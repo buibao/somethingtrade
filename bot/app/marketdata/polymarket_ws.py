@@ -10,8 +10,15 @@ import structlog
 import websockets
 
 from app.core.clock import monotonic_now_ns, utc_now_ns
-from app.core.events import MarketTick, PolymarketQuote, PolymarketSideLabel
+from app.core.events import (
+    MarketLifecycleEvent,
+    MarketLifecycleType,
+    MarketTick,
+    PolymarketQuote,
+    PolymarketSideLabel,
+)
 from app.marketdata.polymarket_discovery import PolymarketMarketMetadata
+from app.marketdata.polymarket_orderbook import PolymarketLocalOrderBook, TokenBookMetadata
 
 DEFAULT_POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -31,7 +38,7 @@ class WebSocketConnection(Protocol):
 
 
 ConnectFactory = Callable[..., AbstractAsyncContextManager[WebSocketConnection]]
-PolymarketStreamEvent = PolymarketQuote | MarketTick
+PolymarketStreamEvent = PolymarketQuote | MarketTick | MarketLifecycleEvent
 
 
 class PolymarketHeartbeatError(RuntimeError):
@@ -43,7 +50,7 @@ class PolymarketMessageError(ValueError):
 
 
 class PolymarketWSClient:
-    """Async Polymarket market-channel client for public CLOB data."""
+    """Async Polymarket market-channel client backed by a local CLOB book."""
 
     def __init__(
         self,
@@ -58,13 +65,22 @@ class PolymarketWSClient:
         initial_backoff_sec: float = 0.25,
         max_backoff_sec: float = 8.0,
         max_queue: int = 1024,
+        orderbook_stale_after_ms: float = 1_000.0,
     ) -> None:
         self.url = _market_ws_url(url)
         self.market_metadata = tuple(markets)
         self.token_ids = tuple(str(token_id) for token_id in token_ids) or tuple(
             token_id for market in self.market_metadata for token_id in market.token_ids
         )
-        self._token_info = _build_token_info(self.market_metadata, self.token_ids, token_side_labels)
+        token_metadata = _build_token_metadata(
+            self.market_metadata,
+            self.token_ids,
+            token_side_labels,
+        )
+        self._orderbooks = PolymarketLocalOrderBook(
+            token_metadata=token_metadata,
+            stale_after_ms=orderbook_stale_after_ms,
+        )
         self.heartbeat_timeout_sec = heartbeat_timeout_sec
         self.ping_timeout_sec = ping_timeout_sec
         self.initial_backoff_sec = initial_backoff_sec
@@ -175,26 +191,40 @@ class PolymarketWSClient:
 
         for payload in payloads:
             event_type = str(payload.get("event_type", ""))
+            event_ts = _timestamp_to_ns(payload.get("timestamp"))
             if event_type == "book":
                 events.append(
-                    _quote_from_book(
+                    self._orderbooks.apply_book(
                         payload,
-                        token_info=self._token_info,
                         received_ts=local_received_ts,
                         parse_done_ts=parse_done_ts,
                         recv_monotonic_ns=recv_mono,
                         parse_done_monotonic_ns=parse_done_mono,
+                        event_ts=event_ts,
+                        sequence=payload.get("hash"),
                     )
                 )
-            elif event_type in {"price_change", "best_bid_ask"}:
+            elif event_type == "price_change":
                 events.extend(
-                    _quotes_from_price_message(
+                    self._quotes_from_price_change(
                         payload,
-                        token_info=self._token_info,
                         received_ts=local_received_ts,
                         parse_done_ts=parse_done_ts,
                         recv_monotonic_ns=recv_mono,
                         parse_done_monotonic_ns=parse_done_mono,
+                        event_ts=event_ts,
+                    )
+                )
+            elif event_type == "best_bid_ask":
+                events.append(
+                    self._orderbooks.apply_best_bid_ask(
+                        payload,
+                        received_ts=local_received_ts,
+                        parse_done_ts=parse_done_ts,
+                        recv_monotonic_ns=recv_mono,
+                        parse_done_monotonic_ns=parse_done_mono,
+                        event_ts=event_ts,
+                        sequence=payload.get("hash"),
                     )
                 )
             elif event_type in {"last_trade_price", "trade"}:
@@ -205,48 +235,91 @@ class PolymarketWSClient:
                         parse_done_ts=parse_done_ts,
                         recv_monotonic_ns=recv_mono,
                         parse_done_monotonic_ns=parse_done_mono,
+                        event_ts=event_ts,
                     )
                 )
             elif event_type in {"tick_size_change", "new_market", "market_resolved"}:
-                continue
+                lifecycle = _lifecycle_event(
+                    payload,
+                    received_ts=local_received_ts,
+                    parse_done_ts=parse_done_ts,
+                    recv_monotonic_ns=recv_mono,
+                    parse_done_monotonic_ns=parse_done_mono,
+                    event_ts=event_ts,
+                )
+                if lifecycle.lifecycle_type in {"tick_size_change", "market_resolved"}:
+                    self._orderbooks.mark_market_invalid(lifecycle.market_id)
+                events.append(lifecycle)
             else:
                 raise PolymarketMessageError(f"unsupported Polymarket message: {payload!r}")
 
         return tuple(events)
 
+    def _quotes_from_price_change(
+        self,
+        payload: dict[str, Any],
+        *,
+        received_ts: int,
+        parse_done_ts: int,
+        recv_monotonic_ns: int,
+        parse_done_monotonic_ns: int,
+        event_ts: int | None,
+    ) -> tuple[PolymarketQuote, ...]:
+        changes = payload.get("price_changes")
+        rows = (
+            [row for row in changes if isinstance(row, dict)]
+            if isinstance(changes, list)
+            else [payload]
+        )
+        quotes: list[PolymarketQuote] = []
+        for row in rows:
+            quotes.append(
+                self._orderbooks.apply_price_change(
+                    row,
+                    parent_payload=payload,
+                    received_ts=received_ts,
+                    parse_done_ts=parse_done_ts,
+                    recv_monotonic_ns=recv_monotonic_ns,
+                    parse_done_monotonic_ns=parse_done_monotonic_ns,
+                    event_ts=event_ts,
+                    sequence=row.get("hash") or payload.get("hash"),
+                )
+            )
+        return tuple(quotes)
+
     def _backoff_delay(self, attempt: int) -> float:
         return min(self.max_backoff_sec, self.initial_backoff_sec * (2**attempt))
 
 
-type TokenInfo = tuple[str | None, str, PolymarketSideLabel]
-
-
-def _build_token_info(
+def _build_token_metadata(
     markets: Iterable[PolymarketMarketMetadata],
     token_ids: Iterable[str],
     overrides: Mapping[str, PolymarketSideLabel] | None,
-) -> dict[str, TokenInfo]:
-    token_info: dict[str, TokenInfo] = {}
+) -> dict[str, TokenBookMetadata]:
+    metadata: dict[str, TokenBookMetadata] = {}
     for market in markets:
         for token_id, outcome in market.token_outcomes.items():
-            token_info[token_id] = (
-                market.condition_id,
-                market.market_id,
-                _side_label_for_outcome(outcome),
+            metadata[token_id] = TokenBookMetadata(
+                condition_id=market.condition_id,
+                market_id=market.market_id,
+                side_label=_side_label_for_outcome(outcome),
             )
 
     if overrides:
         for token_id, side_label in overrides.items():
-            condition_id, market_id, _ = token_info.get(token_id, (None, "", side_label))
-            token_info[token_id] = (condition_id, market_id, side_label)
+            previous = metadata.get(token_id)
+            metadata[token_id] = TokenBookMetadata(
+                condition_id=None if previous is None else previous.condition_id,
+                market_id="" if previous is None else previous.market_id,
+                side_label=side_label,
+            )
 
-    for index, token_id in enumerate(token_ids):
-        token_info.setdefault(
+    for token_id in token_ids:
+        metadata.setdefault(
             token_id,
-            (None, "", "UNKNOWN"),
+            TokenBookMetadata(condition_id=None, market_id="", side_label="UNKNOWN"),
         )
-
-    return token_info
+    return metadata
 
 
 def _market_ws_url(url: str) -> str:
@@ -267,84 +340,6 @@ def _decode_payloads(raw_message: str | bytes) -> tuple[dict[str, Any], ...]:
     raise PolymarketMessageError("Polymarket websocket payload must be an object or list")
 
 
-def _quote_from_book(
-    payload: dict[str, Any],
-    *,
-    token_info: Mapping[str, TokenInfo],
-    received_ts: int,
-    parse_done_ts: int,
-    recv_monotonic_ns: int,
-    parse_done_monotonic_ns: int,
-) -> PolymarketQuote:
-    token_id = str(payload["asset_id"])
-    bids = _levels(payload.get("bids", []))
-    asks = _levels(payload.get("asks", []))
-    best_bid, best_bid_size = _best_bid(bids)
-    best_ask, best_ask_size = _best_ask(asks)
-    event_ts = _timestamp_to_ns(payload.get("timestamp"))
-    condition_id, market_id, side_label = _token_info(token_info, token_id, payload)
-    return _quote(
-        condition_id=condition_id,
-        market_id=market_id,
-        token_id=token_id,
-        side_label=side_label,
-        best_bid=best_bid,
-        best_ask=best_ask,
-        best_bid_size=best_bid_size,
-        best_ask_size=best_ask_size,
-        event_ts=event_ts,
-        received_ts=received_ts,
-        parse_done_ts=parse_done_ts,
-        recv_monotonic_ns=recv_monotonic_ns,
-        parse_done_monotonic_ns=parse_done_monotonic_ns,
-        sequence=payload.get("hash"),
-    )
-
-
-def _quotes_from_price_message(
-    payload: dict[str, Any],
-    *,
-    token_info: Mapping[str, TokenInfo],
-    received_ts: int,
-    parse_done_ts: int,
-    recv_monotonic_ns: int,
-    parse_done_monotonic_ns: int,
-) -> tuple[PolymarketQuote, ...]:
-    event_ts = _timestamp_to_ns(payload.get("timestamp"))
-    changes = payload.get("price_changes")
-    if isinstance(changes, list):
-        rows = [row for row in changes if isinstance(row, dict)]
-    else:
-        rows = [payload]
-
-    quotes: list[PolymarketQuote] = []
-    for row in rows:
-        token_id = str(row.get("asset_id") or payload.get("asset_id"))
-        condition_id, market_id, side_label = _token_info(token_info, token_id, payload)
-        best_bid = _optional_float(row.get("best_bid"))
-        best_ask = _optional_float(row.get("best_ask"))
-        size = _optional_float(row.get("size"))
-        quotes.append(
-            _quote(
-                condition_id=condition_id,
-                market_id=market_id,
-                token_id=token_id,
-                side_label=side_label,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                best_bid_size=size if str(row.get("side", "")).upper() == "BUY" else None,
-                best_ask_size=size if str(row.get("side", "")).upper() == "SELL" else None,
-                event_ts=event_ts,
-                received_ts=received_ts,
-                parse_done_ts=parse_done_ts,
-                recv_monotonic_ns=recv_monotonic_ns,
-                parse_done_monotonic_ns=parse_done_monotonic_ns,
-                sequence=row.get("hash"),
-            )
-        )
-    return tuple(quotes)
-
-
 def _tick_from_trade(
     payload: dict[str, Any],
     *,
@@ -352,8 +347,8 @@ def _tick_from_trade(
     parse_done_ts: int,
     recv_monotonic_ns: int,
     parse_done_monotonic_ns: int,
+    event_ts: int | None,
 ) -> MarketTick:
-    event_ts = _timestamp_to_ns(payload.get("timestamp"))
     return MarketTick(
         source="polymarket",
         symbol=str(payload.get("asset_id") or payload.get("token_id")),
@@ -365,40 +360,33 @@ def _tick_from_trade(
         parse_done_ts=parse_done_ts,
         recv_monotonic_ns=recv_monotonic_ns,
         parse_done_monotonic_ns=parse_done_monotonic_ns,
-        latency_ms=_latency_ms(recv_monotonic_ns, parse_done_monotonic_ns),
+        latency_ms=(parse_done_monotonic_ns - recv_monotonic_ns) / 1_000_000.0,
     )
 
 
-def _quote(
+def _lifecycle_event(
+    payload: dict[str, Any],
     *,
-    condition_id: str | None,
-    market_id: str,
-    token_id: str,
-    side_label: PolymarketSideLabel,
-    best_bid: float | None,
-    best_ask: float | None,
-    best_bid_size: float | None,
-    best_ask_size: float | None,
-    event_ts: int | None,
     received_ts: int,
     parse_done_ts: int,
     recv_monotonic_ns: int,
     parse_done_monotonic_ns: int,
-    sequence: object,
-) -> PolymarketQuote:
-    mid_price = _mid(best_bid, best_ask)
-    spread = None if best_bid is None or best_ask is None else max(0.0, best_ask - best_bid)
-    return PolymarketQuote(
-        market_id=market_id,
-        condition_id=condition_id,
-        token_id=token_id,
-        side_label=side_label,
-        best_bid=best_bid,
-        best_bid_size=best_bid_size,
-        best_ask=best_ask,
-        best_ask_size=best_ask_size,
-        mid_price=mid_price,
-        spread=spread,
+    event_ts: int | None,
+) -> MarketLifecycleEvent:
+    lifecycle_type = str(payload["event_type"])
+    if lifecycle_type not in {"tick_size_change", "market_resolved", "new_market"}:
+        raise PolymarketMessageError(f"unsupported lifecycle type: {lifecycle_type}")
+    return MarketLifecycleEvent(
+        market_id=str(payload.get("market") or payload.get("market_id") or ""),
+        token_id=(
+            None
+            if payload.get("asset_id") is None and payload.get("token_id") is None
+            else str(payload.get("asset_id") or payload.get("token_id"))
+        ),
+        lifecycle_type=cast(MarketLifecycleType, lifecycle_type),
+        old_tick_size=_optional_float(payload.get("old_tick_size")),
+        new_tick_size=_optional_float(payload.get("new_tick_size") or payload.get("tick_size")),
+        raw_metadata=payload,
         event_ts=event_ts,
         received_ts=received_ts,
         exchange_event_ts=event_ts,
@@ -407,44 +395,8 @@ def _quote(
         parse_done_ts=parse_done_ts,
         recv_monotonic_ns=recv_monotonic_ns,
         parse_done_monotonic_ns=parse_done_monotonic_ns,
-        latency_ms=_latency_ms(recv_monotonic_ns, parse_done_monotonic_ns),
-        sequence=_sequence_or_none(sequence),
+        latency_ms=(parse_done_monotonic_ns - recv_monotonic_ns) / 1_000_000.0,
     )
-
-
-def _token_info(
-    token_info: Mapping[str, TokenInfo],
-    token_id: str,
-    payload: Mapping[str, Any],
-) -> TokenInfo:
-    condition_id, mapped_market_id, side_label = token_info.get(token_id, (None, "", "YES"))
-    market_id = mapped_market_id or str(payload.get("market") or "")
-    return condition_id, market_id, side_label
-
-
-def _levels(rows: object) -> list[tuple[float, float]]:
-    if not isinstance(rows, list):
-        raise PolymarketMessageError("book levels must be a list")
-    levels: list[tuple[float, float]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            raise PolymarketMessageError("book level must be an object")
-        levels.append((_float_from(row["price"]), _float_from(row["size"])))
-    return levels
-
-
-def _best_bid(levels: list[tuple[float, float]]) -> tuple[float | None, float | None]:
-    if not levels:
-        return None, None
-    price, size = max(levels, key=lambda level: level[0])
-    return price, size
-
-
-def _best_ask(levels: list[tuple[float, float]]) -> tuple[float | None, float | None]:
-    if not levels:
-        return None, None
-    price, size = min(levels, key=lambda level: level[0])
-    return price, size
 
 
 def _timestamp_to_ns(value: object) -> int | None:
@@ -474,26 +426,6 @@ def _float_from(value: object) -> float:
     if isinstance(value, int | float | str | bytes):
         return float(value)
     raise PolymarketMessageError(f"expected float-like value, got {value!r}")
-
-
-def _mid(best_bid: float | None, best_ask: float | None) -> float | None:
-    if best_bid is None or best_ask is None:
-        return None
-    return (best_bid + best_ask) / 2.0
-
-
-def _latency_ms(start_ts: int | None, end_ts: int | None) -> float | None:
-    if start_ts is None or end_ts is None:
-        return None
-    return (end_ts - start_ts) / 1_000_000.0
-
-
-def _sequence_or_none(value: object) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    return abs(hash(str(value)))
 
 
 def _side_label_for_outcome(outcome: str) -> PolymarketSideLabel:

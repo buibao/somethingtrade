@@ -3,9 +3,11 @@ import orjson
 from app.core.events import (
     BookLevel,
     DepthUpdate,
+    Event,
     ExecutionReport,
     ExecutionStatus,
     LatencyTrace,
+    MarketLifecycleEvent,
     MarketTick,
     OrderBookTop,
     OrderIntent,
@@ -27,7 +29,7 @@ def test_market_tick_round_trips_json() -> None:
 
 
 def test_all_required_events_are_json_serializable() -> None:
-    events = [
+    events: list[Event] = [
         MarketTick(source="binance", symbol="BTCUSDT", price=0.61, size=2.5),
         OrderBookTop(
             source="binance",
@@ -109,6 +111,16 @@ def test_all_required_events_are_json_serializable() -> None:
             estimated_edge_raw=0.04,
             estimated_edge_after_spread=0.02,
             reject_reason=None,
+        ),
+        MarketLifecycleEvent(
+            market_id="market-1",
+            token_id="token-up",
+            lifecycle_type="tick_size_change",
+            old_tick_size=0.01,
+            new_tick_size=0.001,
+            event_ts=100,
+            received_ts=110,
+            raw_metadata={"event_type": "tick_size_change"},
         ),
     ]
 

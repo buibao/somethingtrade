@@ -98,9 +98,12 @@ class PolymarketDiscoveryClient:
         for payload in raw_markets:
             if not is_short_duration_crypto_market(payload):
                 continue
+            def log_reject(reason: str) -> None:
+                self._log_reject(payload, reason)
+
             metadata = parse_market_metadata(
                 payload,
-                reject_logger=lambda reason, p=payload: self._log_reject(p, reason),
+                reject_logger=log_reject,
             )
             if metadata is not None:
                 markets.append(metadata)

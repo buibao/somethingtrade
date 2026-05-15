@@ -31,6 +31,7 @@ class Settings(BaseModel):
     gap_min_move_pct: float = Field(0.10, alias="GAP_MIN_MOVE_PCT")
     gap_reprice_threshold: float = Field(0.005, alias="GAP_REPRICE_THRESHOLD")
     gap_max_entry_spread: float = Field(0.05, alias="GAP_MAX_ENTRY_SPREAD")
+    gap_max_entry_price_move: float = Field(0.02, alias="GAP_MAX_ENTRY_PRICE_MOVE")
     gap_binance_stale_ms: float = Field(500.0, alias="GAP_BINANCE_STALE_MS")
     gap_polymarket_stale_ms: float = Field(1_000.0, alias="GAP_POLYMARKET_STALE_MS")
     gap_measurement_stale_ms: float = Field(5_000.0, alias="GAP_MEASUREMENT_STALE_MS")
@@ -63,6 +64,7 @@ def get_settings() -> Settings:
             "GAP_MIN_MOVE_PCT",
             "GAP_REPRICE_THRESHOLD",
             "GAP_MAX_ENTRY_SPREAD",
+            "GAP_MAX_ENTRY_PRICE_MOVE",
             "GAP_BINANCE_STALE_MS",
             "GAP_POLYMARKET_STALE_MS",
             "GAP_MEASUREMENT_STALE_MS",

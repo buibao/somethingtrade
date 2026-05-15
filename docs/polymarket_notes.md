@@ -43,15 +43,17 @@ Official references:
 
 - `custom_feature_enabled: true` enables extra public market events including `best_bid_ask`.
 - Supported normalized messages:
-  - `book` -> `PolymarketQuote`
-  - `price_change` -> `PolymarketQuote`
-  - `best_bid_ask` -> `PolymarketQuote`
+  - `book` -> full local book replacement, then `PolymarketQuote`
+  - `price_change` -> local price-level mutation, then `PolymarketQuote`
+  - `best_bid_ask` -> price-only validation/update, then incomplete `PolymarketQuote` when size is unknown
   - `last_trade_price` / `trade` -> `MarketTick`
 
 ## Local Assumptions
 
 - `best_bid_size` and `best_ask_size` are tracked separately. A hypothetical BUY uses `best_ask_size`; a hypothetical SELL would use `best_bid_size`.
+- `best_bid_size` and `best_ask_size` are sourced from the local per-token CLOB.
 - `available_liquidity_at_best` is only a backward-compatible computed field.
+- `price_change.best_bid` and `price_change.best_ask` are treated as validation telemetry, not as executable size.
 - Polymarket timestamps are parsed as seconds, milliseconds, microseconds, or nanoseconds based on digit length; current docs show millisecond timestamps.
 - Quote staleness is enforced in `MarketState` using `POLYMARKET_MAX_QUOTE_AGE_MS`.
 - This phase deliberately does not use authenticated CLOB trading endpoints.

@@ -47,7 +47,7 @@ The monitor prints compact state once per second. It uses reconnect with exponen
 
 ## Polymarket Monitor
 
-Phase 2 discovers active BTC/ETH short-duration up/down style markets through public Gamma market data, caches public metadata under `data/cache/`, subscribes to the public CLOB market websocket, and stores latest quotes in memory.
+Phase 2 discovers active BTC/ETH short-duration up/down style markets through public Gamma market data, caches public metadata under `data/cache/`, subscribes to the public CLOB market websocket, and stores latest quotes in memory. The websocket path now maintains a local per-token CLOB book so displayed bid/ask sizes come from applied book state, not standalone `price_change` fields.
 
 ```bash
 python -m app.main polymarket-monitor
@@ -57,7 +57,7 @@ See `docs/polymarket_notes.md` for API assumptions and cache contents. Real orde
 
 ## Gap Monitor
 
-Phase 3.5 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates quote repricing delay from fillable stale-quote windows and spread-adjusted estimated edge.
+Phase 3.6 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates quote repricing delay from the true fillable stale-quote window and only reports spread-adjusted estimated edge when the entry was executable by local-book size and spread filters.
 
 ```bash
 python -m app.main gap-monitor

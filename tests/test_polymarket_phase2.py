@@ -6,7 +6,7 @@ import orjson
 import pytest
 
 from app.core.clock import utc_now_ns
-from app.core.events import MarketTick, PolymarketQuote
+from app.core.events import MarketLifecycleEvent, MarketTick, PolymarketQuote
 from app.marketdata.polymarket_discovery import (
     PolymarketDiscoveryClient,
     PolymarketMarketMetadata,
@@ -192,8 +192,11 @@ def test_normalizes_polymarket_book_price_change_and_trade() -> None:
 
     assert isinstance(price_change, PolymarketQuote)
     assert price_change.side_label == "DOWN"
-    assert price_change.best_bid == 0.48
-    assert price_change.best_ask == 0.51
+    assert price_change.best_bid is None
+    assert price_change.best_ask == 0.49
+    assert price_change.best_bid_size is None
+    assert price_change.best_ask_size == 200.0
+    assert price_change.book_complete is False
     assert price_change.available_liquidity_at_best == 200.0
 
     assert isinstance(trade, MarketTick)
@@ -237,6 +240,35 @@ async def test_polymarket_stream_sends_subscription_and_yields_events() -> None:
     assert isinstance(events[0], PolymarketQuote)
     assert events[0].best_bid == 0.73
     assert events[0].best_ask == 0.77
+    assert events[0].best_bid_size is None
+    assert events[0].best_ask_size is None
+    assert events[0].book_complete is False
+
+
+def test_polymarket_lifecycle_events_are_not_silently_ignored() -> None:
+    market = _metadata()
+    client = PolymarketWSClient(markets=(market,), token_ids=flatten_token_ids((market,)))
+
+    event = client.normalize_message(
+        orjson.dumps(
+            {
+                "event_type": "tick_size_change",
+                "market": "0xmarket",
+                "asset_id": "yes-token",
+                "old_tick_size": "0.01",
+                "new_tick_size": "0.001",
+                "timestamp": "1700000000000",
+            }
+        ),
+        received_ts=1_700_000_000_100_000_000,
+    )[0]
+
+    assert isinstance(event, MarketLifecycleEvent)
+    assert event.lifecycle_type == "tick_size_change"
+    assert event.market_id == "0xmarket"
+    assert event.token_id == "yes-token"
+    assert event.old_tick_size == pytest.approx(0.01)
+    assert event.new_tick_size == pytest.approx(0.001)
 
 
 def test_market_state_rejects_stale_polymarket_quote() -> None:

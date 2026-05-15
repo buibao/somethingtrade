@@ -89,6 +89,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum Polymarket spread for a fillable stale quote.",
     )
     gap_monitor.add_argument(
+        "--max-entry-price-move",
+        type=float,
+        default=None,
+        help="Maximum stale ask price move before the entry window is closed.",
+    )
+    gap_monitor.add_argument(
         "--binance-stale-ms",
         type=float,
         default=None,
@@ -218,6 +224,8 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         min_move_pct=args.min_move_pct or settings.gap_min_move_pct,
         reprice_threshold=args.reprice_threshold or settings.gap_reprice_threshold,
         max_entry_spread=args.max_entry_spread or settings.gap_max_entry_spread,
+        max_entry_price_move=args.max_entry_price_move
+        or settings.gap_max_entry_price_move,
         binance_stale_ms=args.binance_stale_ms or settings.gap_binance_stale_ms,
         polymarket_stale_ms=args.polymarket_stale_ms
         or settings.gap_polymarket_stale_ms,

@@ -1,6 +1,6 @@
-# Phase 3.5 Gap Measurement
+# Phase 3.6 Gap Measurement
 
-Phase 3.5 measures whether Binance price discovery appears before Polymarket reprices the matching short-duration BTC/ETH CLOB market. It is a measurement system, not a live trading signal.
+Phase 3.6 measures whether Binance price discovery appears before Polymarket reprices the matching short-duration BTC/ETH CLOB market. It is a measurement system, not a live trading signal.
 
 ## Three Different Ideas
 
@@ -8,10 +8,13 @@ Repricing delay:
 The time from a Binance-led move being detected to the first matching Polymarket quote update in the expected direction.
 
 Tradable window:
-The subset of that delay where the stale Polymarket quote was actually fillable at the relevant side of the book. For a hypothetical BUY, the detector requires a best ask and enough `best_ask_size`.
+The subset of that delay where the stale Polymarket quote was actually fillable at the relevant side of the local CLOB. For a hypothetical BUY, the detector requires a best ask, enough `best_ask_size`, acceptable spread, and a positive later exit edge after spread. `tradable_window_ms` is allowed to end before `gap_duration_ms`.
 
 Estimated edge:
-Only counted for monitor averages when the stale quote was fillable, the spread was below the configured threshold, and the repriced quote leaves positive spread-adjusted value. A repricing delay without fillability is not treated as executable edge.
+Only counted for monitor averages when the stale quote was fillable, the spread was below the configured threshold, and the repriced quote leaves positive spread-adjusted value. For a hypothetical BUY, `estimated_edge_after_spread = later_best_bid - detection_best_ask`. A repricing delay without fillability is not treated as executable edge.
+
+Fillability:
+For a BUY measurement, the visible entry is `best_ask`. The quote is not fillable if the ask is missing, the ask size is missing, the ask size is below `min_order_size`, the spread is too wide, the quote/book is stale, or the market lifecycle invalidates the book.
 
 ## Outcome Mapping
 
@@ -50,6 +53,37 @@ Strict candidate thresholds:
 Wider monitoring threshold:
 
 - `GAP_MEASUREMENT_STALE_MS`, default `5000`
+
+Entry-window controls:
+
+- `GAP_MAX_ENTRY_SPREAD`, default `0.05`
+- `GAP_MAX_ENTRY_PRICE_MOVE`, default `0.02`
+
+The tradable window ends when a quote update makes the selected token non-executable: ask moves beyond the configured entry tolerance, ask size disappears, spread widens beyond the configured threshold, spread-adjusted edge decays to zero or below, the quote becomes stale, the tick size changes, or the market resolves.
+
+## Local Order Book
+
+Polymarket CLOB websocket messages are applied to an in-memory `PolymarketLocalOrderBook` per token:
+
+- `book` replaces the full bid/ask ladder for the token.
+- `price_change` mutates the relevant side: `BUY` updates bids, `SELL` updates asks, and size `0` removes the level.
+- `best_bid_ask` carries no size, so it is never allowed to erase known size. If it disagrees with the local book, the emitted quote is marked incomplete and the affected size is unknown.
+
+`PolymarketQuote.best_bid_size` and `best_ask_size` come from the local book. The older `available_liquidity_at_best` field is only a backward-compatible computed summary and should not drive execution simulation.
+
+## Why Price Change Alone Is Not Enough
+
+A standalone `price_change` row can show a price level delta and sometimes reports best bid/ask fields, but those reported bests do not prove executable size at the top of book. Without a prior snapshot and local deltas, a detector can mistake a price update for fillable liquidity. Phase 3.6 treats the local book as source of truth and marks quotes incomplete when size cannot be established.
+
+## Lifecycle Events
+
+The Polymarket websocket can emit lifecycle events:
+
+- `tick_size_change`
+- `market_resolved`
+- `new_market`
+
+Tick-size changes and resolved markets invalidate related local books and cancel pending gap measurements for that market. New-market events are surfaced so discovery can be rerun; they are not silently ignored.
 
 ## Observation Fields
 
@@ -95,6 +129,6 @@ These JSONL files are append-only measurement artifacts. They are not database w
 
 ## Why This Is Not A Live Trading Signal
 
-Even a positive observation is not enough to trade. A real execution system would still need order-book depth beyond top-of-book, queue position, cancellation risk, matching latency, fee modeling, market-specific resolution risk, wallet and allowance safety, inventory limits, and kill switches.
+Even a positive observation is not enough to trade. A real execution system would still need deeper book simulation, queue position, cancellation risk, websocket gap recovery, Polymarket order placement latency, fees, market-specific resolution risk, wallet and allowance safety, inventory limits, and kill switches.
 
 This phase answers a narrower research question: did Binance move first, did Polymarket lag, and was the visible stale quote plausibly fillable after spread?

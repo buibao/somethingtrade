@@ -6,6 +6,7 @@ from app.marketdata.polymarket_discovery import (
     PolymarketMarketCache,
     PolymarketMarketMetadata,
 )
+from app.marketdata.polymarket_orderbook import PolymarketLocalOrderBook, TokenBookMetadata
 from app.marketdata.polymarket_ws import (
     PolymarketHeartbeatError,
     PolymarketMessageError,
@@ -21,5 +22,7 @@ __all__ = [
     "PolymarketMarketCache",
     "PolymarketMarketMetadata",
     "PolymarketMessageError",
+    "PolymarketLocalOrderBook",
     "PolymarketWSClient",
+    "TokenBookMetadata",
 ]

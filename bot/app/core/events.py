@@ -64,6 +64,7 @@ type PolymarketSideLabel = Literal[
     "UNKNOWN",
 ]
 type GapDirection = Literal["UP", "DOWN"]
+type MarketLifecycleType = Literal["tick_size_change", "market_resolved", "new_market"]
 
 
 class BookLevel(BaseModel):
@@ -133,6 +134,10 @@ class PolymarketQuote(RealtimeMarketEvent):
     spread: float | None = None
     event_ts: int | None = None
     received_ts: int | None = None
+    book_complete: bool = True
+    book_stale: bool = False
+    book_hash: str | None = None
+    validation_error: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -261,6 +266,18 @@ class TradableGapObservation(EventModel):
     reject_reason: str | None = None
 
 
+class MarketLifecycleEvent(RealtimeMarketEvent):
+    event_type: Literal["market_lifecycle"] = "market_lifecycle"
+    market_id: str
+    token_id: str | None = None
+    lifecycle_type: MarketLifecycleType
+    old_tick_size: float | None = None
+    new_tick_size: float | None = None
+    raw_metadata: dict[str, Any] = Field(default_factory=dict)
+    event_ts: int | None = None
+    received_ts: int | None = None
+
+
 BinanceMarketEvent: TypeAlias = MarketTick | OrderBookTop | DepthUpdate
 
 Event: TypeAlias = (
@@ -273,4 +290,5 @@ Event: TypeAlias = (
     | ExecutionReport
     | LatencyTrace
     | TradableGapObservation
+    | MarketLifecycleEvent
 )

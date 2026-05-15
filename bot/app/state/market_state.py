@@ -6,6 +6,7 @@ from app.core.clock import monotonic_now_ns, utc_now_ns
 from app.core.events import (
     BinanceMarketEvent,
     DepthUpdate,
+    MarketLifecycleEvent,
     MarketTick,
     OrderBookTop,
     PolymarketQuote,
@@ -58,13 +59,15 @@ class MarketState:
         self.book_tops: dict[str, OrderBookTop] = {}
         self.depth_updates: dict[str, DepthUpdate] = {}
         self.polymarket_quotes: dict[str, PolymarketQuote] = {}
+        self.market_lifecycle_events: list[MarketLifecycleEvent] = []
+        self.invalid_polymarket_markets: set[str] = set()
         self.symbols: dict[str, SymbolState] = {}
         self.max_polymarket_quote_age_ms = max_polymarket_quote_age_ms
 
     def apply(
         self,
-        event: BinanceMarketEvent | PolymarketQuote,
-    ) -> BinanceMarketEvent | PolymarketQuote | None:
+        event: BinanceMarketEvent | PolymarketQuote | MarketLifecycleEvent,
+    ) -> BinanceMarketEvent | PolymarketQuote | MarketLifecycleEvent | None:
         state_updated_ts = utc_now_ns()
         state_updated_monotonic_ns = monotonic_now_ns()
         if isinstance(event, PolymarketQuote) and self.is_stale_quote(
@@ -111,6 +114,10 @@ class MarketState:
 
         elif isinstance(updated_event, PolymarketQuote):
             self.polymarket_quotes[updated_event.token_id] = updated_event
+        elif isinstance(updated_event, MarketLifecycleEvent):
+            self.market_lifecycle_events.append(updated_event)
+            if updated_event.lifecycle_type in {"market_resolved", "tick_size_change"}:
+                self.invalid_polymarket_markets.add(updated_event.market_id)
 
         return updated_event
 
@@ -239,11 +246,11 @@ class MarketState:
 
     def _with_state_latency(
         self,
-        event: BinanceMarketEvent | PolymarketQuote,
+        event: BinanceMarketEvent | PolymarketQuote | MarketLifecycleEvent,
         *,
         state_updated_ts: int,
         state_updated_monotonic_ns: int,
-    ) -> BinanceMarketEvent | PolymarketQuote:
+    ) -> BinanceMarketEvent | PolymarketQuote | MarketLifecycleEvent:
         if not isinstance(event, RealtimeMarketEvent):
             return event
 
