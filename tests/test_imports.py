@@ -11,6 +11,7 @@ MODULES = [
     "app.marketdata.polymarket_ws",
     "app.marketdata.normalizer",
     "app.state.market_state",
+    "app.strategy.gap_detector",
     "app.strategy.mispricing_detector",
     "app.strategy.probability_model",
     "app.risk.risk_gate",

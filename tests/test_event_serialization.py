@@ -5,6 +5,7 @@ from app.core.events import (
     DepthUpdate,
     ExecutionReport,
     ExecutionStatus,
+    GapEvent,
     LatencyTrace,
     MarketTick,
     OrderBookTop,
@@ -80,6 +81,18 @@ def test_all_required_events_are_json_serializable() -> None:
             raw={"mode": "paper"},
         ),
         LatencyTrace(trace_id="trace-1", recv_ns=100, execution_ns=150),
+        GapEvent(
+            symbol="BTCUSDT",
+            timeframe="15m",
+            direction="UP",
+            binance_move_pct=1.0,
+            poly_market_price_before=0.50,
+            poly_market_price_after=0.53,
+            detected_ts=100,
+            repriced_ts=250,
+            gap_duration_ms=0.00015,
+            estimated_edge=0.01,
+        ),
     ]
 
     for event in events:

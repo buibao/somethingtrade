@@ -55,6 +55,16 @@ python -m app.main polymarket-monitor
 
 See `docs/polymarket_notes.md` for API assumptions and cache contents. Real order execution remains unimplemented.
 
+## Gap Monitor
+
+Phase 3 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`.
+
+```bash
+python -m app.main gap-monitor
+```
+
+See `docs/phase3_gap_measurement.md` for interpretation guidance. The monitor does not place orders.
+
 ## Status
 
 This project does not implement real trading. Websocket clients, Polymarket execution, and strategy logic are deliberately skeletal so real connectivity, key management, persistence, and production risk controls can be added deliberately.

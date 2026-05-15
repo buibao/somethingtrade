@@ -53,6 +53,7 @@ class ExecutionStatus(StrEnum):
 
 
 type PolymarketSideLabel = Literal["YES", "NO"]
+type GapDirection = Literal["UP", "DOWN"]
 
 
 class BookLevel(BaseModel):
@@ -206,6 +207,20 @@ class LatencyTrace(EventModel):
         return last - self.recv_ns
 
 
+class GapEvent(EventModel):
+    event_type: Literal["gap_event"] = "gap_event"
+    symbol: str
+    timeframe: Literal["5m", "15m"]
+    direction: GapDirection
+    binance_move_pct: float
+    poly_market_price_before: float | None = None
+    poly_market_price_after: float | None = None
+    detected_ts: int
+    repriced_ts: int | None = None
+    gap_duration_ms: float | None = None
+    estimated_edge: float
+
+
 BinanceMarketEvent: TypeAlias = MarketTick | OrderBookTop | DepthUpdate
 
 Event: TypeAlias = (
@@ -217,4 +232,5 @@ Event: TypeAlias = (
     | OrderIntent
     | ExecutionReport
     | LatencyTrace
+    | GapEvent
 )

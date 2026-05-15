@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from app.config.settings import get_settings
 from app.execution.paper_executor import PaperExecutor
+from app.logging.event_logger import AsyncJsonlEventLogger
 from app.marketdata.binance_ws import BinanceWSClient
 from app.marketdata.polymarket_discovery import (
     PolymarketDiscoveryClient,
@@ -12,6 +13,7 @@ from app.marketdata.polymarket_discovery import (
 )
 from app.marketdata.polymarket_ws import PolymarketWSClient
 from app.state.market_state import MarketState
+from app.strategy.gap_detector import GapDetector, GapMonitorStats
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -59,6 +61,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Reject Polymarket quotes older than this many milliseconds.",
     )
 
+    gap_monitor = subparsers.add_parser(
+        "gap-monitor",
+        help="Measure Binance-led Polymarket repricing gaps and log JSONL events.",
+    )
+    gap_monitor.add_argument("--gamma-url", default=None, help="Polymarket Gamma API base URL.")
+    gap_monitor.add_argument("--poly-ws-url", default=None, help="Polymarket market websocket URL.")
+    gap_monitor.add_argument("--binance-url", default=None, help="Binance websocket base URL.")
+    gap_monitor.add_argument("--cache-path", default=None, help="Market metadata cache path.")
+    gap_monitor.add_argument("--log-dir", default=None, help="Directory for gap_events_YYYYMMDD.jsonl.")
+    gap_monitor.add_argument(
+        "--min-move-pct",
+        type=float,
+        default=None,
+        help="Minimum Binance move in percent before tracking a gap.",
+    )
+    gap_monitor.add_argument(
+        "--reprice-threshold",
+        type=float,
+        default=None,
+        help="Minimum Polymarket probability move to count as repricing.",
+    )
+    gap_monitor.add_argument(
+        "--stale-feed-ms",
+        type=float,
+        default=None,
+        help="Feed stale threshold for monitor stats.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -69,6 +99,9 @@ async def run(argv: Sequence[str] | None = None) -> None:
         return
     if args.command == "polymarket-monitor":
         await run_polymarket_monitor(args)
+        return
+    if args.command == "gap-monitor":
+        await run_gap_monitor(args)
         return
 
     settings = get_settings()
@@ -145,6 +178,61 @@ async def run_polymarket_monitor(args: argparse.Namespace) -> None:
             pass
 
 
+async def run_gap_monitor(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    discovery = PolymarketDiscoveryClient(
+        gamma_url=args.gamma_url or settings.polymarket_gamma_url,
+        cache_path=args.cache_path or settings.polymarket_market_cache_path,
+    )
+    markets = await discovery.discover(write_cache=True)
+    if not markets:
+        cached = discovery.read_cache()
+        markets = tuple(cached.markets)
+        if markets:
+            print("using cached Polymarket markets", flush=True)
+    if not markets:
+        print("no active BTC/ETH 5m/15m Polymarket markets discovered", flush=True)
+        return
+
+    state = MarketState(max_polymarket_quote_age_ms=settings.polymarket_max_quote_age_ms)
+    detector = GapDetector(
+        markets=markets,
+        min_move_pct=args.min_move_pct or settings.gap_min_move_pct,
+        reprice_threshold=args.reprice_threshold or settings.gap_reprice_threshold,
+        stale_feed_ms=args.stale_feed_ms or settings.gap_stale_feed_ms,
+    )
+    symbols = _symbols_for_markets(markets) or settings.binance_symbols
+    binance = BinanceWSClient(
+        url=args.binance_url or settings.binance_ws_url,
+        symbols=symbols,
+    )
+    polymarket = PolymarketWSClient(
+        url=args.poly_ws_url or settings.polymarket_ws_url,
+        markets=markets,
+        token_ids=flatten_token_ids(markets),
+    )
+    logger = AsyncJsonlEventLogger(log_dir=args.log_dir or settings.gap_log_dir)
+    logger.start()
+
+    tasks = [
+        asyncio.create_task(_ingest_gap_binance(binance, state, detector, logger)),
+        asyncio.create_task(_ingest_gap_polymarket(polymarket, state, detector, logger)),
+    ]
+    try:
+        while True:
+            await asyncio.sleep(1.0)
+            print(_format_gap_stats(detector.stats(state)), flush=True)
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await logger.close()
+
+
 async def _ingest_binance(client: BinanceWSClient, state: MarketState) -> None:
     async for event in client.stream():
         state.apply(event)
@@ -153,6 +241,32 @@ async def _ingest_binance(client: BinanceWSClient, state: MarketState) -> None:
 async def _ingest_polymarket(client: PolymarketWSClient, state: MarketState) -> None:
     async for event in client.stream():
         state.apply(event)
+
+
+async def _ingest_gap_binance(
+    client: BinanceWSClient,
+    state: MarketState,
+    detector: GapDetector,
+    logger: AsyncJsonlEventLogger,
+) -> None:
+    async for event in client.stream():
+        updated = state.apply(event)
+        if updated is not None:
+            for gap in detector.on_market_event(updated, state):
+                await logger.log(gap)
+
+
+async def _ingest_gap_polymarket(
+    client: PolymarketWSClient,
+    state: MarketState,
+    detector: GapDetector,
+    logger: AsyncJsonlEventLogger,
+) -> None:
+    async for event in client.stream():
+        updated = state.apply(event)
+        if updated is not None:
+            for gap in detector.on_market_event(updated, state):
+                await logger.log(gap)
 
 
 def _parse_symbols(value: str) -> tuple[str, ...]:
@@ -179,6 +293,37 @@ def _print_polymarket_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> 
             ),
             flush=True,
         )
+
+
+def _symbols_for_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> tuple[str, ...]:
+    symbols: set[str] = set()
+    for market in markets:
+        if market.base_asset == "BTC":
+            symbols.add("BTCUSDT")
+        elif market.base_asset == "ETH":
+            symbols.add("ETHUSDT")
+    return tuple(sorted(symbols))
+
+
+def _format_gap_stats(stats: GapMonitorStats) -> str:
+    return " ".join(
+        [
+            f"detected={stats.detected_gaps}",
+            f"completed={stats.completed_gaps}",
+            f"median_gap={_fmt_ms(stats.median_gap_duration_ms)}",
+            f"p95_gap={_fmt_ms(stats.p95_gap_duration_ms)}",
+            f"avg_edge={_fmt_edge(stats.average_estimated_edge)}",
+            f"stale_feeds={stats.stale_feed_count}",
+        ]
+    )
+
+
+def _fmt_ms(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2f}ms"
+
+
+def _fmt_edge(value: float | None) -> str:
+    return "-" if value is None else f"{value:.5f}"
 
 
 def main() -> None:

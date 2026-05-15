@@ -1,5 +1,6 @@
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from math import sqrt
 
 from app.core.clock import utc_now_ns
 from app.core.events import (
@@ -26,6 +27,8 @@ class SymbolState:
     rolling_returns: dict[str, float | None] = field(
         default_factory=lambda: {f"{window}s": None for window in RETURN_WINDOWS_SEC}
     )
+    volatility_30s: float | None = None
+    bid_ask_spread: float | None = None
     last_event_timestamp: int | None = None
     local_receive_timestamp: int | None = None
     parse_done_timestamp: int | None = None
@@ -86,6 +89,10 @@ class MarketState:
             symbol_state.best_bid_size = updated_event.bid_size
             symbol_state.best_ask = updated_event.ask_price
             symbol_state.best_ask_size = updated_event.ask_size
+            symbol_state.bid_ask_spread = max(
+                0.0,
+                updated_event.ask_price - updated_event.bid_price,
+            )
             self._update_common_timestamps(symbol_state, updated_event, state_updated_ts)
 
         elif isinstance(updated_event, DepthUpdate):
@@ -166,6 +173,7 @@ class MarketState:
         while state.price_history and state.price_history[0][0] < cutoff:
             state.price_history.popleft()
         self._recompute_returns(state, now_ts=timestamp, current_price=price)
+        self._recompute_volatility_30s(state)
 
     def _recompute_returns(
         self,
@@ -184,6 +192,26 @@ class MarketState:
                 state.rolling_returns[key] = None
             else:
                 state.rolling_returns[key] = current_price / baseline - 1.0
+
+    def _recompute_volatility_30s(self, state: SymbolState) -> None:
+        if len(state.price_history) < 3:
+            state.volatility_30s = None
+            return
+
+        returns: list[float] = []
+        previous_price = state.price_history[0][1]
+        for _, price in list(state.price_history)[1:]:
+            if previous_price > 0.0:
+                returns.append(price / previous_price - 1.0)
+            previous_price = price
+
+        if len(returns) < 2:
+            state.volatility_30s = None
+            return
+
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / len(returns)
+        state.volatility_30s = sqrt(variance)
 
     def _update_common_timestamps(
         self,
