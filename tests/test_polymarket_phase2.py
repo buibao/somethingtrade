@@ -14,6 +14,7 @@ from app.marketdata.polymarket_discovery import (
     parse_market_metadata,
 )
 from app.marketdata.polymarket_ws import PolymarketWSClient
+from app.main import _discover_polymarket_markets
 from app.state.market_state import MarketState
 
 
@@ -118,6 +119,27 @@ def test_discovery_parses_and_caches_short_duration_markets(tmp_path) -> None:
     assert markets[0].duration_minutes == 15
     assert cached.markets == list(markets)
     assert "replace-me" not in cache_path.read_text()
+
+
+def test_discovery_uses_cache_when_live_fetch_fails(tmp_path, capsys) -> None:
+    market = _metadata()
+    cache_path = tmp_path / "polymarket_markets.json"
+
+    def fail_fetch() -> Sequence[dict[str, object]]:
+        raise OSError("dns unavailable")
+
+    client = PolymarketDiscoveryClient(
+        cache_path=cache_path,
+        fetch_markets=fail_fetch,
+    )
+    client.write_cache([market])
+
+    markets = asyncio.run(_discover_polymarket_markets(client))
+
+    captured = capsys.readouterr()
+    assert markets == (market,)
+    assert "live Polymarket discovery failed" in captured.out
+    assert "using cached Polymarket markets (1)" in captured.out
 
 
 def test_normalizes_polymarket_book_price_change_and_trade() -> None:

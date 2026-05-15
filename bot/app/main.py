@@ -2,12 +2,15 @@ import argparse
 import asyncio
 from collections.abc import Sequence
 
+import aiohttp
+
 from app.config.settings import get_settings
 from app.execution.paper_executor import PaperExecutor
 from app.logging.event_logger import AsyncJsonlEventLogger
 from app.marketdata.binance_ws import BinanceWSClient
 from app.marketdata.polymarket_discovery import (
     PolymarketDiscoveryClient,
+    PolymarketMarketCache,
     PolymarketMarketMetadata,
     flatten_token_ids,
 )
@@ -176,12 +179,7 @@ async def run_polymarket_monitor(args: argparse.Namespace) -> None:
         gamma_url=args.gamma_url or settings.polymarket_gamma_url,
         cache_path=args.cache_path or settings.polymarket_market_cache_path,
     )
-    markets = await discovery.discover(write_cache=True)
-    if not markets:
-        cached = discovery.read_cache()
-        markets = tuple(cached.markets)
-        if markets:
-            print("using cached Polymarket markets", flush=True)
+    markets = await _discover_polymarket_markets(discovery)
     if not markets:
         print("no active BTC/ETH 5m/15m Polymarket markets discovered", flush=True)
         return
@@ -220,12 +218,7 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         gamma_url=args.gamma_url or settings.polymarket_gamma_url,
         cache_path=args.cache_path or settings.polymarket_market_cache_path,
     )
-    markets = await discovery.discover(write_cache=True)
-    if not markets:
-        cached = discovery.read_cache()
-        markets = tuple(cached.markets)
-        if markets:
-            print("using cached Polymarket markets", flush=True)
+    markets = await _discover_polymarket_markets(discovery)
     if not markets:
         print("no active BTC/ETH 5m/15m Polymarket markets discovered", flush=True)
         return
@@ -331,6 +324,42 @@ def _parse_symbols(value: str) -> tuple[str, ...]:
     if not symbols:
         raise ValueError("At least one Binance symbol is required.")
     return symbols
+
+
+async def _discover_polymarket_markets(
+    discovery: PolymarketDiscoveryClient,
+) -> tuple[PolymarketMarketMetadata, ...]:
+    try:
+        markets = await discovery.discover(write_cache=True)
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
+        print(
+            "live Polymarket discovery failed "
+            f"({type(exc).__name__}: {exc}); trying cached market metadata",
+            flush=True,
+        )
+        markets = ()
+
+    if markets:
+        return markets
+
+    cached = _read_cached_polymarket_markets(discovery)
+    if cached.markets:
+        print(f"using cached Polymarket markets ({len(cached.markets)})", flush=True)
+    return tuple(cached.markets)
+
+
+def _read_cached_polymarket_markets(
+    discovery: PolymarketDiscoveryClient,
+) -> PolymarketMarketCache:
+    try:
+        return discovery.read_cache()
+    except (OSError, ValueError) as exc:
+        print(
+            "unable to read cached Polymarket market metadata "
+            f"({type(exc).__name__}: {exc})",
+            flush=True,
+        )
+        return PolymarketMarketCache()
 
 
 def _print_polymarket_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> None:
