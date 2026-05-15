@@ -7,9 +7,14 @@ import aiohttp
 import orjson
 
 from app.backtest.dataset_quality import (
-    build_dataset_quality_report,
     default_report_path,
-    write_dataset_quality_report,
+)
+from app.backtest.dataset_quality_phase4 import (
+    build_phase4_dataset_quality_report,
+    should_fail_for_readiness,
+    write_phase4_csv_outputs,
+    write_phase4_dataset_quality_report,
+    write_phase4_markdown_report,
 )
 from app.config.settings import get_settings
 from app.core.clock import utc_now_ns
@@ -203,16 +208,58 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     quality_report.add_argument("--input", required=True, help="Input gap_events JSONL file.")
     quality_report.add_argument("--output", default=None, help="Output report JSON path.")
     quality_report.add_argument(
+        "--markdown-output",
+        default=None,
+        help="Output Phase 4 markdown report path.",
+    )
+    quality_report.add_argument(
+        "--csv-dir",
+        default=None,
+        help="Directory for Phase 4 CSV report files.",
+    )
+    quality_report.add_argument(
         "--min-quality-tier",
         choices=("A", "B", "C", "D"),
         default=None,
         help="Include rows at this data-quality tier or better.",
     )
     quality_report.add_argument(
+        "--primary-min-tier",
+        choices=("A", "B"),
+        default="B",
+        help="Highest tier allowed in primary empirical analysis.",
+    )
+    quality_report.add_argument(
+        "--include-diagnostic",
+        action="store_true",
+        help="Allow diagnostic validation rows in primary empirical buckets when tier-qualified.",
+    )
+    quality_report.add_argument(
         "--print-top",
         type=int,
         default=20,
         help="Maximum grouped rows to include for high-cardinality sections.",
+    )
+    quality_report.add_argument(
+        "--fail-on-readiness",
+        choices=("NOT_READY", "NEEDS_MORE_DATA", "NEEDS_MORE_CLEANING"),
+        default=None,
+        help="Exit nonzero when readiness is at or below this conservative threshold.",
+    )
+    quality_report.add_argument(
+        "--no-markdown",
+        action="store_true",
+        help="Do not write a markdown report.",
+    )
+    quality_report.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="Do not write CSV report files.",
+    )
+    quality_report.add_argument(
+        "--mismatch-samples",
+        default=None,
+        help="Optional Polymarket orderbook mismatch sample JSONL path.",
     )
 
     return parser.parse_args(argv)
@@ -516,26 +563,61 @@ async def _ingest_gap_polymarket(
 
 def run_dataset_quality_report(args: argparse.Namespace) -> None:
     output_path = Path(args.output) if args.output else default_report_path()
-    report = build_dataset_quality_report(
-        args.input,
-        min_quality_tier=args.min_quality_tier,
-        print_top=args.print_top,
+    markdown_output_path = (
+        None
+        if args.no_markdown
+        else Path(args.markdown_output)
+        if args.markdown_output
+        else output_path.with_suffix(".md")
     )
-    write_dataset_quality_report(report, output_path)
-    outcome = report["outcome"]
+    csv_dir = (
+        None
+        if args.no_csv
+        else Path(args.csv_dir)
+        if args.csv_dir
+        else output_path.with_name(f"{output_path.stem}_csv")
+    )
+    try:
+        report = build_phase4_dataset_quality_report(
+            args.input,
+            output_path=output_path,
+            markdown_output_path=markdown_output_path,
+            csv_dir=csv_dir,
+            min_quality_tier=args.min_quality_tier,
+            primary_min_tier=args.primary_min_tier,
+            include_diagnostic=args.include_diagnostic,
+            print_top=args.print_top,
+            mismatch_samples_path=args.mismatch_samples,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    write_phase4_dataset_quality_report(report, output_path)
+    if markdown_output_path is not None:
+        write_phase4_markdown_report(report, markdown_output_path)
+    if csv_dir is not None:
+        write_phase4_csv_outputs(report, csv_dir)
+
+    readiness = report["readiness_assessment"]
     print(
         " ".join(
             [
                 "dataset_quality_report",
                 f"input={args.input}",
                 f"output={output_path}",
-                f"rows={report['included_rows']}/{report['total_rows']}",
-                f"success={outcome['success_count']}",
+                f"markdown={markdown_output_path or '-'}",
+                f"csv_dir={csv_dir or '-'}",
+                f"rows={report['dataset_health']['included_rows']}/{report['dataset_health']['total_rows']}",
+                f"primary={report['dataset_health']['primary_rows']}",
+                f"success={report['dataset_health']['success_count']}",
+                f"readiness={readiness['classification']}",
                 f"warnings={','.join(report['warnings']) or '-'}",
             ]
         ),
         flush=True,
     )
+    if should_fail_for_readiness(readiness["classification"], args.fail_on_readiness):
+        raise SystemExit(f"dataset readiness failed: {readiness['classification']}")
 
 
 def _parse_symbols(value: str) -> tuple[str, ...]:

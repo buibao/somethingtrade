@@ -230,7 +230,7 @@ class GapDetector:
         self.pre_entry_log_cooldown_ms = pre_entry_log_cooldown_ms
         self.require_book_ready = require_book_ready
         self.book_warmup_max_ms = book_warmup_max_ms
-        self.validation_mode = validation_mode
+        self.validation_mode: ValidationMode = validation_mode
         self.validation_tolerance_ticks = validation_tolerance_ticks
         self._detector_started_ns = utc_now_ns()
         self._markets_by_symbol = _markets_by_symbol(markets)

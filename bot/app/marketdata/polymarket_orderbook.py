@@ -110,7 +110,7 @@ class PolymarketLocalOrderBook:
     ) -> None:
         self.token_metadata = token_metadata
         self.stale_after_ms = stale_after_ms
-        self.best_validation_mode = best_validation_mode
+        self.best_validation_mode: BestValidationMode = best_validation_mode
         self.best_validation_tolerance_ticks = best_validation_tolerance_ticks
         self.mismatch_sample_path = None if mismatch_sample_path is None else Path(mismatch_sample_path)
         self.mismatch_sample_per_token_per_min = mismatch_sample_per_token_per_min

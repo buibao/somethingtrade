@@ -61,10 +61,15 @@ Run:
 ```bash
 python -m app.main dataset-quality-report \
   --input data/logs/<your_gap_events_file>.jsonl \
-  --output data/reports/dataset_quality_latest.json
+  --output data/reports/dataset_quality_latest.json \
+  --markdown-output data/reports/dataset_quality_latest.md \
+  --csv-dir data/reports/dataset_quality_latest_csv \
+  --primary-min-tier B
 ```
 
 Before Phase 4, prefer runs with at least 1000 rows, non-zero successes, low D-tier share, low `book_incomplete`, low `quote_stale`, and mostly tolerant/strict validation modes.
+
+See `docs/phase4_dataset_quality_report.md` for the Phase 4.0 readiness classification, CSV layout, and empirical-bucket interpretation.
 
 ## Non-Goals
 
