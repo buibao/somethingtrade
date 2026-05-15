@@ -7,6 +7,7 @@ import aiohttp
 import orjson
 
 from app.config.settings import get_settings
+from app.core.clock import utc_now_ns
 from app.execution.paper_executor import PaperExecutor
 from app.logging.event_logger import AsyncJsonlEventLogger
 from app.marketdata.binance_ws import BinanceWSClient
@@ -15,6 +16,7 @@ from app.marketdata.polymarket_discovery import (
     PolymarketMarketCache,
     PolymarketMarketMetadata,
     flatten_token_ids,
+    select_runtime_markets,
 )
 from app.marketdata.polymarket_ws import PolymarketWSClient
 from app.state.market_state import MarketState
@@ -346,10 +348,18 @@ async def run_polymarket_rolling_discovery_debug(args: argparse.Namespace) -> No
                 "    "
                 + " ".join(
                     [
+                        f"slug={market.get('market_slug')}",
                         f"market_id={market.get('market_id')}",
                         f"asset={market.get('base_asset')}",
                         f"duration={market.get('duration_minutes')}m",
-                        f"end={market.get('end_time')}",
+                        f"eventStartTime={market.get('event_start_time')}",
+                        f"endDate={market.get('end_time')}",
+                        f"active={market.get('active')}",
+                        f"closed={market.get('closed')}",
+                        f"acceptingOrders={market.get('accepting_orders')}",
+                        f"enableOrderBook={market.get('enable_order_book')}",
+                        f"classification={market.get('classification')}",
+                        f"selected_for_runtime={market.get('selected_for_runtime')}",
                         f"UP={market.get('up_token_id')}",
                         f"DOWN={market.get('down_token_id')}",
                         f"outcomes={token_outcomes}",
@@ -407,23 +417,30 @@ def _parse_symbols(value: str) -> tuple[str, ...]:
 async def _discover_polymarket_markets(
     discovery: PolymarketDiscoveryClient,
 ) -> tuple[PolymarketMarketMetadata, ...]:
+    now_ts = utc_now_ns() // 1_000_000_000
     try:
-        markets = await discovery.discover(write_cache=True)
+        discovered = await discovery.discover(write_cache=True, now_ts=now_ts)
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         print(
             "live Polymarket discovery failed "
             f"({type(exc).__name__}: {exc}); trying cached market metadata",
             flush=True,
         )
-        markets = ()
+        discovered = ()
 
-    if markets:
-        return markets
+    if discovered:
+        runtime_markets = select_runtime_markets(discovered, now_ts=now_ts)
+        if runtime_markets:
+            return runtime_markets
+        print(
+            f"discovered {len(discovered)} rolling markets, but none are runtime-tradable/current-next",
+            flush=True,
+        )
 
     cached = _read_cached_polymarket_markets(discovery)
     if cached.markets:
         print(f"using cached Polymarket markets ({len(cached.markets)})", flush=True)
-    return tuple(cached.markets)
+    return select_runtime_markets(cached.markets, now_ts=now_ts)
 
 
 def _read_cached_polymarket_markets(

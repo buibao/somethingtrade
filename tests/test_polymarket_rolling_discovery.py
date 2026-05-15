@@ -1,10 +1,15 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from app.marketdata.polymarket_discovery import (
     PolymarketDiscoveryClient,
+    classify_market_window,
     floor_to_window,
     generate_crypto_updown_slugs,
+    is_runtime_tradable_market,
     parse_market_metadata,
+    select_runtime_markets,
 )
 
 
@@ -16,20 +21,32 @@ def _market_payload(
     question: str | None = None,
     market_id: str = "0xmarket",
     condition_id: str = "0xcondition",
+    end_date: str = "2026-05-15T12:15:00Z",
+    event_start_time: str | None = "2026-05-15T12:00:00Z",
+    active: bool = True,
+    closed: bool = False,
+    accepting_orders: bool = True,
+    enable_order_book: bool = True,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "conditionId": condition_id,
         "market": market_id,
         "slug": slug,
         "question": question or f"{slug} up or down",
-        "endDateIso": "2026-05-15T12:15:00Z",
+        "endDate": end_date,
+        "endDateIso": end_date.split("T", maxsplit=1)[0],
         "clobTokenIds": token_ids,
         "outcomes": outcomes,
         "order_price_min_tick_size": "0.01",
         "minimum_order_size": "5",
-        "active": True,
-        "closed": False,
+        "active": active,
+        "closed": closed,
+        "acceptingOrders": accepting_orders,
+        "enableOrderBook": enable_order_book,
     }
+    if event_start_time is not None:
+        payload["eventStartTime"] = event_start_time
+    return payload
 
 
 def test_floor_to_window_15m() -> None:
@@ -89,6 +106,20 @@ def test_parse_eth_rolling_5m_slug_sets_asset_and_duration() -> None:
     assert metadata.base_asset == "ETH"
     assert metadata.duration_minutes == 5
     assert metadata.market_slug == "eth-updown-5m-1778832900"
+
+
+def test_full_end_date_is_preserved_over_date_only_end_date_iso() -> None:
+    metadata = parse_market_metadata(
+        _market_payload(
+            slug="btc-updown-15m-1778832900",
+            end_date="2026-05-15T15:15:00Z",
+            event_start_time="2026-05-15T15:00:00Z",
+        )
+    )
+
+    assert metadata is not None
+    assert metadata.end_time == "2026-05-15T15:15:00Z"
+    assert metadata.event_start_time == "2026-05-15T15:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -179,6 +210,115 @@ def test_ambiguous_yes_no_rolling_market_rejected_unless_text_resolves_direction
     assert resolved.down_token_id == "down-token"
 
 
+def test_closed_market_is_not_runtime_tradable() -> None:
+    market = parse_market_metadata(
+        _market_payload(slug="btc-updown-15m-1778832900", closed=True)
+    )
+
+    assert market is not None
+    assert is_runtime_tradable_market(market, now_ts=1_778_833_200) is False
+    assert classify_market_window(market, now_ts=1_778_833_200) == "closed"
+
+
+def test_accepting_orders_false_is_not_runtime_tradable() -> None:
+    market = parse_market_metadata(
+        _market_payload(slug="btc-updown-15m-1778832900", accepting_orders=False)
+    )
+
+    assert market is not None
+    assert is_runtime_tradable_market(market, now_ts=1_778_833_200) is False
+    assert classify_market_window(market, now_ts=1_778_833_200) == "not_accepting"
+
+
+def test_expired_but_not_closed_market_is_not_runtime_tradable() -> None:
+    market = parse_market_metadata(
+        _market_payload(
+            slug="btc-updown-15m-1778832900",
+            event_start_time=_iso_from_ts(1_778_832_900),
+            end_date=_iso_from_ts(1_778_833_800),
+        )
+    )
+
+    assert market is not None
+    assert is_runtime_tradable_market(market, now_ts=1_778_833_801) is False
+    assert classify_market_window(market, now_ts=1_778_833_801) == "expired"
+
+
+def test_current_and_next_markets_are_selected_but_later_future_is_not() -> None:
+    current = parse_market_metadata(
+        _market_payload(
+            slug="btc-updown-15m-1778832900",
+            market_id="current",
+            event_start_time=_iso_from_ts(1_778_832_900),
+            end_date=_iso_from_ts(1_778_833_800),
+        )
+    )
+    next_market = parse_market_metadata(
+        _market_payload(
+            slug="btc-updown-15m-1778833800",
+            market_id="next",
+            event_start_time=_iso_from_ts(1_778_833_800),
+            end_date=_iso_from_ts(1_778_834_700),
+        )
+    )
+    later_future = parse_market_metadata(
+        _market_payload(
+            slug="btc-updown-15m-1778834700",
+            market_id="later",
+            event_start_time=_iso_from_ts(1_778_834_700),
+            end_date=_iso_from_ts(1_778_835_600),
+        )
+    )
+    assert current is not None
+    assert next_market is not None
+    assert later_future is not None
+
+    selected = select_runtime_markets(
+        (later_future, next_market, current),
+        now_ts=1_778_833_500,
+    )
+
+    assert [market.market_id for market in selected] == ["current", "next"]
+    assert classify_market_window(current, now_ts=1_778_833_500) == "current"
+    assert classify_market_window(next_market, now_ts=1_778_833_500) == "next"
+    assert classify_market_window(later_future, now_ts=1_778_833_500) == "future"
+
+
+def test_current_and_next_selection_is_per_asset_and_duration() -> None:
+    markets = []
+    for asset, duration, base_start in (
+        ("btc", "5m", 1_778_832_900),
+        ("btc", "15m", 1_778_832_900),
+        ("eth", "5m", 1_778_832_900),
+        ("eth", "15m", 1_778_832_900),
+    ):
+        seconds = 300 if duration == "5m" else 900
+        for index, start_ts in enumerate((base_start, base_start + seconds, base_start + 2 * seconds)):
+            metadata = parse_market_metadata(
+                _market_payload(
+                    slug=f"{asset}-updown-{duration}-{start_ts}",
+                    market_id=f"{asset}-{duration}-{index}",
+                    event_start_time=_iso_from_ts(start_ts),
+                    end_date=_iso_from_ts(start_ts + seconds),
+                )
+            )
+            assert metadata is not None
+            markets.append(metadata)
+
+    selected = select_runtime_markets(tuple(markets), now_ts=1_778_833_000)
+
+    assert [market.market_id for market in selected] == [
+        "btc-5m-0",
+        "btc-5m-1",
+        "btc-15m-0",
+        "btc-15m-1",
+        "eth-5m-0",
+        "eth-5m-1",
+        "eth-15m-0",
+        "eth-15m-1",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_pagination_fallback_stops_on_empty_page() -> None:
     class Client(PolymarketDiscoveryClient):
@@ -222,3 +362,7 @@ async def test_discovery_returns_rolling_markets_before_broad_fallback() -> None
 
     assert markets
     assert markets[0].market_id == "rolling-market"
+
+
+def _iso_from_ts(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=UTC).isoformat().replace("+00:00", "Z")

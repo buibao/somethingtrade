@@ -4,7 +4,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import aiohttp
@@ -71,6 +71,12 @@ class PolymarketMarketMetadata(BaseModel):
     end_time: str
     tick_size: float
     min_order_size: float
+    start_time: str | None = None
+    event_start_time: str | None = None
+    active: bool | None = None
+    closed: bool | None = None
+    accepting_orders: bool | None = None
+    enable_order_book: bool | None = None
     up_token_id: str | None = None
     down_token_id: str | None = None
     yes_token_id: str | None = None
@@ -109,6 +115,14 @@ class PolymarketMarketCache(BaseModel):
 
 FetchMarkets = Callable[[], Sequence[dict[str, Any]]]
 RejectLogger = Callable[[str], None]
+MarketWindowClassification = Literal[
+    "expired",
+    "current",
+    "next",
+    "future",
+    "closed",
+    "not_accepting",
+]
 
 
 class PolymarketDiscoveryClient:
@@ -173,19 +187,31 @@ class PolymarketDiscoveryClient:
         *,
         now_ts: int | None = None,
     ) -> dict[str, Any]:
+        current_ts = now_ts or utc_now_ns() // 1_000_000_000
         markets, results = await self._discover_rolling_slug_candidates(
-            now_ts=now_ts,
+            now_ts=current_ts,
             include_raw=True,
         )
+        selected_keys = _market_keys(select_runtime_markets(markets, now_ts=current_ts))
         slugs = [str(result["slug"]) for result in results]
         found_slugs = [str(result["slug"]) for result in results if result["found"]]
         return {
-            "generated_at_ts": now_ts or utc_now_ns() // 1_000_000_000,
+            "generated_at_ts": current_ts,
             "generated_slugs": slugs,
             "found_slugs": found_slugs,
             "not_found_slugs": [slug for slug in slugs if slug not in set(found_slugs)],
-            "results": results,
-            "markets": [market.model_dump(mode="json") for market in markets],
+            "results": [
+                _enrich_debug_result(result, now_ts=current_ts, selected_keys=selected_keys)
+                for result in results
+            ],
+            "markets": [
+                _debug_market_payload(
+                    market,
+                    now_ts=current_ts,
+                    selected_keys=selected_keys,
+                )
+                for market in markets
+            ],
         }
 
     async def fetch_market_by_slug(self, slug: str) -> dict[str, Any] | None:
@@ -459,6 +485,152 @@ def token_side_labels(
     return mapping
 
 
+def is_runtime_tradable_market(
+    market: PolymarketMarketMetadata,
+    *,
+    now_ts: int,
+) -> bool:
+    """Return whether a discovered market is safe to subscribe for runtime measurement."""
+
+    if market.active is not True:
+        return False
+    if market.closed is not False:
+        return False
+    if market.accepting_orders is not True:
+        return False
+    if market.enable_order_book is not True:
+        return False
+    if market.up_token_id is None or market.down_token_id is None:
+        return False
+    if len(market.token_ids) < 2:
+        return False
+
+    end_ts = _unix_seconds(market.end_time)
+    return end_ts is not None and end_ts > now_ts
+
+
+def classify_market_window(
+    market: PolymarketMarketMetadata,
+    *,
+    now_ts: int,
+) -> MarketWindowClassification:
+    """Classify a rolling market relative to now for debug and runtime selection."""
+
+    if market.closed is True:
+        return "closed"
+    if (
+        market.active is not True
+        or market.accepting_orders is not True
+        or market.enable_order_book is not True
+    ):
+        return "not_accepting"
+
+    end_ts = _unix_seconds(market.end_time)
+    if end_ts is None or end_ts <= now_ts:
+        return "expired"
+
+    start_ts = _market_start_sort_key(market)
+    if start_ts <= now_ts < end_ts:
+        return "current"
+    if start_ts > now_ts:
+        duration_seconds = _market_duration_seconds(market)
+        if duration_seconds is not None and start_ts - now_ts <= duration_seconds:
+            return "next"
+        return "future"
+    return "expired"
+
+
+def select_runtime_markets(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+) -> tuple[PolymarketMarketMetadata, ...]:
+    """Select current plus first future market per asset/duration for live monitoring."""
+
+    groups: dict[tuple[str | None, int | None], list[PolymarketMarketMetadata]] = {}
+    group_order: list[tuple[str | None, int | None]] = []
+    for market in markets:
+        if not is_runtime_tradable_market(market, now_ts=now_ts):
+            continue
+        key = (market.base_asset, market.duration_minutes)
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(market)
+
+    selected: list[PolymarketMarketMetadata] = []
+    for key in group_order:
+        group = groups[key]
+        current = sorted(
+            (market for market in group if _is_current_window(market, now_ts=now_ts)),
+            key=_market_start_sort_key,
+        )
+        selected.extend(current)
+
+        futures = [
+            market
+            for market in group
+            if _market_start_sort_key(market) > now_ts
+        ]
+        if futures:
+            selected.append(min(futures, key=_market_start_sort_key))
+
+    return tuple(selected)
+
+
+def _market_key(market: PolymarketMarketMetadata) -> tuple[str, tuple[str, ...]]:
+    return market.market_id, market.token_ids
+
+
+def _market_keys(
+    markets: Sequence[PolymarketMarketMetadata],
+) -> set[tuple[str, tuple[str, ...]]]:
+    return {_market_key(market) for market in markets}
+
+
+def _debug_market_payload(
+    market: PolymarketMarketMetadata,
+    *,
+    now_ts: int,
+    selected_keys: set[tuple[str, tuple[str, ...]]],
+) -> dict[str, Any]:
+    payload = market.model_dump(mode="json")
+    payload["classification"] = classify_market_window(market, now_ts=now_ts)
+    payload["selected_for_runtime"] = _market_key(market) in selected_keys
+    payload["token_for_up"] = market.token_for_direction("UP")
+    payload["token_for_down"] = market.token_for_direction("DOWN")
+    return payload
+
+
+def _enrich_debug_result(
+    result: dict[str, Any],
+    *,
+    now_ts: int,
+    selected_keys: set[tuple[str, tuple[str, ...]]],
+) -> dict[str, Any]:
+    enriched = dict(result)
+    enriched["parsed_markets"] = [
+        _enrich_debug_market_dict(
+            market,
+            now_ts=now_ts,
+            selected_keys=selected_keys,
+        )
+        for market in result.get("parsed_markets") or []
+        if isinstance(market, dict)
+    ]
+    return enriched
+
+
+def _enrich_debug_market_dict(
+    market_payload: dict[str, Any],
+    *,
+    now_ts: int,
+    selected_keys: set[tuple[str, tuple[str, ...]]],
+) -> dict[str, Any]:
+    market = PolymarketMarketMetadata.model_validate(market_payload)
+    return _debug_market_payload(market, now_ts=now_ts, selected_keys=selected_keys)
+
+
 def is_short_duration_crypto_market(payload: dict[str, Any]) -> bool:
     text = " ".join(
         str(payload.get(key, ""))
@@ -526,13 +698,20 @@ def parse_market_metadata(
         or ""
     )
     description = str(payload.get("description") or payload.get("subtitle") or "")
-    end_time = str(
-        payload.get("endDateIso")
-        or payload.get("endDate")
-        or payload.get("end_time")
-        or payload.get("end")
-        or ""
+    end_time = _best_timestamp_text(
+        payload,
+        ("endDate", "end_time", "end", "endDateIso"),
     )
+    start_time = _best_timestamp_text(
+        payload,
+        ("startDate", "start_time", "startDateIso"),
+    )
+    event_start_time = _best_timestamp_text(
+        payload,
+        ("eventStartTime", "event_start_time", "eventStartDate"),
+    )
+    if not event_start_time:
+        event_start_time = _iso_from_unix_seconds(_rolling_slug_start_ts(market_slug)) or ""
 
     if not condition_id or not market_id or not market_slug or not question:
         reject("missing_required_market_metadata")
@@ -566,6 +745,16 @@ def parse_market_metadata(
             or payload.get("min_order_size")
             or payload.get("rewardsMinSize")
             or 0.0
+        ),
+        start_time=start_time or None,
+        event_start_time=event_start_time or None,
+        active=_bool_from_any(_first_present(payload, ("active",))),
+        closed=_bool_from_any(_first_present(payload, ("closed",))),
+        accepting_orders=_bool_from_any(
+            _first_present(payload, ("acceptingOrders", "accepting_orders"))
+        ),
+        enable_order_book=_bool_from_any(
+            _first_present(payload, ("enableOrderBook", "enable_order_book"))
         ),
         up_token_id=mapping.up_token_id,
         down_token_id=mapping.down_token_id,
@@ -663,8 +852,8 @@ def infer_duration_minutes(payload: dict[str, Any]) -> int | None:
     if re.search(r"(?<!\d)5[\s-]?(?:m|min|minute)s?(?!\d)", text):
         return 5
 
-    start = _parse_datetime(payload.get("startDate") or payload.get("start_time"))
-    end = _parse_datetime(payload.get("endDateIso") or payload.get("endDate") or payload.get("end_time"))
+    start = _parse_datetime(_best_timestamp_text(payload, ("startDate", "start_time", "startDateIso")))
+    end = _parse_datetime(_best_timestamp_text(payload, ("endDate", "end_time", "endDateIso")))
     if start is None or end is None:
         return None
     minutes = round((end - start).total_seconds() / 60)
@@ -738,6 +927,52 @@ def _parse_datetime(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _unix_seconds(value: object) -> int | None:
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return None
+    return int(parsed.timestamp())
+
+
+def _iso_from_unix_seconds(value: int | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value, tz=UTC).isoformat().replace("+00:00", "Z")
+
+
+def _best_timestamp_text(payload: dict[str, Any], keys: Sequence[str]) -> str:
+    values = [
+        str(payload[key]).strip()
+        for key in keys
+        if payload.get(key) is not None and str(payload[key]).strip()
+    ]
+    for value in values:
+        if "T" in value or " " in value:
+            return value
+    return values[0] if values else ""
+
+
+def _first_present(payload: dict[str, Any], keys: Sequence[str]) -> object:
+    for key in keys:
+        if key in payload and payload[key] is not None:
+            return payload[key]
+    return None
+
+
+def _bool_from_any(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    if isinstance(value, int | float):
+        return bool(value)
+    return None
+
+
 def _float_from_any(value: object) -> float:
     if isinstance(value, int | float | str | bytes):
         return float(value)
@@ -748,6 +983,37 @@ def _rolling_slug_parts(text: str) -> tuple[str, str, int] | None:
     for match in ROLLING_UPDOWN_SLUG_RE.finditer(text.lower()):
         return match.group(1), match.group(2), int(match.group(3))
     return None
+
+
+def _rolling_slug_start_ts(slug: str) -> int | None:
+    parts = _rolling_slug_parts(slug)
+    return None if parts is None else parts[2]
+
+
+def _market_duration_seconds(market: PolymarketMarketMetadata) -> int | None:
+    if market.duration_minutes is None:
+        return None
+    return market.duration_minutes * 60
+
+
+def _market_start_sort_key(market: PolymarketMarketMetadata) -> int:
+    return (
+        _unix_seconds(market.event_start_time)
+        or _unix_seconds(market.start_time)
+        or _rolling_slug_start_ts(market.market_slug)
+        or 0
+    )
+
+
+def _is_current_window(
+    market: PolymarketMarketMetadata,
+    *,
+    now_ts: int,
+) -> bool:
+    end_ts = _unix_seconds(market.end_time)
+    if end_ts is None:
+        return False
+    return _market_start_sort_key(market) <= now_ts < end_ts
 
 
 def _extract_market_payloads(
@@ -794,8 +1060,23 @@ def _merge_event_market_payload(
     if question:
         merged["question"] = question
 
-    for key in ("endDateIso", "endDate", "end_time", "active", "closed"):
-        if not merged.get(key) and event.get(key) is not None:
+    for key in (
+        "endDate",
+        "endDateIso",
+        "end_time",
+        "startDate",
+        "startDateIso",
+        "start_time",
+        "eventStartTime",
+        "event_start_time",
+        "active",
+        "closed",
+        "acceptingOrders",
+        "accepting_orders",
+        "enableOrderBook",
+        "enable_order_book",
+    ):
+        if key not in merged and event.get(key) is not None:
             merged[key] = event[key]
 
     return merged
