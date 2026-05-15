@@ -94,13 +94,15 @@ def test_discovery_parses_and_caches_short_duration_markets(tmp_path) -> None:
         "market": "0xmarket",
         "slug": "bitcoin-up-or-down-15m",
         "question": "Bitcoin Up or Down - 15 minute",
-        "endDateIso": "2026-05-15T12:15:00Z",
+        "endDateIso": "2099-05-15T12:15:00Z",
         "clobTokenIds": '["yes-token","no-token"]',
         "outcomes": '["Up","Down"]',
         "order_price_min_tick_size": "0.01",
         "minimum_order_size": "5",
         "active": True,
         "closed": False,
+        "acceptingOrders": True,
+        "enableOrderBook": True,
     }
     cache_path = tmp_path / "polymarket_markets.json"
     client = PolymarketDiscoveryClient(
@@ -115,7 +117,16 @@ def test_discovery_parses_and_caches_short_duration_markets(tmp_path) -> None:
     cached = client.read_cache()
 
     assert len(markets) == 1
-    assert parse_market_metadata(payload) == markets[0]
+    parsed = parse_market_metadata(payload)
+    assert parsed is not None
+    assert markets[0].model_dump(
+        exclude={"classification", "selected_for_runtime", "signal_enabled", "runtime_selection_reason"}
+    ) == parsed.model_dump(
+        exclude={"classification", "selected_for_runtime", "signal_enabled", "runtime_selection_reason"}
+    )
+    assert markets[0].classification == "current"
+    assert markets[0].selected_for_runtime is True
+    assert markets[0].signal_enabled is True
     assert markets[0].up_token_id == "yes-token"
     assert markets[0].down_token_id == "no-token"
     assert markets[0].token_for_direction("UP") == "yes-token"
@@ -141,7 +152,16 @@ def test_discovery_uses_cache_when_live_fetch_fails(tmp_path, capsys) -> None:
     markets = asyncio.run(_discover_polymarket_markets(client))
 
     captured = capsys.readouterr()
-    assert markets == (market,)
+    assert markets == (
+        market.model_copy(
+            update={
+                "classification": "current",
+                "selected_for_runtime": True,
+                "signal_enabled": True,
+                "runtime_selection_reason": "current_signal",
+            }
+        ),
+    )
     assert "live Polymarket discovery failed" in captured.out
     assert "using cached Polymarket markets (1)" in captured.out
 

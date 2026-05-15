@@ -16,7 +16,11 @@ from app.core.events import (
     RejectStage,
     TradableGapObservation,
 )
-from app.marketdata.polymarket_discovery import PolymarketMarketMetadata
+from app.marketdata.polymarket_discovery import (
+    PolymarketMarketMetadata,
+    classify_market_window,
+    is_runtime_tradable_market,
+)
 from app.state.market_state import MarketState, SymbolState
 
 RETURN_KEYS = ("1s", "5s", "15s", "30s")
@@ -110,6 +114,11 @@ class GapMonitorStats:
     reject_count_by_reason: dict[str, int]
     reject_count_by_stage: dict[str, int]
     stale_feed_count: int
+    pre_entry_observations_written: int = 0
+    pre_entry_observations_suppressed: int = 0
+    warmup_quotes_received: int = 0
+    signal_enabled_markets: int = 0
+    warmup_only_markets: int = 0
 
     @property
     def detected_count(self) -> int:
@@ -151,6 +160,7 @@ class GapDetector:
         binance_stale_ms: float = 500.0,
         polymarket_stale_ms: float = 1_000.0,
         measurement_stale_ms: float = 5_000.0,
+        pre_entry_log_cooldown_ms: float = 500.0,
     ) -> None:
         self.markets = markets
         self.min_move_pct = min_move_pct
@@ -162,15 +172,21 @@ class GapDetector:
         self.binance_stale_ms = binance_stale_ms
         self.polymarket_stale_ms = polymarket_stale_ms
         self.measurement_stale_ms = measurement_stale_ms
+        self.pre_entry_log_cooldown_ms = pre_entry_log_cooldown_ms
         self._markets_by_symbol = _markets_by_symbol(markets)
+        self._markets_by_token = _markets_by_token(markets)
         self._pending: dict[tuple[str, str, GapDirection], PendingTradableGap] = {}
         self._completed: list[TradableGapObservation] = []
         self._invalid_markets: set[str] = set()
+        self._last_pre_entry_log_ns: dict[tuple[str, str, GapDirection, str], int] = {}
         self._reject_count_by_reason: dict[str, int] = {}
         self._reject_count_by_stage: dict[str, int] = {}
         self.detected_gaps = 0
         self.fillable_at_detection_count = 0
         self.non_fillable_at_detection_count = 0
+        self.pre_entry_observations_written = 0
+        self.pre_entry_observations_suppressed = 0
+        self.warmup_quotes_received = 0
 
     def on_market_event(
         self,
@@ -204,6 +220,7 @@ class GapDetector:
                 )
             )
         elif isinstance(event, PolymarketQuote):
+            self._record_warmup_quote(event, now_ts=current_ts)
             closed.extend(
                 self._handle_polymarket_quote(
                     event,
@@ -260,6 +277,20 @@ class GapDetector:
             for event in self._completed
             if event.reject_stage != "none"
         )
+        signal_enabled_markets = sum(
+            1 for market in self.markets if self._market_signal_enabled(market, current_ts)
+        )
+        warmup_only_markets = sum(
+            1
+            for market in self.markets
+            if market.selected_for_runtime
+            and not self._market_signal_enabled(market, current_ts)
+            and classify_market_window(
+                market,
+                now_ts=current_ts // 1_000_000_000,
+            )
+            == "next"
+        )
         return GapMonitorStats(
             detected_gaps=self.detected_gaps,
             completed_gaps=len(self._completed),
@@ -283,6 +314,11 @@ class GapDetector:
             reject_count_by_reason=reject_count_by_reason,
             reject_count_by_stage=reject_count_by_stage,
             stale_feed_count=self.stale_feed_count(state, now_ts=current_ts),
+            pre_entry_observations_written=self.pre_entry_observations_written,
+            pre_entry_observations_suppressed=self.pre_entry_observations_suppressed,
+            warmup_quotes_received=self.warmup_quotes_received,
+            signal_enabled_markets=signal_enabled_markets,
+            warmup_only_markets=warmup_only_markets,
         )
 
     def stale_feed_count(self, state: MarketState, *, now_ts: int | None = None) -> int:
@@ -345,43 +381,44 @@ class GapDetector:
 
         direction: GapDirection = "UP" if move_pct > 0.0 else "DOWN"
         for market in markets:
+            if not self._market_signal_enabled(market, now_ts):
+                continue
+
             self.detected_gaps += 1
             token_id = market.token_for_direction(direction)
 
             if market.market_id in self._invalid_markets or state.is_market_invalid(
                 market.market_id
             ):
-                observations.append(
-                    self._record_pre_entry_observation(
-                        self._pre_entry_observation(
-                            symbol=symbol,
-                            market=market,
-                            direction=direction,
-                            token_id=token_id or "",
-                            move_pct=move_pct,
-                            now_ts=now_ts,
-                            binance_event_ts=binance_event_ts,
-                            quote=None,
-                            reason="market_invalidated",
-                        )
+                self._append_pre_entry_observation(
+                    observations,
+                    self._pre_entry_observation(
+                        symbol=symbol,
+                        market=market,
+                        direction=direction,
+                        token_id=token_id or "",
+                        move_pct=move_pct,
+                        now_ts=now_ts,
+                        binance_event_ts=binance_event_ts,
+                        quote=None,
+                        reason="market_invalidated",
                     )
                 )
                 continue
 
             if token_id is None:
-                observations.append(
-                    self._record_pre_entry_observation(
-                        self._pre_entry_observation(
-                            symbol=symbol,
-                            market=market,
-                            direction=direction,
-                            token_id="",
-                            move_pct=move_pct,
-                            now_ts=now_ts,
-                            binance_event_ts=binance_event_ts,
-                            quote=None,
-                            reason="direction_token_unmapped",
-                        )
+                self._append_pre_entry_observation(
+                    observations,
+                    self._pre_entry_observation(
+                        symbol=symbol,
+                        market=market,
+                        direction=direction,
+                        token_id="",
+                        move_pct=move_pct,
+                        now_ts=now_ts,
+                        binance_event_ts=binance_event_ts,
+                        quote=None,
+                        reason="direction_token_unmapped",
                     )
                 )
                 continue
@@ -392,19 +429,18 @@ class GapDetector:
 
             quote = state.polymarket_quotes.get(token_id)
             if quote is None:
-                observations.append(
-                    self._record_pre_entry_observation(
-                        self._pre_entry_observation(
-                            symbol=symbol,
-                            market=market,
-                            direction=direction,
-                            token_id=token_id,
-                            move_pct=move_pct,
-                            now_ts=now_ts,
-                            binance_event_ts=binance_event_ts,
-                            quote=None,
-                            reason="missing_quote",
-                        )
+                self._append_pre_entry_observation(
+                    observations,
+                    self._pre_entry_observation(
+                        symbol=symbol,
+                        market=market,
+                        direction=direction,
+                        token_id=token_id,
+                        move_pct=move_pct,
+                        now_ts=now_ts,
+                        binance_event_ts=binance_event_ts,
+                        quote=None,
+                        reason="missing_quote",
                     )
                 )
                 continue
@@ -414,38 +450,36 @@ class GapDetector:
                 now_monotonic_ns=now_monotonic_ns,
                 stale_ms=self.polymarket_stale_ms,
             ):
-                observations.append(
-                    self._record_pre_entry_observation(
-                        self._pre_entry_observation(
-                            symbol=symbol,
-                            market=market,
-                            direction=direction,
-                            token_id=token_id,
-                            move_pct=move_pct,
-                            now_ts=now_ts,
-                            binance_event_ts=binance_event_ts,
-                            quote=quote,
-                            reason="quote_stale",
-                        )
+                self._append_pre_entry_observation(
+                    observations,
+                    self._pre_entry_observation(
+                        symbol=symbol,
+                        market=market,
+                        direction=direction,
+                        token_id=token_id,
+                        move_pct=move_pct,
+                        now_ts=now_ts,
+                        binance_event_ts=binance_event_ts,
+                        quote=quote,
+                        reason="quote_stale",
                     )
                 )
                 continue
 
             fillable, reject_reason = self._fillable_before_repricing(market, quote)
             if not fillable:
-                observations.append(
-                    self._record_pre_entry_observation(
-                        self._pre_entry_observation(
-                            symbol=symbol,
-                            market=market,
-                            direction=direction,
-                            token_id=token_id,
-                            move_pct=move_pct,
-                            now_ts=now_ts,
-                            binance_event_ts=binance_event_ts,
-                            quote=quote,
-                            reason=reject_reason or "quote_not_fillable",
-                        )
+                self._append_pre_entry_observation(
+                    observations,
+                    self._pre_entry_observation(
+                        symbol=symbol,
+                        market=market,
+                        direction=direction,
+                        token_id=token_id,
+                        move_pct=move_pct,
+                        now_ts=now_ts,
+                        binance_event_ts=binance_event_ts,
+                        quote=quote,
+                        reason=reject_reason or "quote_not_fillable",
                     )
                 )
                 continue
@@ -898,15 +932,60 @@ class GapDetector:
             reject_reason=reason,
         )
 
+    def _append_pre_entry_observation(
+        self,
+        observations: list[TradableGapObservation],
+        observation: TradableGapObservation,
+    ) -> None:
+        recorded = self._record_pre_entry_observation(observation)
+        if recorded is not None:
+            observations.append(recorded)
+
     def _record_pre_entry_observation(
         self,
         observation: TradableGapObservation,
-    ) -> TradableGapObservation:
+    ) -> TradableGapObservation | None:
         self.non_fillable_at_detection_count += 1
+        cooldown_key = (
+            observation.symbol,
+            observation.market_id,
+            observation.direction,
+            observation.pre_entry_reject_reason or observation.reject_reason or "",
+        )
+        last_logged_ns = self._last_pre_entry_log_ns.get(cooldown_key)
+        if last_logged_ns is not None:
+            elapsed_ms = _duration_ms(last_logged_ns, observation.detected_ts_ns)
+            if elapsed_ms is not None and elapsed_ms < self.pre_entry_log_cooldown_ms:
+                self.pre_entry_observations_suppressed += 1
+                return None
+
+        self._last_pre_entry_log_ns[cooldown_key] = observation.detected_ts_ns
+        self.pre_entry_observations_written += 1
         if observation.reject_reason is not None:
             self._record_reject(observation.reject_reason, "pre_entry")
         self._completed.append(observation)
         return observation
+
+    def _record_warmup_quote(self, quote: PolymarketQuote, *, now_ts: int) -> None:
+        market = self._markets_by_token.get(quote.token_id)
+        if market is None:
+            return
+        if (
+            market.selected_for_runtime
+            and not self._market_signal_enabled(market, now_ts)
+            and classify_market_window(market, now_ts=now_ts // 1_000_000_000) == "next"
+        ):
+            self.warmup_quotes_received += 1
+
+    def _market_signal_enabled(
+        self,
+        market: PolymarketMarketMetadata,
+        now_ts: int,
+    ) -> bool:
+        return (
+            is_runtime_tradable_market(market, now_ts=now_ts // 1_000_000_000)
+            and classify_market_window(market, now_ts=now_ts // 1_000_000_000) == "current"
+        )
 
     def _record_reject(self, reason: str, stage: RejectStage) -> None:
         self._reject_count_by_reason[reason] = self._reject_count_by_reason.get(reason, 0) + 1
@@ -934,6 +1013,16 @@ def _markets_by_symbol(
             continue
         grouped.setdefault(symbol, []).append(market)
     return {symbol: tuple(items) for symbol, items in grouped.items()}
+
+
+def _markets_by_token(
+    markets: tuple[PolymarketMarketMetadata, ...],
+) -> dict[str, PolymarketMarketMetadata]:
+    mapping: dict[str, PolymarketMarketMetadata] = {}
+    for market in markets:
+        for token_id in market.token_ids:
+            mapping[token_id] = market
+    return mapping
 
 
 def _symbol_for_market(market: PolymarketMarketMetadata) -> str | None:

@@ -15,6 +15,7 @@ from app.marketdata.polymarket_discovery import (
     PolymarketDiscoveryClient,
     PolymarketMarketCache,
     PolymarketMarketMetadata,
+    annotate_runtime_market_roles,
     flatten_token_ids,
     select_runtime_markets,
 )
@@ -130,6 +131,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Wider feed stale threshold for monitor stats.",
+    )
+    gap_monitor.add_argument(
+        "--pre-entry-log-cooldown-ms",
+        type=float,
+        default=None,
+        help="Cooldown for duplicate pre-entry reject JSONL rows.",
     )
 
     rolling_debug = subparsers.add_parser(
@@ -280,6 +287,10 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
             args.measurement_stale_ms,
             settings.gap_measurement_stale_ms,
         ),
+        pre_entry_log_cooldown_ms=_arg_or_setting(
+            args.pre_entry_log_cooldown_ms,
+            settings.gap_pre_entry_log_cooldown_ms,
+        ),
     )
     symbols = _symbols_for_markets(markets) or settings.binance_symbols
     binance = BinanceWSClient(
@@ -360,6 +371,8 @@ async def run_polymarket_rolling_discovery_debug(args: argparse.Namespace) -> No
                         f"enableOrderBook={market.get('enable_order_book')}",
                         f"classification={market.get('classification')}",
                         f"selected_for_runtime={market.get('selected_for_runtime')}",
+                        f"signal_enabled={market.get('signal_enabled')}",
+                        f"runtime_selection_reason={market.get('runtime_selection_reason')}",
                         f"UP={market.get('up_token_id')}",
                         f"DOWN={market.get('down_token_id')}",
                         f"outcomes={token_outcomes}",
@@ -429,6 +442,7 @@ async def _discover_polymarket_markets(
         discovered = ()
 
     if discovered:
+        _print_runtime_selection_diagnostics(discovered)
         runtime_markets = select_runtime_markets(discovered, now_ts=now_ts)
         if runtime_markets:
             return runtime_markets
@@ -439,8 +453,11 @@ async def _discover_polymarket_markets(
 
     cached = _read_cached_polymarket_markets(discovery)
     if cached.markets:
-        print(f"using cached Polymarket markets ({len(cached.markets)})", flush=True)
-    return select_runtime_markets(cached.markets, now_ts=now_ts)
+        cached_markets = annotate_runtime_market_roles(cached.markets, now_ts=now_ts)
+        print(f"using cached Polymarket markets ({len(cached_markets)})", flush=True)
+        _print_runtime_selection_diagnostics(cached_markets)
+        return select_runtime_markets(cached_markets, now_ts=now_ts)
+    return ()
 
 
 def _read_cached_polymarket_markets(
@@ -470,10 +487,49 @@ def _print_polymarket_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> 
                     f"DOWN={_short_token(market.down_token_id)}",
                     f"tick={market.tick_size:g}",
                     f"min={market.min_order_size:g}",
+                    f"classification={market.classification or '-'}",
+                    f"signal={market.signal_enabled}",
                 ]
             ),
             flush=True,
         )
+
+
+def _print_runtime_selection_diagnostics(
+    markets: Sequence[PolymarketMarketMetadata],
+) -> None:
+    selected_count = sum(1 for market in markets if market.selected_for_runtime)
+    signal_count = sum(1 for market in markets if market.signal_enabled)
+    warmup_count = sum(
+        1
+        for market in markets
+        if market.selected_for_runtime and not market.signal_enabled
+    )
+    skipped_by_classification: dict[str, int] = {}
+    for market in markets:
+        if market.selected_for_runtime:
+            continue
+        classification = market.classification or "unknown"
+        skipped_by_classification[classification] = (
+            skipped_by_classification.get(classification, 0) + 1
+        )
+    skipped = ",".join(
+        f"{classification}:{count}"
+        for classification, count in sorted(skipped_by_classification.items())
+    )
+    print(
+        " ".join(
+            [
+                "Polymarket runtime selection:",
+                f"total={len(markets)}",
+                f"selected_for_runtime={selected_count}",
+                f"signal_enabled={signal_count}",
+                f"warmup_only={warmup_count}",
+                f"skipped_by_classification={skipped or '-'}",
+            ]
+        ),
+        flush=True,
+    )
 
 
 def _symbols_for_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> tuple[str, ...]:
@@ -507,6 +563,11 @@ def _format_gap_stats(stats: GapMonitorStats) -> str:
             f"completed={stats.completed_count}",
             f"fillable={stats.fillable_at_detection_count}",
             f"non_fillable={stats.non_fillable_at_detection_count}",
+            f"pre_entry_written={stats.pre_entry_observations_written}",
+            f"pre_entry_suppressed={stats.pre_entry_observations_suppressed}",
+            f"warmup_quotes={stats.warmup_quotes_received}",
+            f"signal_markets={stats.signal_enabled_markets}",
+            f"warmup_markets={stats.warmup_only_markets}",
             f"median_mid={_fmt_ms(stats.median_mid_repricing_delay_ms)}",
             f"p95_mid={_fmt_ms(stats.p95_mid_repricing_delay_ms)}",
             f"median_exec={_fmt_ms(stats.median_executable_repricing_delay_ms)}",

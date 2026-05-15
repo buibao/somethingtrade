@@ -22,6 +22,14 @@ UP_OUTCOMES = {"up", "above", "higher"}
 DOWN_OUTCOMES = {"down", "below", "lower"}
 ROLLING_HORIZON_SECONDS = {"5m": 300, "15m": 900}
 ROLLING_UPDOWN_SLUG_RE = re.compile(r"\b(btc|eth)-updown-(5m|15m)-(\d+)\b")
+MarketWindowClassification = Literal[
+    "expired",
+    "current",
+    "next",
+    "future",
+    "closed",
+    "not_accepting",
+]
 
 
 def floor_to_window(ts: int, window_seconds: int) -> int:
@@ -71,12 +79,17 @@ class PolymarketMarketMetadata(BaseModel):
     end_time: str
     tick_size: float
     min_order_size: float
+    rewards_min_size: float | None = None
     start_time: str | None = None
     event_start_time: str | None = None
     active: bool | None = None
     closed: bool | None = None
     accepting_orders: bool | None = None
     enable_order_book: bool | None = None
+    classification: MarketWindowClassification | None = None
+    selected_for_runtime: bool = False
+    signal_enabled: bool = False
+    runtime_selection_reason: str | None = None
     up_token_id: str | None = None
     down_token_id: str | None = None
     yes_token_id: str | None = None
@@ -115,14 +128,6 @@ class PolymarketMarketCache(BaseModel):
 
 FetchMarkets = Callable[[], Sequence[dict[str, Any]]]
 RejectLogger = Callable[[str], None]
-MarketWindowClassification = Literal[
-    "expired",
-    "current",
-    "next",
-    "future",
-    "closed",
-    "not_accepting",
-]
 
 
 class PolymarketDiscoveryClient:
@@ -157,15 +162,23 @@ class PolymarketDiscoveryClient:
         write_cache: bool = True,
         now_ts: int | None = None,
     ) -> tuple[PolymarketMarketMetadata, ...]:
+        current_ts = now_ts or utc_now_ns() // 1_000_000_000
         if self.enable_direct_slug_lookup:
-            rolling_markets = await self.discover_rolling_markets(now_ts=now_ts)
+            rolling_markets = await self.discover_rolling_markets(now_ts=current_ts)
             if rolling_markets:
+                rolling_markets = annotate_runtime_market_roles(
+                    rolling_markets,
+                    now_ts=current_ts,
+                )
                 if write_cache:
                     self.write_cache(rolling_markets)
                 return rolling_markets
 
         raw_markets = await self._fetch_raw_market_payloads()
-        markets = self._parse_market_payloads(raw_markets)
+        markets = annotate_runtime_market_roles(
+            self._parse_market_payloads(raw_markets),
+            now_ts=current_ts,
+        )
 
         if write_cache:
             self.write_cache(markets)
@@ -176,11 +189,12 @@ class PolymarketDiscoveryClient:
         *,
         now_ts: int | None = None,
     ) -> tuple[PolymarketMarketMetadata, ...]:
+        current_ts = now_ts or utc_now_ns() // 1_000_000_000
         markets, _ = await self._discover_rolling_slug_candidates(
-            now_ts=now_ts,
+            now_ts=current_ts,
             include_raw=False,
         )
-        return tuple(markets)
+        return annotate_runtime_market_roles(markets, now_ts=current_ts)
 
     async def debug_rolling_discovery(
         self,
@@ -547,6 +561,59 @@ def select_runtime_markets(
 ) -> tuple[PolymarketMarketMetadata, ...]:
     """Select current plus first future market per asset/duration for live monitoring."""
 
+    annotated = annotate_runtime_market_roles(markets, now_ts=now_ts)
+    selected_by_key = {_market_key(market): market for market in annotated}
+    return tuple(
+        selected_by_key[key]
+        for key in _select_runtime_market_key_order(markets, now_ts=now_ts)
+        if key in selected_by_key
+    )
+
+
+def annotate_runtime_market_roles(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+) -> tuple[PolymarketMarketMetadata, ...]:
+    selected_keys = _select_runtime_market_keys(markets, now_ts=now_ts)
+    annotated: list[PolymarketMarketMetadata] = []
+    for market in markets:
+        classification = classify_market_window(market, now_ts=now_ts)
+        selected = _market_key(market) in selected_keys
+        if selected and classification in {"future", "next"}:
+            classification = "next"
+        signal_enabled = selected and classification == "current"
+        reason = _runtime_selection_reason(
+            classification=classification,
+            selected=selected,
+            signal_enabled=signal_enabled,
+        )
+        annotated.append(
+            market.model_copy(
+                update={
+                    "classification": classification,
+                    "selected_for_runtime": selected,
+                    "signal_enabled": signal_enabled,
+                    "runtime_selection_reason": reason,
+                }
+            )
+        )
+    return tuple(annotated)
+
+
+def _select_runtime_market_keys(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+) -> set[tuple[str, tuple[str, ...]]]:
+    return set(_select_runtime_market_key_order(markets, now_ts=now_ts))
+
+
+def _select_runtime_market_key_order(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+) -> list[tuple[str, tuple[str, ...]]]:
     groups: dict[tuple[str | None, int | None], list[PolymarketMarketMetadata]] = {}
     group_order: list[tuple[str | None, int | None]] = []
     for market in markets:
@@ -575,7 +642,20 @@ def select_runtime_markets(
         if futures:
             selected.append(min(futures, key=_market_start_sort_key))
 
-    return tuple(selected)
+    return [_market_key(market) for market in selected]
+
+
+def _runtime_selection_reason(
+    *,
+    classification: MarketWindowClassification,
+    selected: bool,
+    signal_enabled: bool,
+) -> str:
+    if signal_enabled:
+        return "current_signal"
+    if selected:
+        return "next_warmup"
+    return classification
 
 
 def _market_key(market: PolymarketMarketMetadata) -> tuple[str, tuple[str, ...]]:
@@ -594,9 +674,20 @@ def _debug_market_payload(
     now_ts: int,
     selected_keys: set[tuple[str, tuple[str, ...]]],
 ) -> dict[str, Any]:
+    classification = classify_market_window(market, now_ts=now_ts)
+    selected = _market_key(market) in selected_keys
+    if selected and classification in {"future", "next"}:
+        classification = "next"
+    signal_enabled = selected and classification == "current"
     payload = market.model_dump(mode="json")
-    payload["classification"] = classify_market_window(market, now_ts=now_ts)
-    payload["selected_for_runtime"] = _market_key(market) in selected_keys
+    payload["classification"] = classification
+    payload["selected_for_runtime"] = selected
+    payload["signal_enabled"] = signal_enabled
+    payload["runtime_selection_reason"] = _runtime_selection_reason(
+        classification=classification,
+        selected=selected,
+        signal_enabled=signal_enabled,
+    )
     payload["token_for_up"] = market.token_for_direction("UP")
     payload["token_for_down"] = market.token_for_direction("DOWN")
     return payload
@@ -741,10 +832,16 @@ def parse_market_metadata(
             or 0.01
         ),
         min_order_size=_float_from_any(
-            payload.get("minimum_order_size")
+            payload.get("orderMinSize")
+            or payload.get("order_min_size")
+            or payload.get("minimum_order_size")
             or payload.get("min_order_size")
-            or payload.get("rewardsMinSize")
             or 0.0
+        ),
+        rewards_min_size=(
+            _float_from_any(payload.get("rewardsMinSize"))
+            if payload.get("rewardsMinSize") is not None
+            else None
         ),
         start_time=start_time or None,
         event_start_time=event_start_time or None,
@@ -1075,6 +1172,11 @@ def _merge_event_market_payload(
         "accepting_orders",
         "enableOrderBook",
         "enable_order_book",
+        "orderMinSize",
+        "order_min_size",
+        "minimum_order_size",
+        "min_order_size",
+        "rewardsMinSize",
     ):
         if key not in merged and event.get(key) is not None:
             merged[key] = event[key]

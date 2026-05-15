@@ -122,6 +122,32 @@ def test_full_end_date_is_preserved_over_date_only_end_date_iso() -> None:
     assert metadata.event_start_time == "2026-05-15T15:00:00Z"
 
 
+def test_order_min_size_is_preferred_over_rewards_min_size() -> None:
+    payload = _market_payload(slug="btc-updown-15m-1778832900")
+    payload.pop("minimum_order_size")
+    payload["orderMinSize"] = "5"
+    payload["rewardsMinSize"] = "50"
+
+    metadata = parse_market_metadata(payload)
+
+    assert metadata is not None
+    assert metadata.min_order_size == pytest.approx(5.0)
+    assert metadata.rewards_min_size == pytest.approx(50.0)
+
+
+def test_missing_order_min_size_does_not_use_rewards_min_size_for_fillability() -> None:
+    payload = _market_payload(slug="btc-updown-15m-1778832900")
+    payload.pop("minimum_order_size")
+    payload["rewardsMinSize"] = "50"
+
+    metadata = parse_market_metadata(payload)
+
+    assert metadata is not None
+    assert metadata.min_order_size != pytest.approx(50.0)
+    assert metadata.min_order_size == pytest.approx(0.0)
+    assert metadata.rewards_min_size == pytest.approx(50.0)
+
+
 @pytest.mark.asyncio
 async def test_direct_market_slug_up_down_maps_correctly() -> None:
     class Client(PolymarketDiscoveryClient):
@@ -282,6 +308,12 @@ def test_current_and_next_markets_are_selected_but_later_future_is_not() -> None
     assert classify_market_window(current, now_ts=1_778_833_500) == "current"
     assert classify_market_window(next_market, now_ts=1_778_833_500) == "next"
     assert classify_market_window(later_future, now_ts=1_778_833_500) == "future"
+    assert selected[0].selected_for_runtime is True
+    assert selected[0].signal_enabled is True
+    assert selected[0].classification == "current"
+    assert selected[1].selected_for_runtime is True
+    assert selected[1].signal_enabled is False
+    assert selected[1].classification == "next"
 
 
 def test_current_and_next_selection_is_per_asset_and_duration() -> None:

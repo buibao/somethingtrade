@@ -37,6 +37,10 @@ class Settings(BaseModel):
     gap_binance_stale_ms: float = Field(500.0, alias="GAP_BINANCE_STALE_MS")
     gap_polymarket_stale_ms: float = Field(1_000.0, alias="GAP_POLYMARKET_STALE_MS")
     gap_measurement_stale_ms: float = Field(5_000.0, alias="GAP_MEASUREMENT_STALE_MS")
+    gap_pre_entry_log_cooldown_ms: float = Field(
+        500.0,
+        alias="GAP_PRE_ENTRY_LOG_COOLDOWN_MS",
+    )
     polymarket_api_key: str = Field("replace-me", alias="POLYMARKET_API_KEY")
     wallet_private_key: str = Field("replace-me", alias="WALLET_PRIVATE_KEY")
     mode: Literal["paper", "live"] = Field("paper", alias="MODE")
@@ -72,6 +76,7 @@ def get_settings() -> Settings:
             "GAP_BINANCE_STALE_MS",
             "GAP_POLYMARKET_STALE_MS",
             "GAP_MEASUREMENT_STALE_MS",
+            "GAP_PRE_ENTRY_LOG_COOLDOWN_MS",
             "POLYMARKET_API_KEY",
             "WALLET_PRIVATE_KEY",
             "MODE",
