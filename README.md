@@ -57,7 +57,7 @@ See `docs/polymarket_notes.md` for API assumptions and cache contents. Real orde
 
 ## Gap Monitor
 
-Phase 3.8 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates mid repricing from executable repricing, measures the true fillable stale-quote window, and records reject stage/reason taxonomy for modeling.
+Phase 3.9 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates mid repricing from executable repricing, measures the true fillable stale-quote window, and records reject stage/reason taxonomy for modeling.
 
 ```bash
 python -m app.main gap-monitor

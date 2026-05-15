@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from statistics import median
 from typing import Literal
@@ -84,8 +85,11 @@ class PendingTradableGap:
     current_spread: float | None = None
     current_quote_ts_ns: int | None = None
     current_quote_monotonic_ns: int | None = None
+    pre_entry_reject_reason: str | None = None
     window_end_reason: str | None = None
     exit_reject_reason: str | None = None
+    lifecycle_reason: str | None = None
+    timeout_reason: str | None = None
     close_reason: str | None = None
     reject_stage: RejectStage = "none"
 
@@ -180,20 +184,24 @@ class GapDetector:
         closed: list[TradableGapObservation] = []
 
         if isinstance(event, MarketTick) and event.source == "binance":
-            self._detect_binance_move(
-                event.symbol,
-                state,
-                now_ts=current_ts,
-                now_monotonic_ns=current_mono,
-                binance_event_ts=event.exchange_event_ts or event.local_received_ts,
+            closed.extend(
+                self._detect_binance_move(
+                    event.symbol,
+                    state,
+                    now_ts=current_ts,
+                    now_monotonic_ns=current_mono,
+                    binance_event_ts=event.exchange_event_ts or event.local_received_ts,
+                )
             )
         elif isinstance(event, OrderBookTop) and event.source == "binance":
-            self._detect_binance_move(
-                event.symbol,
-                state,
-                now_ts=current_ts,
-                now_monotonic_ns=current_mono,
-                binance_event_ts=event.exchange_event_ts or event.local_received_ts,
+            closed.extend(
+                self._detect_binance_move(
+                    event.symbol,
+                    state,
+                    now_ts=current_ts,
+                    now_monotonic_ns=current_mono,
+                    binance_event_ts=event.exchange_event_ts or event.local_received_ts,
+                )
             )
         elif isinstance(event, PolymarketQuote):
             closed.extend(
@@ -242,6 +250,16 @@ class GapDetector:
             for event in self._completed
             if event.reject_stage == "none" and event.estimated_edge_after_spread is not None
         ]
+        reject_count_by_reason = _count_strings(
+            event.reject_reason
+            for event in self._completed
+            if event.reject_reason is not None
+        )
+        reject_count_by_stage = _count_strings(
+            event.reject_stage
+            for event in self._completed
+            if event.reject_stage != "none"
+        )
         return GapMonitorStats(
             detected_gaps=self.detected_gaps,
             completed_gaps=len(self._completed),
@@ -262,8 +280,8 @@ class GapDetector:
             average_estimated_edge=(
                 sum(executable_edges) / len(executable_edges) if executable_edges else None
             ),
-            reject_count_by_reason=dict(self._reject_count_by_reason),
-            reject_count_by_stage=dict(self._reject_count_by_stage),
+            reject_count_by_reason=reject_count_by_reason,
+            reject_count_by_stage=reject_count_by_stage,
             stale_feed_count=self.stale_feed_count(state, now_ts=current_ts),
         )
 
@@ -301,10 +319,11 @@ class GapDetector:
         now_ts: int,
         now_monotonic_ns: int,
         binance_event_ts: int | None,
-    ) -> None:
+    ) -> tuple[TradableGapObservation, ...]:
+        observations: list[TradableGapObservation] = []
         markets = self._markets_by_symbol.get(symbol, ())
         if not markets:
-            return
+            return ()
 
         symbol_state = state.symbols.get(symbol)
         if symbol_state is None or _is_stale_wall(
@@ -313,30 +332,58 @@ class GapDetector:
             stale_ms=self.binance_stale_ms,
         ):
             self._record_reject("binance_stale", "pre_entry")
-            return
+            return ()
 
         snapshot = build_move_snapshot(symbol_state)
         strongest_return = snapshot.strongest_return
         if strongest_return is None:
-            return
+            return ()
 
         move_pct = strongest_return * 100.0
         if abs(move_pct) < self.min_move_pct:
-            return
+            return ()
 
         direction: GapDirection = "UP" if move_pct > 0.0 else "DOWN"
         for market in markets:
             self.detected_gaps += 1
+            token_id = market.token_for_direction(direction)
 
             if market.market_id in self._invalid_markets or state.is_market_invalid(
                 market.market_id
             ):
-                self._reject_pre_entry("market_invalidated")
+                observations.append(
+                    self._record_pre_entry_observation(
+                        self._pre_entry_observation(
+                            symbol=symbol,
+                            market=market,
+                            direction=direction,
+                            token_id=token_id or "",
+                            move_pct=move_pct,
+                            now_ts=now_ts,
+                            binance_event_ts=binance_event_ts,
+                            quote=None,
+                            reason="market_invalidated",
+                        )
+                    )
+                )
                 continue
 
-            token_id = market.token_for_direction(direction)
             if token_id is None:
-                self._reject_pre_entry("direction_token_unmapped")
+                observations.append(
+                    self._record_pre_entry_observation(
+                        self._pre_entry_observation(
+                            symbol=symbol,
+                            market=market,
+                            direction=direction,
+                            token_id="",
+                            move_pct=move_pct,
+                            now_ts=now_ts,
+                            binance_event_ts=binance_event_ts,
+                            quote=None,
+                            reason="direction_token_unmapped",
+                        )
+                    )
+                )
                 continue
 
             pending_key = (symbol, market.market_id, direction)
@@ -345,7 +392,21 @@ class GapDetector:
 
             quote = state.polymarket_quotes.get(token_id)
             if quote is None:
-                self._reject_pre_entry("missing_quote")
+                observations.append(
+                    self._record_pre_entry_observation(
+                        self._pre_entry_observation(
+                            symbol=symbol,
+                            market=market,
+                            direction=direction,
+                            token_id=token_id,
+                            move_pct=move_pct,
+                            now_ts=now_ts,
+                            binance_event_ts=binance_event_ts,
+                            quote=None,
+                            reason="missing_quote",
+                        )
+                    )
+                )
                 continue
             if _is_stale_quote(
                 quote,
@@ -353,12 +414,40 @@ class GapDetector:
                 now_monotonic_ns=now_monotonic_ns,
                 stale_ms=self.polymarket_stale_ms,
             ):
-                self._reject_pre_entry("quote_stale")
+                observations.append(
+                    self._record_pre_entry_observation(
+                        self._pre_entry_observation(
+                            symbol=symbol,
+                            market=market,
+                            direction=direction,
+                            token_id=token_id,
+                            move_pct=move_pct,
+                            now_ts=now_ts,
+                            binance_event_ts=binance_event_ts,
+                            quote=quote,
+                            reason="quote_stale",
+                        )
+                    )
+                )
                 continue
 
             fillable, reject_reason = self._fillable_before_repricing(market, quote)
             if not fillable:
-                self._reject_pre_entry(reject_reason or "quote_not_fillable")
+                observations.append(
+                    self._record_pre_entry_observation(
+                        self._pre_entry_observation(
+                            symbol=symbol,
+                            market=market,
+                            direction=direction,
+                            token_id=token_id,
+                            move_pct=move_pct,
+                            now_ts=now_ts,
+                            binance_event_ts=binance_event_ts,
+                            quote=quote,
+                            reason=reject_reason or "quote_not_fillable",
+                        )
+                    )
+                )
                 continue
             assert quote.best_ask is not None
             assert quote.best_ask_size is not None
@@ -396,6 +485,8 @@ class GapDetector:
             )
             self.fillable_at_detection_count += 1
 
+        return tuple(observations)
+
     def _handle_polymarket_quote(
         self,
         quote: PolymarketQuote,
@@ -415,6 +506,7 @@ class GapDetector:
 
             timeout_reason = self._timeout_reason(pending, now_monotonic_ns=quote_mono)
             if timeout_reason is not None:
+                pending.timeout_reason = timeout_reason
                 pending.close_reason = timeout_reason
                 pending.reject_stage = "timeout"
                 observation = self._close_pending(key, pending)
@@ -496,6 +588,8 @@ class GapDetector:
             pending.first_non_tradable_monotonic_ns = (
                 pending.first_non_tradable_monotonic_ns or close_mono
             )
+            pending.window_end_reason = event.lifecycle_type
+            pending.lifecycle_reason = event.lifecycle_type
             pending.close_reason = event.lifecycle_type
             pending.reject_stage = "lifecycle"
             closed.append(self._close_pending(key, pending))
@@ -521,6 +615,7 @@ class GapDetector:
                     quote_ts=_quote_timestamp(quote) or now_ts,
                     quote_mono=_quote_monotonic(quote) or now_monotonic_ns,
                 )
+            pending.timeout_reason = timeout_reason
             pending.close_reason = timeout_reason
             pending.reject_stage = "timeout"
             closed.append(self._close_pending(key, pending))
@@ -709,7 +804,7 @@ class GapDetector:
             quote_was_fillable=True,
             estimated_edge_raw=raw_edge,
             estimated_edge_after_spread=exit_edge if reject_stage == "none" else None,
-            pre_entry_reject_reason=None,
+            pre_entry_reject_reason=pending.pre_entry_reject_reason,
             window_end_reason=pending.window_end_reason,
             exit_reject_reason=exit_reject_reason,
             reject_stage=reject_stage,
@@ -726,12 +821,16 @@ class GapDetector:
         return _duration_ms(pending.first_detected_monotonic_ns, end_mono) or 0.0
 
     def _exit_reject_reason(self, pending: PendingTradableGap) -> str | None:
-        if pending.reject_stage in {"none", "lifecycle", "timeout", "window"}:
-            if pending.reject_stage == "none":
-                return None
-            if pending.current_best_bid is not None and pending.current_best_bid <= pending.entry_ask:
-                return "edge_not_positive_after_spread"
+        if pending.reject_stage == "none":
             return None
+        if pending.reject_stage == "timeout":
+            if pending.first_mid_repriced_ts_ns is None:
+                return "no_mid_repricing_before_timeout"
+            if pending.first_executable_repriced_ts_ns is None:
+                return "no_executable_repricing_before_timeout"
+            return None
+        if pending.reject_stage == "exit":
+            return pending.exit_reject_reason
         return None
 
     def _final_reject_reason(
@@ -752,9 +851,62 @@ class GapDetector:
             return exit_reject_reason
         return pending.close_reason
 
-    def _reject_pre_entry(self, reason: str) -> None:
+    def _pre_entry_observation(
+        self,
+        *,
+        symbol: str,
+        market: PolymarketMarketMetadata,
+        direction: GapDirection,
+        token_id: str,
+        move_pct: float,
+        now_ts: int,
+        binance_event_ts: int | None,
+        quote: PolymarketQuote | None,
+        reason: str,
+    ) -> TradableGapObservation:
+        quote_ts = _quote_timestamp(quote) if quote is not None else None
+        entry_ask = quote.best_ask if quote is not None else None
+        entry_ask_size = quote.best_ask_size if quote is not None else None
+        return TradableGapObservation(
+            symbol=symbol,
+            market_id=market.market_id,
+            token_id=token_id,
+            direction=direction,
+            binance_move_pct=move_pct,
+            detected_ts_ns=now_ts,
+            binance_event_ts_ns=binance_event_ts,
+            poly_quote_ts_ns=quote_ts,
+            before_best_bid=quote.best_bid if quote is not None else None,
+            before_best_ask=quote.best_ask if quote is not None else None,
+            before_best_bid_size=quote.best_bid_size if quote is not None else None,
+            before_best_ask_size=quote.best_ask_size if quote is not None else None,
+            before_mid=quote.mid_price if quote is not None else None,
+            after_best_bid=quote.best_bid if quote is not None else None,
+            after_best_ask=quote.best_ask if quote is not None else None,
+            after_mid=quote.mid_price if quote is not None else None,
+            spread_before=quote.spread if quote is not None else None,
+            spread_after=quote.spread if quote is not None else None,
+            repricing_delay_ms=None,
+            tradable_window_ms=0.0,
+            hypothetical_entry_price=entry_ask,
+            hypothetical_exit_price=None,
+            quote_was_fillable=False,
+            entry_ask=entry_ask,
+            entry_ask_size=entry_ask_size,
+            pre_entry_reject_reason=reason,
+            reject_stage="pre_entry",
+            reject_reason=reason,
+        )
+
+    def _record_pre_entry_observation(
+        self,
+        observation: TradableGapObservation,
+    ) -> TradableGapObservation:
         self.non_fillable_at_detection_count += 1
-        self._record_reject(reason, "pre_entry")
+        if observation.reject_reason is not None:
+            self._record_reject(observation.reject_reason, "pre_entry")
+        self._completed.append(observation)
+        return observation
 
     def _record_reject(self, reason: str, stage: RejectStage) -> None:
         self._reject_count_by_reason[reason] = self._reject_count_by_reason.get(reason, 0) + 1
@@ -864,3 +1016,12 @@ def _percentile(values: list[float], percentile: float) -> float:
     sorted_values = sorted(values)
     index = min(len(sorted_values) - 1, round((len(sorted_values) - 1) * percentile))
     return sorted_values[index]
+
+
+def _count_strings(values: Iterable[str | None]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    return counts

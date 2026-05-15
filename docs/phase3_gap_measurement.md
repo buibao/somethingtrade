@@ -1,6 +1,6 @@
-# Phase 3.8 Gap Measurement
+# Phase 3.9 Gap Measurement
 
-Phase 3.8 measures whether Binance price discovery appears before Polymarket reprices the matching short-duration BTC/ETH CLOB market. It is a measurement system, not a live trading signal.
+Phase 3.9 measures whether Binance price discovery appears before Polymarket reprices the matching short-duration BTC/ETH CLOB market. It is a measurement system, not a live trading signal.
 
 ## Three Different Ideas
 
@@ -78,7 +78,7 @@ Polymarket CLOB websocket messages are applied to an in-memory `PolymarketLocalO
 
 ## Why Price Change Alone Is Not Enough
 
-A standalone `price_change` row can show a price level delta and sometimes reports best bid/ask fields, but those reported bests do not prove executable size at the top of book. Without a prior snapshot and local deltas, a detector can mistake a price update for fillable liquidity. Phase 3.8 treats the local book as source of truth and marks quotes incomplete when size cannot be established.
+A standalone `price_change` row can show a price level delta and sometimes reports best bid/ask fields, but those reported bests do not prove executable size at the top of book. Without a prior snapshot and local deltas, a detector can mistake a price update for fillable liquidity. Phase 3.9 treats the local book as source of truth and marks quotes incomplete when size cannot be established.
 
 ## Lifecycle Events
 
@@ -100,7 +100,7 @@ Each completed observation carries:
 - `reject_stage`: `pre_entry`, `window`, `exit`, `lifecycle`, `timeout`, or `none`
 - `reject_reason`: final summary reason for dashboards and quick scans
 
-Pending gaps are closed by executable repricing, window failure, lifecycle invalidation, or `GAP_MAX_PENDING_MS`. The timeout path prevents unresolved gaps from staying open forever.
+Pending gaps are closed by executable repricing, window failure, lifecycle invalidation, or `GAP_MAX_PENDING_MS`. Lifecycle invalidation and timeout always produce completed observations; pending gaps are not silently deleted. If a timeout happens before mid repricing, `exit_reject_reason` is `no_mid_repricing_before_timeout`. If mid repricing happened but no profitable executable bid appeared, `exit_reject_reason` is `no_executable_repricing_before_timeout`.
 
 ## Observation Fields
 
