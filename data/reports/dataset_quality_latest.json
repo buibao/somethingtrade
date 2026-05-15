@@ -1,0 +1,249 @@
+{
+  "by_group": {
+    "by_data_quality_tier": {
+      "A": {
+        "rows": 144,
+        "success": 5
+      },
+      "B": {
+        "rows": 303,
+        "success": 10
+      },
+      "D": {
+        "rows": 3
+      }
+    },
+    "by_direction": {
+      "DOWN": {
+        "rows": 269,
+        "success": 8
+      },
+      "UP": {
+        "rows": 181,
+        "success": 7
+      }
+    },
+    "by_duration_minutes": {
+      "15": {
+        "rows": 181,
+        "success": 11
+      },
+      "5": {
+        "rows": 269,
+        "success": 4
+      }
+    },
+    "by_market_slug": {
+      "btc-updown-15m-1778873400": {
+        "rows": 95,
+        "success": 6
+      },
+      "btc-updown-5m-1778873400": {
+        "rows": 78,
+        "success": 2
+      },
+      "btc-updown-5m-1778873700": {
+        "rows": 70
+      },
+      "eth-updown-15m-1778873400": {
+        "rows": 86,
+        "success": 5
+      },
+      "eth-updown-5m-1778873400": {
+        "rows": 51,
+        "success": 1
+      },
+      "eth-updown-5m-1778873700": {
+        "rows": 70,
+        "success": 1
+      }
+    },
+    "by_symbol": {
+      "BTCUSDT": {
+        "rows": 243,
+        "success": 8
+      },
+      "ETHUSDT": {
+        "rows": 207,
+        "success": 7
+      }
+    }
+  },
+  "data_quality_tier_distribution": {
+    "A": 144,
+    "B": 303,
+    "D": 3
+  },
+  "directions": {
+    "DOWN": 269,
+    "UP": 181
+  },
+  "edge": {
+    "exit_edge_after_spread": {
+      "max": 0.010000000000000009,
+      "median": 0.010000000000000009,
+      "min": 0.010000000000000002,
+      "p95": 0.010000000000000009
+    },
+    "exit_edge_ticks": {
+      "max": 1.0000000000000009,
+      "median": 1.0000000000000009,
+      "min": 1.0000000000000002,
+      "p95": 1.0000000000000009
+    },
+    "spread_ticks_at_detection": {
+      "max": 15.000000000000002,
+      "median": 1.0000000000000009,
+      "min": 0.9999999999999898,
+      "p95": 6.0
+    }
+  },
+  "included_rows": 450,
+  "input_path": "data/logs/gap_events_20260515.jsonl",
+  "markets": {
+    "btc-updown-15m-1778873400": 95,
+    "btc-updown-5m-1778873400": 78,
+    "btc-updown-5m-1778873700": 70,
+    "eth-updown-15m-1778873400": 86,
+    "eth-updown-5m-1778873400": 51,
+    "eth-updown-5m-1778873700": 70
+  },
+  "min_quality_tier": null,
+  "outcome": {
+    "fillable_count": 283,
+    "lifecycle_count": 0,
+    "pre_entry_count": 167,
+    "reject_reason_counts": {
+      "book_incomplete": 222,
+      "entry_price_moved": 3,
+      "insufficient_best_ask_size": 128,
+      "max_observation_lifetime_reached": 54,
+      "quote_stale": 2,
+      "spread_too_wide": 26
+    },
+    "reject_stage_counts": {
+      "none": 15,
+      "pre_entry": 167,
+      "timeout": 54,
+      "window": 214
+    },
+    "success_count": 15,
+    "timeout_count": 54,
+    "window_count": 214
+  },
+  "quality": {
+    "book_complete_at_detection_counts": {
+      "False": 90,
+      "True": 360
+    },
+    "book_has_snapshot_at_detection_counts": {
+      "True": 450
+    },
+    "book_structurally_complete_at_detection_counts": {
+      "False": 3,
+      "True": 447
+    },
+    "data_quality_reason_counts": {
+      "clean_validated": 205,
+      "size_unknown": 40,
+      "tolerated_one_tick_mismatch": 205
+    },
+    "market_quote_complete_rate": {
+      "max": 1.0,
+      "median": 0.9627312775437931,
+      "min": 0.8730585789409319,
+      "p95": 0.9932011736921205
+    },
+    "reported_best_validation_ok_at_detection_counts": {
+      "False": 5,
+      "True": 445
+    },
+    "stale_source_counts": {
+      "binance": 2
+    },
+    "token_quote_complete_rate": {
+      "max": 1.0,
+      "median": 0.9627511514524518,
+      "min": 0.8700623700623701,
+      "p95": 0.9932011736921205
+    }
+  },
+  "success_quality": {
+    "success_by_duration": {
+      "15": {
+        "rows": 11,
+        "success": 11
+      },
+      "5": {
+        "rows": 4,
+        "success": 4
+      }
+    },
+    "success_by_quality_tier": {
+      "A": {
+        "rows": 5,
+        "success": 5
+      },
+      "B": {
+        "rows": 10,
+        "success": 10
+      }
+    },
+    "success_by_symbol_direction": {
+      "BTCUSDT:DOWN": 3,
+      "BTCUSDT:UP": 5,
+      "ETHUSDT:DOWN": 5,
+      "ETHUSDT:UP": 2
+    },
+    "success_delay": {
+      "max": 3688.1292,
+      "median": 948.9601,
+      "min": 190.2461,
+      "p95": 2432.4208
+    },
+    "success_edge_ticks": {
+      "max": 1.0000000000000009,
+      "median": 1.0000000000000009,
+      "min": 1.0000000000000002,
+      "p95": 1.0000000000000009
+    }
+  },
+  "symbols": {
+    "BTCUSDT": 243,
+    "ETHUSDT": 207
+  },
+  "time_range": {
+    "end_iso": "2026-05-15T19:38:04.108038+00:00",
+    "end_ts_ns": 1778873884108038000,
+    "start_iso": "2026-05-15T19:30:21.184609+00:00",
+    "start_ts_ns": 1778873421184609400
+  },
+  "timing": {
+    "executable_repricing_delay_ms": {
+      "max": 3688.1292,
+      "median": 948.9601,
+      "min": 190.2461,
+      "p95": 2432.4208
+    },
+    "mid_repricing_delay_ms": {
+      "max": 4838.3202,
+      "median": 313.3202,
+      "min": 3.6325,
+      "p95": 3638.0698
+    },
+    "tradable_window_ms": {
+      "max": 5066.1566,
+      "median": 112.44925,
+      "min": 0.0,
+      "p95": 4994.659
+    }
+  },
+  "total_rows": 450,
+  "validation_mode_distribution": {
+    "tolerant": 450
+  },
+  "warnings": [
+    "total_rows_below_1000",
+    "book_incomplete_above_30pct"
+  ]
+}

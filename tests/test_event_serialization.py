@@ -170,6 +170,12 @@ def test_polymarket_quote_constructs_with_phase37_fields() -> None:
         book_has_snapshot=True,
         book_structurally_complete=True,
         reported_best_validation_ok=True,
+        validation_mode="tolerant",
+        validation_tolerance_ticks=1,
+        market_mismatch_rate=0.01,
+        token_mismatch_rate=0.02,
+        market_quote_complete_rate=0.99,
+        token_quote_complete_rate=0.98,
         recv_monotonic_ns=1_000,
         parse_done_monotonic_ns=1_100,
     )
@@ -178,6 +184,8 @@ def test_polymarket_quote_constructs_with_phase37_fields() -> None:
     assert quote.book_has_snapshot is True
     assert quote.book_structurally_complete is True
     assert quote.reported_best_validation_ok is True
+    assert quote.validation_mode == "tolerant"
+    assert quote.market_quote_complete_rate == 0.99
     assert quote.available_liquidity_at_best == 30.0
     assert quote.book_hash == "hash-1"
 
@@ -234,6 +242,15 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
         entry_ask=0.51,
         entry_ask_size=20.0,
         exit_edge_after_spread=0.02,
+        tick_size_at_detection=0.01,
+        spread_at_detection=0.02,
+        spread_ticks_at_detection=2.0,
+        entry_ask_ticks=51.0,
+        exit_edge_ticks=2.0,
+        estimated_edge_ticks=4.0,
+        reprice_threshold_ticks=0.5,
+        effective_reprice_threshold=0.01,
+        effective_reprice_threshold_ticks=1.0,
         repricing_delay_ms=150.0,
         tradable_window_ms=100.0,
         hypothetical_entry_price=0.51,
@@ -254,6 +271,14 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
         now_monotonic_ns=300,
         last_binance_update_monotonic_ns=250,
         last_polymarket_update_monotonic_ns=240,
+        validation_mode="tolerant",
+        validation_tolerance_ticks=1,
+        market_mismatch_rate_at_detection=0.01,
+        token_mismatch_rate_at_detection=0.02,
+        market_quote_complete_rate_at_detection=0.99,
+        token_quote_complete_rate_at_detection=0.98,
+        data_quality_tier="A",
+        data_quality_reason="clean_validated",
         pre_entry_reject_reason=None,
         window_end_reason=None,
         exit_reject_reason=None,
@@ -268,6 +293,8 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
     assert event.base_asset == "BTC"
     assert event.duration_minutes == 15
     assert event.book_has_snapshot_at_detection is True
+    assert event.exit_edge_ticks == 2.0
+    assert event.data_quality_tier == "A"
 
 
 def test_latency_trace_total_ns() -> None:

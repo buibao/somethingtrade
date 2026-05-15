@@ -29,6 +29,7 @@ def _market(
     selected_for_runtime: bool = True,
     signal_enabled: bool = True,
     classification: str | None = "current",
+    tick_size: float = 0.01,
 ) -> PolymarketMarketMetadata:
     return PolymarketMarketMetadata(
         condition_id="0xcondition",
@@ -40,7 +41,7 @@ def _market(
         up_token_id=up_token_id,
         down_token_id=down_token_id,
         token_outcomes={up_token_id: "Up", down_token_id: "Down"},
-        tick_size=0.01,
+        tick_size=tick_size,
         min_order_size=min_order_size,
         active=True,
         closed=False,
@@ -70,6 +71,10 @@ def _quote(
     book_structurally_complete: bool = True,
     reported_best_validation_ok: bool = True,
     validation_error: str | None = None,
+    market_mismatch_rate: float | None = None,
+    token_mismatch_rate: float | None = None,
+    market_quote_complete_rate: float | None = None,
+    token_quote_complete_rate: float | None = None,
 ) -> PolymarketQuote:
     half_spread = spread / 2.0
     return PolymarketQuote(
@@ -94,6 +99,10 @@ def _quote(
         book_has_snapshot=book_has_snapshot,
         book_structurally_complete=book_structurally_complete,
         reported_best_validation_ok=reported_best_validation_ok,
+        market_mismatch_rate=market_mismatch_rate,
+        token_mismatch_rate=token_mismatch_rate,
+        market_quote_complete_rate=market_quote_complete_rate,
+        token_quote_complete_rate=token_quote_complete_rate,
     )
 
 
@@ -114,6 +123,10 @@ def _book_quote(
     book_structurally_complete: bool = True,
     reported_best_validation_ok: bool = True,
     validation_error: str | None = None,
+    market_mismatch_rate: float | None = None,
+    token_mismatch_rate: float | None = None,
+    market_quote_complete_rate: float | None = None,
+    token_quote_complete_rate: float | None = None,
 ) -> PolymarketQuote:
     mid = None if best_bid is None or best_ask is None else (best_bid + best_ask) / 2.0
     spread = None if best_bid is None or best_ask is None else best_ask - best_bid
@@ -140,6 +153,10 @@ def _book_quote(
         book_has_snapshot=book_has_snapshot,
         book_structurally_complete=book_structurally_complete,
         reported_best_validation_ok=reported_best_validation_ok,
+        market_mismatch_rate=market_mismatch_rate,
+        token_mismatch_rate=token_mismatch_rate,
+        market_quote_complete_rate=market_quote_complete_rate,
+        token_quote_complete_rate=token_quote_complete_rate,
     )
 
 
@@ -300,12 +317,295 @@ def test_gap_detector_records_tradable_observation_for_delayed_repricing() -> No
     assert observation.signal_enabled_at_detection is True
     assert observation.book_complete_at_detection is True
     assert observation.book_has_snapshot_at_detection is False
-    assert observation.book_structurally_complete_at_detection is False
+    assert observation.book_structurally_complete_at_detection is True
     assert observation.reported_best_validation_ok_at_detection is True
     assert observation.book_validation_error_at_detection is None
     assert observation.book_warmup_ms_at_detection is not None
     assert observation.reject_stage == "none"
     assert observation.reject_reason is None
+
+
+def test_tick_normalized_fields_and_quality_tier_a_for_clean_observation() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        reprice_threshold=0.002,
+        validation_mode="tolerant",
+        validation_tolerance_ticks=1,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(
+        _book_quote(
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+            market_quote_complete_rate=0.99,
+            token_quote_complete_rate=0.99,
+            market_mismatch_rate=0.0,
+            token_mismatch_rate=0.0,
+        )
+    )
+    state.apply(
+        _book_quote(
+            token_id="down-token",
+            side_label="DOWN",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+            market_quote_complete_rate=0.99,
+            token_quote_complete_rate=0.99,
+        )
+    )
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    repriced = state.apply(_book_quote(best_bid=0.53, best_ask=0.55, ts=detected_ts + 100_000_000))
+    assert isinstance(repriced, PolymarketQuote)
+    observations = detector.on_market_event(repriced, state, now_ts=detected_ts + 100_000_000)
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.tick_size_at_detection == pytest.approx(0.01)
+    assert observation.spread_at_detection == pytest.approx(0.02)
+    assert observation.spread_ticks_at_detection == pytest.approx(2.0)
+    assert observation.entry_ask_ticks == pytest.approx(51.0)
+    assert observation.exit_edge_ticks == pytest.approx(2.0)
+    assert observation.estimated_edge_ticks == pytest.approx(4.0)
+    assert observation.reprice_threshold_ticks == pytest.approx(0.2)
+    assert observation.effective_reprice_threshold == pytest.approx(0.01)
+    assert observation.effective_reprice_threshold_ticks == pytest.approx(1.0)
+    assert observation.validation_mode == "tolerant"
+    assert observation.validation_tolerance_ticks == 1
+    assert observation.market_quote_complete_rate_at_detection == pytest.approx(0.99)
+    assert observation.data_quality_tier == "A"
+    assert observation.data_quality_reason == "clean_validated"
+
+
+def test_effective_reprice_threshold_uses_config_when_above_tick() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        reprice_threshold=0.02,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_book_quote(best_bid=0.49, best_ask=0.51, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    repriced = state.apply(_book_quote(best_bid=0.54, best_ask=0.56, ts=detected_ts + 100_000_000))
+    assert isinstance(repriced, PolymarketQuote)
+    observations = detector.on_market_event(repriced, state, now_ts=detected_ts + 100_000_000)
+
+    assert observations[0].effective_reprice_threshold == pytest.approx(0.02)
+    assert observations[0].effective_reprice_threshold_ticks == pytest.approx(2.0)
+
+
+def test_missing_tick_size_nulls_tick_fields_and_marks_quality_d() -> None:
+    base_ts = utc_now_ns()
+    market = _market(tick_size=0.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        require_book_ready=False,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    repriced = state.apply(_quote(mid=0.54, ts=detected_ts + 100_000_000))
+    assert isinstance(repriced, PolymarketQuote)
+    observations = detector.on_market_event(repriced, state, now_ts=detected_ts + 100_000_000)
+
+    assert observations[0].tick_size_at_detection is None
+    assert observations[0].spread_ticks_at_detection is None
+    assert observations[0].data_quality_tier == "D"
+    assert observations[0].data_quality_reason == "missing_tick_size"
+
+
+def test_tolerated_one_tick_mismatch_marks_quality_b() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        validation_mode="tolerant",
+        validation_tolerance_ticks=1,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(
+        _book_quote(
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+            validation_error="reported_best_bid_mismatch",
+            reported_best_validation_ok=True,
+            market_quote_complete_rate=0.90,
+        )
+    )
+    state.apply(
+        _book_quote(
+            token_id="down-token",
+            side_label="DOWN",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+            market_quote_complete_rate=0.90,
+        )
+    )
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    repriced = state.apply(_book_quote(best_bid=0.53, best_ask=0.55, ts=detected_ts + 100_000_000))
+    assert isinstance(repriced, PolymarketQuote)
+    observations = detector.on_market_event(repriced, state, now_ts=detected_ts + 100_000_000)
+
+    assert observations[0].data_quality_tier == "B"
+    assert observations[0].data_quality_reason == "tolerated_one_tick_mismatch"
+
+
+def test_structurally_incomplete_quote_marks_quality_d() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        require_book_ready=False,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(
+        _quote(
+            mid=0.50,
+            ts=base_ts,
+            book_complete=False,
+            book_has_snapshot=True,
+            book_structurally_complete=False,
+            validation_error="best_ask_size_unknown",
+        )
+    )
+
+    observations_ts = _apply_binance_move(
+        state,
+        detector,
+        base_ts=base_ts,
+        expected_second_observations=1,
+    )
+    assert observations_ts
+    observation = detector._completed[-1]  # type: ignore[attr-defined]
+    assert observation.data_quality_tier == "D"
+    assert observation.data_quality_reason == "size_unknown"
+
+
+def test_diagnostic_mismatch_is_not_quality_a() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        validation_mode="diagnostic",
+        require_book_ready=False,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(
+        _book_quote(
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+            validation_error="reported_best_bid_mismatch",
+            reported_best_validation_ok=False,
+        )
+    )
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    repriced = state.apply(_book_quote(best_bid=0.53, best_ask=0.55, ts=detected_ts + 100_000_000))
+    assert isinstance(repriced, PolymarketQuote)
+    observations = detector.on_market_event(repriced, state, now_ts=detected_ts + 100_000_000)
+
+    assert observations[0].data_quality_tier == "C"
+    assert observations[0].data_quality_reason == "diagnostic_mode_only"
+
+
+def test_unknown_exit_bid_size_is_not_clean_executable_quality() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        validation_mode="tolerant",
+        require_book_ready=False,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(
+        _book_quote(
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+            market_quote_complete_rate=0.99,
+        )
+    )
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    repriced = state.apply(
+        _book_quote(
+            best_bid=0.53,
+            best_ask=0.55,
+            bid_size=None,
+            ts=detected_ts + 100_000_000,
+        )
+    )
+    assert isinstance(repriced, PolymarketQuote)
+    observations = detector.on_market_event(repriced, state, now_ts=detected_ts + 100_000_000)
+
+    assert observations[0].reject_stage == "none"
+    assert observations[0].data_quality_tier == "B"
+    assert observations[0].data_quality_reason == "size_unknown"
+
+
+def test_tolerant_mode_does_not_treat_unknown_best_ask_size_as_fillable() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        validation_mode="tolerant",
+        require_book_ready=False,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts, ask_size=None))
+
+    _apply_binance_move(
+        state,
+        detector,
+        base_ts=base_ts,
+        expected_second_observations=1,
+    )
+
+    observation = detector._completed[-1]  # type: ignore[attr-defined]
+    assert observation.reject_stage == "pre_entry"
+    assert observation.reject_reason == "missing_best_ask_size"
+    assert observation.quote_was_fillable is False
+    assert observation.data_quality_tier == "D"
+    assert observation.data_quality_reason == "size_unknown"
 
 
 def test_up_move_maps_to_up_token() -> None:
@@ -1471,7 +1771,32 @@ def test_tick_size_change_marks_market_invalid() -> None:
     assert observations[0].reject_reason == "tick_size_change"
     assert observations[0].reject_stage == "lifecycle"
     assert observations[0].window_end_reason == "tick_size_change"
+    assert observations[0].tick_size_at_detection == pytest.approx(0.01)
+    assert detector._tick_size_for_market(market) == pytest.approx(0.001)  # type: ignore[attr-defined]
+    assert detector._effective_reprice_threshold(market) == pytest.approx(0.005)  # type: ignore[attr-defined]
     assert detector.stats(state, now_ts=detected_ts + 100_000_000).completed_count == 1
+
+
+def test_effective_reprice_threshold_updates_after_tick_size_change() -> None:
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(markets=(market,), reprice_threshold=0.0005)
+
+    lifecycle = state.apply(
+        MarketLifecycleEvent(
+            market_id="0xmarket",
+            lifecycle_type="tick_size_change",
+            old_tick_size=0.01,
+            new_tick_size=0.001,
+            event_ts=utc_now_ns(),
+            received_ts=utc_now_ns(),
+        )
+    )
+    assert isinstance(lifecycle, MarketLifecycleEvent)
+    detector.on_market_event(lifecycle, state)
+
+    assert detector._tick_size_for_market(market) == pytest.approx(0.001)  # type: ignore[attr-defined]
+    assert detector._effective_reprice_threshold(market) == pytest.approx(0.001)  # type: ignore[attr-defined]
 
 
 def test_stale_quote_ends_tradable_window() -> None:

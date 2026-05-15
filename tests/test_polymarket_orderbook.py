@@ -401,6 +401,32 @@ def test_tolerant_mode_rejects_reported_best_mismatch_beyond_tolerance() -> None
     assert quote.book_complete is False
 
 
+def test_tick_size_update_changes_validation_tolerance() -> None:
+    orderbook = _book(best_validation_mode="tolerant")
+    _snapshot(orderbook)
+
+    orderbook.update_tick_size("0xmarket", token_id="token-up", tick_size=0.001)
+    quote = orderbook.apply_best_bid_ask(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "token-up",
+            "market": "0xmarket",
+            "best_bid": "0.502",
+            "best_ask": "0.52",
+        },
+        received_ts=2_000,
+        parse_done_ts=2_001,
+        recv_monotonic_ns=2_000,
+        parse_done_monotonic_ns=2_001,
+        event_ts=2_000,
+        sequence="hash-2",
+    )
+
+    assert quote.validation_error == "reported_best_bid_mismatch"
+    assert quote.reported_best_validation_ok is False
+    assert quote.book_complete is False
+
+
 def test_diagnostic_mode_records_mismatch_without_marking_incomplete() -> None:
     orderbook = _book(best_validation_mode="diagnostic")
     _snapshot(orderbook)

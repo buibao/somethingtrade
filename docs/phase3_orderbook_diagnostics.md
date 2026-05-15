@@ -28,7 +28,7 @@ Backward-compatible conservative flag used by `GapDetector`. In strict mode a re
 Reported best bid/ask mismatches mark the quote incomplete. This is the conservative measurement mode.
 
 `tolerant`:
-Reported best mismatches within `POLYMARKET_BEST_VALIDATION_TOLERANCE_TICKS * tick_size` are allowed, but counters and samples are still recorded.
+Reported best mismatches within `POLYMARKET_BEST_VALIDATION_TOLERANCE_TICKS * tick_size` are allowed, but counters and samples are still recorded. Phase 3.16 makes tolerant mode with one tick the research default because live strict/diagnostic/tolerant comparisons showed roughly 97-98% of reported-best mismatches were within one tick.
 
 `diagnostic`:
 Reported best mismatches are recorded and sampled, but they do not mark the quote incomplete by themselves. Real structural failures such as `missing_snapshot`, invalid ladders, missing best sizes, lifecycle invalidation, or stale books remain non-tradable.
@@ -88,6 +88,8 @@ Compare:
 
 If diagnostic mode materially lowers `book_incomplete` without increasing structural errors, the next step is to inspect mismatch samples and decide whether tolerant mode is justified. That is still measurement work, not trading.
 
+For Phase 3.16, use tolerant mode for normal research measurement, strict mode for audit/safety comparisons, and diagnostic mode only when debugging orderbook sequencing.
+
 ## Stale Diagnostics
 
 `quote_stale` observations include:
@@ -104,3 +106,14 @@ When monotonic timestamps are missing or incompatible, `stale_source` is `unknow
 ## Measurement Only
 
 Phase 3.15 helps explain quote completeness and stale-feed attribution. It does not decide profitability, train Phase 4 models, simulate queue position, place orders, or handle private keys.
+
+## Data Quality Tiers
+
+Phase 3.16 observations include `data_quality_tier`:
+
+- `A`: clean validated row, structurally complete, snapshot-backed, and suitable for primary Phase 4 analysis.
+- `B`: usable research row with tolerated one-tick reported-best mismatch or minor confidence caveat.
+- `C`: weaker validation quality, diagnostic-mode row, or lower quote-complete rate.
+- `D`: missing snapshot, structurally incomplete, size unknown, or missing tick size.
+
+Start Phase 4 analysis with A/B rows. Treat C rows as sensitivity analysis and D rows as reject/diagnostic evidence rather than clean labels.

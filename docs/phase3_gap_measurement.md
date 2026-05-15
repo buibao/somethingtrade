@@ -81,7 +81,7 @@ Phase 3.15 splits quote completeness into diagnostic fields:
 - `reported_best_validation_ok`: reported best prices agree with local book validation rules.
 - `book_complete`: conservative compatibility flag used by the detector.
 
-Reported best validation can run in `strict`, `tolerant`, or `diagnostic` mode. Strict mode is conservative. Diagnostic mode records reported best mismatches without marking a quote incomplete solely for that mismatch. See `docs/phase3_orderbook_diagnostics.md` for the live-run comparison workflow and mismatch sample format.
+Reported best validation can run in `strict`, `tolerant`, or `diagnostic` mode. Phase 3.16 uses `tolerant` with one tick as the research default after live diagnostics showed most reported-best mismatches were one-tick sequencing differences. Strict remains the audit/safety mode. Diagnostic remains debug-only and should not be used as clean ground truth. See `docs/phase3_orderbook_diagnostics.md` for the live-run comparison workflow and mismatch sample format.
 
 `PolymarketQuote.best_bid_size` and `best_ask_size` come from the local book. The older `available_liquidity_at_best` field is only a backward-compatible computed summary and should not drive execution simulation.
 
@@ -126,6 +126,8 @@ Completed observations are `TradableGapObservation` JSON events with:
 - Entry/exit prices: `entry_ask`, `entry_ask_size`, `executable_exit_bid`
 - Fillability data: `quote_was_fillable`, `reject_reason`
 - Edge data: `estimated_edge_raw`, `estimated_edge_after_spread`, `exit_edge_after_spread`
+- Tick-normalized context: `tick_size_at_detection`, `spread_ticks_at_detection`, `entry_ask_ticks`, `exit_edge_ticks`, `estimated_edge_ticks`, and `effective_reprice_threshold_ticks`
+- Data-quality context: `validation_mode`, `validation_tolerance_ticks`, quote/mismatch rates, `data_quality_tier`, and `data_quality_reason`
 
 Internal processing latency uses monotonic timestamps:
 
@@ -172,6 +174,20 @@ data/logs/gap_events_YYYYMMDD.jsonl
 ```
 
 These JSONL files are append-only measurement artifacts. They are not database writes and they are not used for realtime order execution.
+
+Runtime JSONL logs are local artifacts and should not be committed wholesale. Commit only curated summaries or small anonymized examples under `docs/examples/`.
+
+## Dataset Quality Report
+
+Before Phase 4 modeling, run:
+
+```bash
+python -m app.main dataset-quality-report \
+  --input data/logs/<your_gap_events_file>.jsonl \
+  --output data/reports/dataset_quality_latest.json
+```
+
+The report summarizes rows, outcomes, timing, edge, validation mode, data-quality tiers, stale sources, and warnings. Warnings flag small samples, zero successes, excessive D-tier rows, high `book_incomplete`, high `quote_stale`, diagnostic-mode dominated data, and missing tick sizes. Use this report to decide whether a live run is suitable for Phase 4 analysis; it does not train a model.
 
 ## Why This Is Not A Live Trading Signal
 

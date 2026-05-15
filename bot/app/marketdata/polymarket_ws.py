@@ -66,7 +66,7 @@ class PolymarketWSClient:
         max_backoff_sec: float = 8.0,
         max_queue: int = 1024,
         orderbook_stale_after_ms: float = 1_000.0,
-        best_validation_mode: str = "strict",
+        best_validation_mode: str = "tolerant",
         best_validation_tolerance_ticks: int = 1,
         mismatch_sample_path: str | None = "data/debug/polymarket_orderbook_mismatch_samples.jsonl",
         mismatch_sample_per_token_per_min: int = 20,
@@ -258,6 +258,12 @@ class PolymarketWSClient:
                     event_ts=event_ts,
                 )
                 if lifecycle.lifecycle_type in {"tick_size_change", "market_resolved"}:
+                    if lifecycle.lifecycle_type == "tick_size_change" and lifecycle.new_tick_size:
+                        self._orderbooks.update_tick_size(
+                            lifecycle.market_id,
+                            token_id=lifecycle.token_id,
+                            tick_size=lifecycle.new_tick_size,
+                        )
                     self._orderbooks.mark_market_invalid(lifecycle.market_id)
                 events.append(lifecycle)
             else:

@@ -74,6 +74,8 @@ type GapDirection = Literal["UP", "DOWN"]
 type MarketLifecycleType = Literal["tick_size_change", "market_resolved", "new_market"]
 type RejectStage = Literal["pre_entry", "window", "exit", "lifecycle", "timeout", "none"]
 type StaleSource = Literal["binance", "polymarket", "both", "unknown"]
+type ValidationMode = Literal["strict", "tolerant", "diagnostic"]
+type DataQualityTier = Literal["A", "B", "C", "D"]
 
 
 class BookLevel(BaseModel):
@@ -151,6 +153,12 @@ class PolymarketQuote(RealtimeMarketEvent):
     book_has_snapshot: bool = False
     book_structurally_complete: bool = False
     reported_best_validation_ok: bool = True
+    validation_mode: ValidationMode | None = None
+    validation_tolerance_ticks: int | None = None
+    market_mismatch_rate: float | None = None
+    token_mismatch_rate: float | None = None
+    market_quote_complete_rate: float | None = None
+    token_quote_complete_rate: float | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -280,6 +288,15 @@ class TradableGapObservation(EventModel):
     entry_ask: float | None = None
     entry_ask_size: float | None = None
     exit_edge_after_spread: float | None = None
+    tick_size_at_detection: float | None = None
+    spread_at_detection: float | None = None
+    spread_ticks_at_detection: float | None = None
+    entry_ask_ticks: float | None = None
+    exit_edge_ticks: float | None = None
+    estimated_edge_ticks: float | None = None
+    reprice_threshold_ticks: float | None = None
+    effective_reprice_threshold: float | None = None
+    effective_reprice_threshold_ticks: float | None = None
     repricing_delay_ms: float | None = Field(
         None,
         validation_alias=AliasChoices("repricing_delay_ms", "gap_duration_ms"),
@@ -305,6 +322,14 @@ class TradableGapObservation(EventModel):
     now_monotonic_ns: int | None = None
     last_binance_update_monotonic_ns: int | None = None
     last_polymarket_update_monotonic_ns: int | None = None
+    validation_mode: ValidationMode | None = None
+    validation_tolerance_ticks: int | None = None
+    market_mismatch_rate_at_detection: float | None = None
+    token_mismatch_rate_at_detection: float | None = None
+    market_quote_complete_rate_at_detection: float | None = None
+    token_quote_complete_rate_at_detection: float | None = None
+    data_quality_tier: DataQualityTier | None = None
+    data_quality_reason: str | None = None
     pre_entry_reject_reason: str | None = None
     window_end_reason: str | None = None
     exit_reject_reason: str | None = None

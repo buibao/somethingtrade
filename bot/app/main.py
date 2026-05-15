@@ -6,6 +6,11 @@ from pathlib import Path
 import aiohttp
 import orjson
 
+from app.backtest.dataset_quality import (
+    build_dataset_quality_report,
+    default_report_path,
+    write_dataset_quality_report,
+)
 from app.config.settings import get_settings
 from app.core.clock import utc_now_ns
 from app.execution.paper_executor import PaperExecutor
@@ -154,7 +159,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--best-validation-mode",
         choices=("strict", "tolerant", "diagnostic"),
         default=None,
-        help="Polymarket reported-best validation mode.",
+        help=(
+            "Polymarket reported-best validation mode: strict=conservative audit; "
+            "tolerant=research default allowing mismatches within N ticks; "
+            "diagnostic=debug-only mismatch recording."
+        ),
     )
     gap_monitor.add_argument(
         "--best-validation-tolerance-ticks",
@@ -187,6 +196,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path for raw and parsed rolling discovery debug JSON.",
     )
 
+    quality_report = subparsers.add_parser(
+        "dataset-quality-report",
+        help="Summarize Phase 3 gap measurement JSONL quality without pandas.",
+    )
+    quality_report.add_argument("--input", required=True, help="Input gap_events JSONL file.")
+    quality_report.add_argument("--output", default=None, help="Output report JSON path.")
+    quality_report.add_argument(
+        "--min-quality-tier",
+        choices=("A", "B", "C", "D"),
+        default=None,
+        help="Include rows at this data-quality tier or better.",
+    )
+    quality_report.add_argument(
+        "--print-top",
+        type=int,
+        default=20,
+        help="Maximum grouped rows to include for high-cardinality sections.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -203,6 +231,9 @@ async def run(argv: Sequence[str] | None = None) -> None:
         return
     if args.command == "polymarket-rolling-discovery-debug":
         await run_polymarket_rolling_discovery_debug(args)
+        return
+    if args.command == "dataset-quality-report":
+        run_dataset_quality_report(args)
         return
 
     settings = get_settings()
@@ -329,6 +360,12 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         book_warmup_max_ms=_arg_or_setting(
             args.book_warmup_max_ms,
             settings.gap_book_warmup_max_ms,
+        ),
+        validation_mode=(args.best_validation_mode or settings.polymarket_best_validation_mode),
+        validation_tolerance_ticks=(
+            args.best_validation_tolerance_ticks
+            if args.best_validation_tolerance_ticks is not None
+            else settings.polymarket_best_validation_tolerance_ticks
         ),
     )
     symbols = _symbols_for_markets(markets) or settings.binance_symbols
@@ -475,6 +512,30 @@ async def _ingest_gap_polymarket(
         if updated is not None:
             for gap in detector.on_market_event(updated, state):
                 await logger.log(gap)
+
+
+def run_dataset_quality_report(args: argparse.Namespace) -> None:
+    output_path = Path(args.output) if args.output else default_report_path()
+    report = build_dataset_quality_report(
+        args.input,
+        min_quality_tier=args.min_quality_tier,
+        print_top=args.print_top,
+    )
+    write_dataset_quality_report(report, output_path)
+    outcome = report["outcome"]
+    print(
+        " ".join(
+            [
+                "dataset_quality_report",
+                f"input={args.input}",
+                f"output={output_path}",
+                f"rows={report['included_rows']}/{report['total_rows']}",
+                f"success={outcome['success_count']}",
+                f"warnings={','.join(report['warnings']) or '-'}",
+            ]
+        ),
+        flush=True,
+    )
 
 
 def _parse_symbols(value: str) -> tuple[str, ...]:

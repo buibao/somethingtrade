@@ -44,7 +44,7 @@ class Settings(BaseModel):
     gap_require_book_ready: bool = Field(True, alias="GAP_REQUIRE_BOOK_READY")
     gap_book_warmup_max_ms: float = Field(3_000.0, alias="GAP_BOOK_WARMUP_MAX_MS")
     polymarket_best_validation_mode: Literal["strict", "tolerant", "diagnostic"] = Field(
-        "strict",
+        "tolerant",
         alias="POLYMARKET_BEST_VALIDATION_MODE",
     )
     polymarket_best_validation_tolerance_ticks: int = Field(

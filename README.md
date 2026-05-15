@@ -63,8 +63,14 @@ Phase 3.10 hardens those measurement semantics before Phase 4. It locks delayed 
 
 Phase 3.15 adds Polymarket orderbook validation diagnostics. The monitor can run strict, tolerant, or diagnostic best-price validation, writes compact mismatch samples under `data/debug/`, and attributes `quote_stale` observations to Binance, Polymarket, both, or unknown when monotonic timestamps are unavailable.
 
+Phase 3.16 makes tolerant one-tick validation the research default, adds tick-normalized observation fields, data-quality tiers, and a standard-library dataset quality report command. Runtime JSONL logs are local artifacts; commit only curated summaries or small anonymized examples.
+
 ```bash
 python -m app.main gap-monitor
+```
+
+```bash
+python -m app.main dataset-quality-report --input data/logs/<your_gap_events_file>.jsonl --output data/reports/dataset_quality_latest.json
 ```
 
 See `docs/phase3_gap_measurement.md` and `docs/phase3_orderbook_diagnostics.md` for interpretation guidance, and `docs/phase4_dataset_fields.md` for dataset-field usage. The monitor does not place orders, and a measured gap is not a live trading signal.

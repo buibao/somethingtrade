@@ -7,6 +7,7 @@ from typing import Literal
 
 from app.core.clock import utc_now_ns
 from app.core.events import (
+    DataQualityTier,
     DepthUpdate,
     GapDirection,
     MarketLifecycleEvent,
@@ -16,7 +17,9 @@ from app.core.events import (
     RejectStage,
     StaleSource,
     TradableGapObservation,
+    ValidationMode,
 )
+from app.core.tick_math import diff_to_ticks, price_to_ticks
 from app.marketdata.polymarket_discovery import (
     PolymarketMarketMetadata,
     classify_market_window,
@@ -66,6 +69,10 @@ class BookReadinessGate:
     validation_error: str | None
     market_classification: str | None
     signal_enabled: bool
+    market_mismatch_rate: float | None = None
+    token_mismatch_rate: float | None = None
+    market_quote_complete_rate: float | None = None
+    token_quote_complete_rate: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +102,8 @@ class PendingTradableGap:
     before_best_ask_size: float
     before_mid: float | None
     spread_before: float | None
+    tick_size_at_detection: float | None
+    spread_at_detection: float | None
     entry_ask: float
     entry_ask_size: float
     last_tradable_ts_ns: int
@@ -123,6 +132,12 @@ class PendingTradableGap:
     book_validation_error_at_detection: str | None = None
     book_warmup_ms_at_detection: float | None = None
     book_warmup_timeout: bool = False
+    validation_mode: ValidationMode | None = None
+    validation_tolerance_ticks: int | None = None
+    market_mismatch_rate_at_detection: float | None = None
+    token_mismatch_rate_at_detection: float | None = None
+    market_quote_complete_rate_at_detection: float | None = None
+    token_quote_complete_rate_at_detection: float | None = None
     stale_diagnostics: StaleDiagnostics = field(default_factory=StaleDiagnostics)
     pre_entry_reject_reason: str | None = None
     window_end_reason: str | None = None
@@ -199,6 +214,8 @@ class GapDetector:
         pre_entry_log_cooldown_ms: float = 500.0,
         require_book_ready: bool = True,
         book_warmup_max_ms: float = 3_000.0,
+        validation_mode: ValidationMode = "tolerant",
+        validation_tolerance_ticks: int = 1,
     ) -> None:
         self.markets = markets
         self.min_move_pct = min_move_pct
@@ -213,9 +230,16 @@ class GapDetector:
         self.pre_entry_log_cooldown_ms = pre_entry_log_cooldown_ms
         self.require_book_ready = require_book_ready
         self.book_warmup_max_ms = book_warmup_max_ms
+        self.validation_mode = validation_mode
+        self.validation_tolerance_ticks = validation_tolerance_ticks
         self._detector_started_ns = utc_now_ns()
         self._markets_by_symbol = _markets_by_symbol(markets)
         self._markets_by_token = _markets_by_token(markets)
+        self._tick_size_by_market = {
+            market.market_id: market.tick_size
+            for market in markets
+            if market.tick_size > 0.0
+        }
         self._pending: dict[tuple[str, str, GapDirection], PendingTradableGap] = {}
         self._completed: list[TradableGapObservation] = []
         self._invalid_markets: set[str] = set()
@@ -550,6 +574,8 @@ class GapDetector:
 
             quote_ts = _quote_timestamp(quote)
             quote_mono = _quote_monotonic(quote) or now_monotonic_ns
+            tick_size_at_detection = self._tick_size_for_market(market)
+            spread_at_detection = _spread(quote.best_bid, quote.best_ask)
             self._pending[pending_key] = PendingTradableGap(
                 symbol=symbol,
                 market=market,
@@ -566,6 +592,8 @@ class GapDetector:
                 before_best_ask_size=quote.best_ask_size,
                 before_mid=quote.mid_price,
                 spread_before=quote.spread,
+                tick_size_at_detection=tick_size_at_detection,
+                spread_at_detection=spread_at_detection,
                 entry_ask=quote.best_ask,
                 entry_ask_size=quote.best_ask_size,
                 last_tradable_ts_ns=now_ts,
@@ -580,13 +608,29 @@ class GapDetector:
                 current_quote_monotonic_ns=quote_mono,
                 market_classification_at_detection=book_gate.market_classification,
                 signal_enabled_at_detection=book_gate.signal_enabled,
-                book_complete_at_detection=book_gate.book_complete,
-                book_has_snapshot_at_detection=book_gate.book_has_snapshot,
-                book_structurally_complete_at_detection=book_gate.book_structurally_complete,
-                reported_best_validation_ok_at_detection=book_gate.reported_best_validation_ok,
-                book_validation_error_at_detection=book_gate.validation_error,
+                book_complete_at_detection=quote.book_complete,
+                book_has_snapshot_at_detection=quote.book_has_snapshot,
+                book_structurally_complete_at_detection=quote.book_structurally_complete,
+                reported_best_validation_ok_at_detection=quote.reported_best_validation_ok,
+                book_validation_error_at_detection=quote.validation_error,
                 book_warmup_ms_at_detection=book_gate.warmup_ms,
                 book_warmup_timeout=book_gate.warmup_timeout,
+                validation_mode=self.validation_mode,
+                validation_tolerance_ticks=self.validation_tolerance_ticks,
+                market_mismatch_rate_at_detection=(
+                    quote.market_mismatch_rate or book_gate.market_mismatch_rate
+                ),
+                token_mismatch_rate_at_detection=(
+                    quote.token_mismatch_rate or book_gate.token_mismatch_rate
+                ),
+                market_quote_complete_rate_at_detection=(
+                    quote.market_quote_complete_rate
+                    or book_gate.market_quote_complete_rate
+                ),
+                token_quote_complete_rate_at_detection=(
+                    quote.token_quote_complete_rate
+                    or book_gate.token_quote_complete_rate
+                ),
             )
             self.fillable_at_detection_count += 1
 
@@ -684,6 +728,8 @@ class GapDetector:
         if event.lifecycle_type == "new_market":
             return ()
 
+        if event.lifecycle_type == "tick_size_change" and event.new_tick_size:
+            self._tick_size_by_market[event.market_id] = event.new_tick_size
         self._invalid_markets.add(event.market_id)
         close_ts = event.received_ts or event.local_received_ts or now_ts
         close_mono = event.recv_monotonic_ns or now_monotonic_ns
@@ -777,7 +823,7 @@ class GapDetector:
             return
         if pending.before_mid is None or quote.mid_price is None:
             return
-        threshold = max(self.reprice_threshold, pending.market.tick_size)
+        threshold = self._effective_reprice_threshold(pending.market)
         if quote.mid_price >= pending.before_mid + threshold:
             pending.first_mid_repriced_ts_ns = quote_ts
             pending.first_mid_repriced_monotonic_ns = quote_mono
@@ -892,6 +938,22 @@ class GapDetector:
             pending,
             exit_reject_reason=exit_reject_reason,
         )
+        tick_size = pending.tick_size_at_detection
+        spread_at_detection = pending.spread_at_detection or pending.spread_before
+        effective_threshold = self._effective_reprice_threshold(pending.market)
+        data_quality_tier, data_quality_reason = self._data_quality(
+            market=pending.market,
+            quote_was_fillable=True,
+            book_has_snapshot=pending.book_has_snapshot_at_detection,
+            book_structurally_complete=pending.book_structurally_complete_at_detection,
+            reported_best_validation_ok=pending.reported_best_validation_ok_at_detection,
+            validation_error=pending.book_validation_error_at_detection,
+            validation_mode=pending.validation_mode,
+            market_quote_complete_rate=pending.market_quote_complete_rate_at_detection,
+            best_ask_size=pending.before_best_ask_size,
+            best_bid_size=pending.current_best_bid_size,
+            tick_size=tick_size,
+        )
 
         return TradableGapObservation(
             symbol=pending.symbol,
@@ -923,6 +985,15 @@ class GapDetector:
             entry_ask=pending.entry_ask,
             entry_ask_size=pending.entry_ask_size,
             exit_edge_after_spread=exit_edge,
+            tick_size_at_detection=tick_size,
+            spread_at_detection=spread_at_detection,
+            spread_ticks_at_detection=_ticks(spread_at_detection, tick_size),
+            entry_ask_ticks=_price_ticks(pending.entry_ask, tick_size),
+            exit_edge_ticks=_ticks(exit_edge, tick_size),
+            estimated_edge_ticks=_ticks(raw_edge, tick_size),
+            reprice_threshold_ticks=_ticks(self.reprice_threshold, tick_size),
+            effective_reprice_threshold=effective_threshold,
+            effective_reprice_threshold_ticks=_ticks(effective_threshold, tick_size),
             repricing_delay_ms=executable_delay_ms,
             tradable_window_ms=self._tradable_window_ms(pending),
             hypothetical_entry_price=pending.entry_ask,
@@ -953,6 +1024,18 @@ class GapDetector:
             last_polymarket_update_monotonic_ns=(
                 pending.stale_diagnostics.last_polymarket_update_monotonic_ns
             ),
+            validation_mode=pending.validation_mode,
+            validation_tolerance_ticks=pending.validation_tolerance_ticks,
+            market_mismatch_rate_at_detection=pending.market_mismatch_rate_at_detection,
+            token_mismatch_rate_at_detection=pending.token_mismatch_rate_at_detection,
+            market_quote_complete_rate_at_detection=(
+                pending.market_quote_complete_rate_at_detection
+            ),
+            token_quote_complete_rate_at_detection=(
+                pending.token_quote_complete_rate_at_detection
+            ),
+            data_quality_tier=data_quality_tier,
+            data_quality_reason=data_quality_reason,
             pre_entry_reject_reason=pending.pre_entry_reject_reason,
             window_end_reason=pending.window_end_reason,
             exit_reject_reason=exit_reject_reason,
@@ -1018,30 +1101,65 @@ class GapDetector:
         quote_ts = _quote_timestamp(quote) if quote is not None else None
         entry_ask = quote.best_ask if quote is not None else None
         entry_ask_size = quote.best_ask_size if quote is not None else None
+        tick_size = self._tick_size_for_market(market)
+        spread_at_detection = (
+            _spread(quote.best_bid, quote.best_ask) if quote is not None else None
+        )
+        raw_edge = None
+        effective_threshold = self._effective_reprice_threshold(market)
         book_complete = (
             quote.book_complete
-            if book_gate is None and quote is not None
+            if quote is not None
             else (None if book_gate is None else book_gate.book_complete)
         )
         validation_error = (
             quote.validation_error
-            if book_gate is None and quote is not None
+            if quote is not None
             else (None if book_gate is None else book_gate.validation_error)
         )
         book_has_snapshot = (
             quote.book_has_snapshot
-            if book_gate is None and quote is not None
+            if quote is not None
             else (None if book_gate is None else book_gate.book_has_snapshot)
         )
         structurally_complete = (
             quote.book_structurally_complete
-            if book_gate is None and quote is not None
+            if quote is not None
             else (None if book_gate is None else book_gate.book_structurally_complete)
         )
         reported_best_ok = (
             quote.reported_best_validation_ok
-            if book_gate is None and quote is not None
+            if quote is not None
             else (None if book_gate is None else book_gate.reported_best_validation_ok)
+        )
+        market_mismatch_rate = _coalesce(
+            None if quote is None else quote.market_mismatch_rate,
+            None if book_gate is None else book_gate.market_mismatch_rate,
+        )
+        token_mismatch_rate = _coalesce(
+            None if quote is None else quote.token_mismatch_rate,
+            None if book_gate is None else book_gate.token_mismatch_rate,
+        )
+        market_complete_rate = _coalesce(
+            None if quote is None else quote.market_quote_complete_rate,
+            None if book_gate is None else book_gate.market_quote_complete_rate,
+        )
+        token_complete_rate = _coalesce(
+            None if quote is None else quote.token_quote_complete_rate,
+            None if book_gate is None else book_gate.token_quote_complete_rate,
+        )
+        data_quality_tier, data_quality_reason = self._data_quality(
+            market=market,
+            quote_was_fillable=False,
+            book_has_snapshot=book_has_snapshot,
+            book_structurally_complete=structurally_complete,
+            reported_best_validation_ok=reported_best_ok,
+            validation_error=validation_error or reason,
+            validation_mode=self.validation_mode,
+            market_quote_complete_rate=market_complete_rate,
+            best_ask_size=entry_ask_size,
+            best_bid_size=quote.best_bid_size if quote is not None else None,
+            tick_size=tick_size,
         )
         stale = stale_diagnostics or StaleDiagnostics()
         return TradableGapObservation(
@@ -1073,6 +1191,14 @@ class GapDetector:
             quote_was_fillable=False,
             entry_ask=entry_ask,
             entry_ask_size=entry_ask_size,
+            tick_size_at_detection=tick_size,
+            spread_at_detection=spread_at_detection,
+            spread_ticks_at_detection=_ticks(spread_at_detection, tick_size),
+            entry_ask_ticks=_price_ticks(entry_ask, tick_size),
+            estimated_edge_ticks=_ticks(raw_edge, tick_size),
+            reprice_threshold_ticks=_ticks(self.reprice_threshold, tick_size),
+            effective_reprice_threshold=effective_threshold,
+            effective_reprice_threshold_ticks=_ticks(effective_threshold, tick_size),
             market_classification_at_detection=(
                 None if book_gate is None else book_gate.market_classification
             ),
@@ -1090,6 +1216,14 @@ class GapDetector:
             now_monotonic_ns=stale.now_monotonic_ns,
             last_binance_update_monotonic_ns=stale.last_binance_update_monotonic_ns,
             last_polymarket_update_monotonic_ns=stale.last_polymarket_update_monotonic_ns,
+            validation_mode=self.validation_mode,
+            validation_tolerance_ticks=self.validation_tolerance_ticks,
+            market_mismatch_rate_at_detection=market_mismatch_rate,
+            token_mismatch_rate_at_detection=token_mismatch_rate,
+            market_quote_complete_rate_at_detection=market_complete_rate,
+            token_quote_complete_rate_at_detection=token_complete_rate,
+            data_quality_tier=data_quality_tier,
+            data_quality_reason=data_quality_reason,
             pre_entry_reject_reason=reason,
             reject_stage="pre_entry",
             reject_reason=reason,
@@ -1205,7 +1339,69 @@ class GapDetector:
             validation_error=_first_validation_error(known_quotes),
             market_classification=classification,
             signal_enabled=signal_enabled,
+            market_mismatch_rate=_first_rate(known_quotes, "market_mismatch_rate"),
+            token_mismatch_rate=_first_rate(known_quotes, "token_mismatch_rate"),
+            market_quote_complete_rate=_first_rate(
+                known_quotes,
+                "market_quote_complete_rate",
+            ),
+            token_quote_complete_rate=_first_rate(known_quotes, "token_quote_complete_rate"),
         )
+
+    def _tick_size_for_market(self, market: PolymarketMarketMetadata) -> float | None:
+        tick_size = self._tick_size_by_market.get(market.market_id, market.tick_size)
+        return tick_size if tick_size > 0.0 else None
+
+    def _effective_reprice_threshold(self, market: PolymarketMarketMetadata) -> float:
+        tick_size = self._tick_size_for_market(market)
+        if tick_size is None:
+            return self.reprice_threshold
+        return max(self.reprice_threshold, tick_size)
+
+    def _data_quality(
+        self,
+        *,
+        market: PolymarketMarketMetadata,
+        quote_was_fillable: bool,
+        book_has_snapshot: bool | None,
+        book_structurally_complete: bool | None,
+        reported_best_validation_ok: bool | None,
+        validation_error: str | None,
+        validation_mode: ValidationMode | None,
+        market_quote_complete_rate: float | None,
+        best_ask_size: float | None,
+        best_bid_size: float | None,
+        tick_size: float | None,
+    ) -> tuple[DataQualityTier, str]:
+        if tick_size is None:
+            return "D", "missing_tick_size"
+        if validation_error in {"missing_best_ask_size", "best_ask_size_unknown", "best_bid_size_unknown"}:
+            return "D", "size_unknown"
+        if quote_was_fillable and best_ask_size is None:
+            return "D", "size_unknown"
+        if not book_has_snapshot:
+            return "D", "missing_snapshot"
+        if not book_structurally_complete:
+            return "D", "structurally_incomplete"
+        if validation_mode == "diagnostic":
+            if validation_error and validation_error.startswith("reported_best_"):
+                return "C", "diagnostic_mode_only"
+            return "C", "diagnostic_mode_only"
+        if market_quote_complete_rate is not None and market_quote_complete_rate < 0.85:
+            return "C", "low_quote_complete_rate"
+        if validation_mode == "tolerant" and validation_error and validation_error.startswith(
+            "reported_best_"
+        ):
+            return "B", "tolerated_one_tick_mismatch"
+        if reported_best_validation_ok is True and (
+            market_quote_complete_rate is None or market_quote_complete_rate >= 0.95
+        ):
+            if best_bid_size is None and validation_error in {None, ""}:
+                return "B", "size_unknown"
+            return "A", "clean_validated"
+        if reported_best_validation_ok is True:
+            return "B", "clean_validated"
+        return "C", validation_error or "weaker_validation_quality"
 
     def _stale_diagnostics(
         self,
@@ -1359,6 +1555,36 @@ def _first_validation_error(quotes: Iterable[PolymarketQuote]) -> str | None:
         if quote.validation_error is not None:
             return quote.validation_error
     return None
+
+
+def _first_rate(quotes: Iterable[PolymarketQuote], attr: str) -> float | None:
+    for quote in quotes:
+        value = getattr(quote, attr)
+        if isinstance(value, int | float):
+            return float(value)
+    return None
+
+
+def _coalesce(left: float | None, right: float | None) -> float | None:
+    return left if left is not None else right
+
+
+def _spread(best_bid: float | None, best_ask: float | None) -> float | None:
+    if best_bid is None or best_ask is None:
+        return None
+    return max(0.0, best_ask - best_bid)
+
+
+def _ticks(value: float | None, tick_size: float | None) -> float | None:
+    if value is None or tick_size is None:
+        return None
+    return diff_to_ticks(value, tick_size)
+
+
+def _price_ticks(value: float | None, tick_size: float | None) -> float | None:
+    if value is None or tick_size is None:
+        return None
+    return price_to_ticks(value, tick_size)
 
 
 def _is_stale_wall(timestamp: int | None, *, now_ts: int, stale_ms: float) -> bool:

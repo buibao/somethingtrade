@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -103,7 +103,7 @@ class PolymarketLocalOrderBook:
         *,
         token_metadata: dict[str, TokenBookMetadata],
         stale_after_ms: float = 1_000.0,
-        best_validation_mode: BestValidationMode = "strict",
+        best_validation_mode: BestValidationMode = "tolerant",
         best_validation_tolerance_ticks: int = 1,
         mismatch_sample_path: Path | str | None = "data/debug/polymarket_orderbook_mismatch_samples.jsonl",
         mismatch_sample_per_token_per_min: int = 20,
@@ -281,6 +281,34 @@ class PolymarketLocalOrderBook:
                 book.invalid = True
                 book.incomplete = True
                 book.validation_error = "market_invalidated"
+
+    def update_tick_size(
+        self,
+        market_id: str,
+        *,
+        token_id: str | None,
+        tick_size: float,
+    ) -> None:
+        if tick_size <= 0.0:
+            return
+        token_ids = (
+            (token_id,)
+            if token_id is not None
+            else tuple(
+                token
+                for token, metadata in self.token_metadata.items()
+                if metadata.market_id == market_id
+            )
+        )
+        for token in token_ids:
+            metadata = self.token_metadata.get(token)
+            if metadata is None:
+                continue
+            updated = replace(metadata, tick_size=tick_size)
+            self.token_metadata[token] = updated
+            book = self._books.get(token)
+            if book is not None:
+                book.metadata = updated
 
     def record_reconnect(self) -> None:
         for readiness in self._readiness.values():
@@ -513,6 +541,10 @@ class PolymarketLocalOrderBook:
         mid = None if best_bid is None or best_ask is None else (best_bid + best_ask) / 2.0
         spread = None if best_bid is None or best_ask is None else max(0.0, best_ask - best_bid)
         stale = self._is_stale(book, now_ts=received_ts)
+        token_mismatch_rate, token_complete_rate = self._quality_rates_for_token(book.token_id)
+        market_mismatch_rate, market_complete_rate = self._quality_rates_for_market(
+            book.metadata.market_id
+        )
         structurally_complete = (
             book.has_snapshot
             and not book.invalid
@@ -552,6 +584,12 @@ class PolymarketLocalOrderBook:
             book_has_snapshot=book.has_snapshot,
             book_structurally_complete=structurally_complete,
             reported_best_validation_ok=book.reported_best_validation_ok,
+            validation_mode=self.best_validation_mode,
+            validation_tolerance_ticks=self.best_validation_tolerance_ticks,
+            market_mismatch_rate=market_mismatch_rate,
+            token_mismatch_rate=token_mismatch_rate,
+            market_quote_complete_rate=market_complete_rate,
+            token_quote_complete_rate=token_complete_rate,
         )
 
     def _record_readiness(
@@ -793,6 +831,33 @@ class PolymarketLocalOrderBook:
             return True
         return (now_ts - book.last_received_ts) / 1_000_000.0 > self.stale_after_ms
 
+    def _quality_rates_for_token(self, token_id: str) -> tuple[float | None, float | None]:
+        readiness = self._readiness.get(token_id)
+        if readiness is None:
+            return None, None
+        return _quality_rates(readiness)
+
+    def _quality_rates_for_market(self, market_id: str) -> tuple[float | None, float | None]:
+        stats = [
+            readiness
+            for readiness in self._readiness.values()
+            if readiness.market_id == market_id
+        ]
+        if not stats:
+            return None, None
+        true_count = sum(item.book_complete_true_count for item in stats)
+        false_count = sum(item.book_complete_false_count for item in stats)
+        total = true_count + false_count
+        if total == 0:
+            return None, None
+        mismatch_count = sum(
+            count
+            for item in stats
+            for reason, count in item.validation_error_count_by_reason.items()
+            if reason.startswith("reported_best_")
+        )
+        return mismatch_count / total, true_count / total
+
 
 def _levels_to_dict(rows: object) -> dict[float, float]:
     if not isinstance(rows, list):
@@ -878,6 +943,18 @@ def _merge_reason_counts(reason_counts: Iterable[object]) -> dict[str, int]:
             if isinstance(reason, str) and isinstance(count, int):
                 merged[reason] = merged.get(reason, 0) + count
     return merged
+
+
+def _quality_rates(readiness: _TokenBookReadiness) -> tuple[float | None, float | None]:
+    total = readiness.book_complete_true_count + readiness.book_complete_false_count
+    if total == 0:
+        return None, None
+    mismatch_count = sum(
+        count
+        for reason, count in readiness.validation_error_count_by_reason.items()
+        if reason.startswith("reported_best_")
+    )
+    return mismatch_count / total, readiness.book_complete_true_count / total
 
 
 def _int_or_none(value: object) -> int | None:
