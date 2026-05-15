@@ -34,6 +34,17 @@ pytest
 
 Copy `.env.example` to `.env` for local configuration. The default `MODE=paper` is the only implemented execution mode in this skeleton.
 
+## Binance Monitor
+
+Phase 1 includes websocket-first Binance ingestion for `aggTrade`, `bookTicker`, and `depth@100ms` combined streams. It normalizes messages into `MarketTick`, `OrderBookTop`, and `DepthUpdate`, updates in-memory state, and tracks exchange/local/parse/state timestamps plus latency.
+
+```bash
+python -m app.main binance-monitor
+python -m app.main binance-monitor --symbols BTCUSDT,ETHUSDT
+```
+
+The monitor prints compact state once per second. It uses reconnect with exponential backoff and websocket heartbeat pings. No database is used in the realtime path.
+
 ## Status
 
 This project does not implement real trading. Websocket clients, Polymarket execution, and strategy logic are deliberately skeletal so real connectivity, key management, persistence, and production risk controls can be added deliberately.

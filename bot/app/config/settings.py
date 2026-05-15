@@ -9,22 +9,38 @@ from pydantic import BaseModel, Field
 class Settings(BaseModel):
     """Runtime settings loaded from environment variables."""
 
-    binance_ws_url: str = Field(..., alias="BINANCE_WS_URL")
-    polymarket_ws_url: str = Field(..., alias="POLYMARKET_WS_URL")
-    polymarket_api_key: str = Field(..., alias="POLYMARKET_API_KEY")
-    wallet_private_key: str = Field(..., alias="WALLET_PRIVATE_KEY")
+    binance_ws_url: str = Field("wss://stream.binance.com:9443/ws", alias="BINANCE_WS_URL")
+    binance_symbols_csv: str = Field("BTCUSDT,ETHUSDT", alias="BINANCE_SYMBOLS")
+    polymarket_ws_url: str = Field(
+        "wss://ws-subscriptions-clob.polymarket.com/ws/",
+        alias="POLYMARKET_WS_URL",
+    )
+    polymarket_api_key: str = Field("replace-me", alias="POLYMARKET_API_KEY")
+    wallet_private_key: str = Field("replace-me", alias="WALLET_PRIVATE_KEY")
     mode: Literal["paper", "live"] = Field("paper", alias="MODE")
+
+    @property
+    def binance_symbols(self) -> tuple[str, ...]:
+        return tuple(
+            symbol.strip().upper()
+            for symbol in self.binance_symbols_csv.split(",")
+            if symbol.strip()
+        )
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     load_dotenv()
-    return Settings.model_validate(
-        {
-            "BINANCE_WS_URL": os.environ.get("BINANCE_WS_URL"),
-            "POLYMARKET_WS_URL": os.environ.get("POLYMARKET_WS_URL"),
-            "POLYMARKET_API_KEY": os.environ.get("POLYMARKET_API_KEY"),
-            "WALLET_PRIVATE_KEY": os.environ.get("WALLET_PRIVATE_KEY"),
-            "MODE": os.environ.get("MODE", "paper"),
-        }
-    )
+    values = {
+        key: value
+        for key in (
+            "BINANCE_WS_URL",
+            "BINANCE_SYMBOLS",
+            "POLYMARKET_WS_URL",
+            "POLYMARKET_API_KEY",
+            "WALLET_PRIVATE_KEY",
+            "MODE",
+        )
+        if (value := os.environ.get(key)) is not None
+    }
+    return Settings.model_validate(values)

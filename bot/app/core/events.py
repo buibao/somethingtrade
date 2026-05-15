@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
 import orjson
@@ -52,17 +52,36 @@ class ExecutionStatus(StrEnum):
     CANCELED = "canceled"
 
 
-class MarketTick(EventModel):
+class BookLevel(BaseModel):
+    """Single price level for order book deltas."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    price: float
+    size: float
+
+
+class RealtimeMarketEvent(EventModel):
+    """Market data event with exchange-to-state latency telemetry."""
+
+    exchange_event_ts: int | None = None
+    local_received_ts: int | None = None
+    parse_done_ts: int | None = None
+    state_updated_ts: int | None = None
+    latency_ms: float | None = None
+    exchange_ts_ns: int | None = None
+    sequence: int | None = None
+
+
+class MarketTick(RealtimeMarketEvent):
     event_type: Literal["market_tick"] = "market_tick"
     source: Literal["binance", "polymarket", "replay"]
     symbol: str
     price: float
     size: float
-    exchange_ts_ns: int | None = None
-    sequence: int | None = None
 
 
-class OrderBookTop(EventModel):
+class OrderBookTop(RealtimeMarketEvent):
     event_type: Literal["order_book_top"] = "order_book_top"
     source: Literal["binance", "polymarket", "replay"]
     symbol: str
@@ -70,11 +89,20 @@ class OrderBookTop(EventModel):
     bid_size: float
     ask_price: float
     ask_size: float
-    exchange_ts_ns: int | None = None
-    sequence: int | None = None
 
 
-class PolymarketQuote(EventModel):
+class DepthUpdate(RealtimeMarketEvent):
+    event_type: Literal["depth_update"] = "depth_update"
+    source: Literal["binance", "replay"] = "binance"
+    symbol: str
+    first_update_id: int
+    final_update_id: int
+    previous_final_update_id: int | None = None
+    bids: list[BookLevel] = Field(default_factory=list)
+    asks: list[BookLevel] = Field(default_factory=list)
+
+
+class PolymarketQuote(RealtimeMarketEvent):
     event_type: Literal["polymarket_quote"] = "polymarket_quote"
     market_id: str
     condition_id: str | None = None
@@ -84,8 +112,6 @@ class PolymarketQuote(EventModel):
     ask_probability: float
     bid_size: float
     ask_size: float
-    exchange_ts_ns: int | None = None
-    sequence: int | None = None
 
 
 class SignalEvent(EventModel):
@@ -154,9 +180,12 @@ class LatencyTrace(EventModel):
         return last - self.recv_ns
 
 
-Event = (
+BinanceMarketEvent: TypeAlias = MarketTick | OrderBookTop | DepthUpdate
+
+Event: TypeAlias = (
     MarketTick
     | OrderBookTop
+    | DepthUpdate
     | PolymarketQuote
     | SignalEvent
     | OrderIntent

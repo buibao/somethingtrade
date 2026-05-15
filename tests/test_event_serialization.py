@@ -1,6 +1,8 @@
 import orjson
 
 from app.core.events import (
+    BookLevel,
+    DepthUpdate,
     ExecutionReport,
     ExecutionStatus,
     LatencyTrace,
@@ -33,6 +35,13 @@ def test_all_required_events_are_json_serializable() -> None:
             bid_size=10.0,
             ask_price=0.62,
             ask_size=12.0,
+        ),
+        DepthUpdate(
+            symbol="BTCUSDT",
+            first_update_id=100,
+            final_update_id=101,
+            bids=[BookLevel(price=100.0, size=1.0)],
+            asks=[BookLevel(price=101.0, size=2.0)],
         ),
         PolymarketQuote(
             market_id="market-1",
