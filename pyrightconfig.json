@@ -1,0 +1,12 @@
+{
+  "include": ["bot", "tests"],
+  "exclude": ["**/__pycache__", ".venv", ".pytest_cache"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["bot"]
+    }
+  ]
+}

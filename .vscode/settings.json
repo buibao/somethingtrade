@@ -1,0 +1,5 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+  "python.analysis.extraPaths": ["${workspaceFolder}\\bot"],
+  "python.analysis.typeCheckingMode": "standard"
+}
