@@ -14,6 +14,7 @@ from app.core.events import (
     PolymarketSideLabel,
     PolymarketQuote,
     SignalEvent,
+    RejectStage,
     TradableGapObservation,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "OrderIntent",
     "PolymarketSideLabel",
     "PolymarketQuote",
+    "RejectStage",
     "SignalEvent",
     "TradableGapObservation",
 ]

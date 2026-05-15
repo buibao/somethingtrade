@@ -83,6 +83,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Minimum Polymarket probability move to count as repricing.",
     )
     gap_monitor.add_argument(
+        "--min-exit-edge",
+        type=float,
+        default=None,
+        help="Minimum positive bid-over-entry edge for executable repricing.",
+    )
+    gap_monitor.add_argument(
         "--max-entry-spread",
         type=float,
         default=None,
@@ -93,6 +99,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Maximum stale ask price move before the entry window is closed.",
+    )
+    gap_monitor.add_argument(
+        "--max-pending-ms",
+        type=float,
+        default=None,
+        help="Maximum observation lifetime before closing an unresolved gap.",
     )
     gap_monitor.add_argument(
         "--binance-stale-ms",
@@ -221,16 +233,30 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
     state = MarketState(max_polymarket_quote_age_ms=settings.polymarket_max_quote_age_ms)
     detector = GapDetector(
         markets=markets,
-        min_move_pct=args.min_move_pct or settings.gap_min_move_pct,
-        reprice_threshold=args.reprice_threshold or settings.gap_reprice_threshold,
-        max_entry_spread=args.max_entry_spread or settings.gap_max_entry_spread,
-        max_entry_price_move=args.max_entry_price_move
-        or settings.gap_max_entry_price_move,
-        binance_stale_ms=args.binance_stale_ms or settings.gap_binance_stale_ms,
-        polymarket_stale_ms=args.polymarket_stale_ms
-        or settings.gap_polymarket_stale_ms,
-        measurement_stale_ms=args.measurement_stale_ms
-        or settings.gap_measurement_stale_ms,
+        min_move_pct=_arg_or_setting(args.min_move_pct, settings.gap_min_move_pct),
+        reprice_threshold=_arg_or_setting(
+            args.reprice_threshold,
+            settings.gap_reprice_threshold,
+        ),
+        min_exit_edge=_arg_or_setting(args.min_exit_edge, settings.gap_min_exit_edge),
+        max_entry_spread=_arg_or_setting(
+            args.max_entry_spread,
+            settings.gap_max_entry_spread,
+        ),
+        max_entry_price_move=_arg_or_setting(
+            args.max_entry_price_move,
+            settings.gap_max_entry_price_move,
+        ),
+        max_pending_gap_ms=_arg_or_setting(args.max_pending_ms, settings.gap_max_pending_ms),
+        binance_stale_ms=_arg_or_setting(args.binance_stale_ms, settings.gap_binance_stale_ms),
+        polymarket_stale_ms=_arg_or_setting(
+            args.polymarket_stale_ms,
+            settings.gap_polymarket_stale_ms,
+        ),
+        measurement_stale_ms=_arg_or_setting(
+            args.measurement_stale_ms,
+            settings.gap_measurement_stale_ms,
+        ),
     )
     symbols = _symbols_for_markets(markets) or settings.binance_symbols
     binance = BinanceWSClient(
@@ -340,20 +366,32 @@ def _short_token(token_id: str | None) -> str:
     return "-" if token_id is None else token_id[:10]
 
 
+def _arg_or_setting(value: float | None, default: float) -> float:
+    return default if value is None else value
+
+
 def _format_gap_stats(stats: GapMonitorStats) -> str:
     rejects = ",".join(
         f"{reason}:{count}" for reason, count in sorted(stats.reject_count_by_reason.items())
+    )
+    reject_stages = ",".join(
+        f"{stage}:{count}" for stage, count in sorted(stats.reject_count_by_stage.items())
     )
     return " ".join(
         [
             f"detected={stats.detected_count}",
             f"completed={stats.completed_count}",
-            f"median_reprice={_fmt_ms(stats.median_repricing_delay_ms)}",
-            f"p95_reprice={_fmt_ms(stats.p95_repricing_delay_ms)}",
+            f"fillable={stats.fillable_at_detection_count}",
+            f"non_fillable={stats.non_fillable_at_detection_count}",
+            f"median_mid={_fmt_ms(stats.median_mid_repricing_delay_ms)}",
+            f"p95_mid={_fmt_ms(stats.p95_mid_repricing_delay_ms)}",
+            f"median_exec={_fmt_ms(stats.median_executable_repricing_delay_ms)}",
+            f"p95_exec={_fmt_ms(stats.p95_executable_repricing_delay_ms)}",
             f"median_window={_fmt_ms(stats.median_tradable_window_ms)}",
             f"p95_window={_fmt_ms(stats.p95_tradable_window_ms)}",
             f"avg_edge={_fmt_edge(stats.average_estimated_edge)}",
             f"rejects={rejects or '-'}",
+            f"reject_stages={reject_stages or '-'}",
             f"stale_feeds={stats.stale_feed_count}",
         ]
     )

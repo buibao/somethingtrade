@@ -72,6 +72,7 @@ type PolymarketSideLabel = Literal[
 ]
 type GapDirection = Literal["UP", "DOWN"]
 type MarketLifecycleType = Literal["tick_size_change", "market_resolved", "new_market"]
+type RejectStage = Literal["pre_entry", "window", "exit", "lifecycle", "timeout", "none"]
 
 
 class BookLevel(BaseModel):
@@ -263,6 +264,14 @@ class TradableGapObservation(EventModel):
     after_mid: float | None = None
     spread_before: float | None = None
     spread_after: float | None = None
+    mid_repricing_delay_ms: float | None = None
+    executable_repricing_delay_ms: float | None = None
+    first_mid_repriced_ts_ns: int | None = None
+    first_executable_repriced_ts_ns: int | None = None
+    executable_exit_bid: float | None = None
+    entry_ask: float | None = None
+    entry_ask_size: float | None = None
+    exit_edge_after_spread: float | None = None
     repricing_delay_ms: float | None = Field(
         None,
         validation_alias=AliasChoices("repricing_delay_ms", "gap_duration_ms"),
@@ -273,6 +282,10 @@ class TradableGapObservation(EventModel):
     quote_was_fillable: bool
     estimated_edge_raw: float | None = None
     estimated_edge_after_spread: float | None = None
+    pre_entry_reject_reason: str | None = None
+    window_end_reason: str | None = None
+    exit_reject_reason: str | None = None
+    reject_stage: RejectStage = "none"
     reject_reason: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]

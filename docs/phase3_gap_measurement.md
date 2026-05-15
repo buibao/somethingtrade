@@ -1,17 +1,20 @@
-# Phase 3.7 Gap Measurement
+# Phase 3.8 Gap Measurement
 
-Phase 3.7 measures whether Binance price discovery appears before Polymarket reprices the matching short-duration BTC/ETH CLOB market. It is a measurement system, not a live trading signal.
+Phase 3.8 measures whether Binance price discovery appears before Polymarket reprices the matching short-duration BTC/ETH CLOB market. It is a measurement system, not a live trading signal.
 
 ## Three Different Ideas
 
 Repricing delay:
-The time from a Binance-led move being detected to the first matching Polymarket quote update in the expected direction.
+There are two delays:
+
+- `mid_repricing_delay_ms`: time from Binance move detection until Polymarket mid probability moves in the expected direction.
+- `executable_repricing_delay_ms`: time from Binance move detection until the selected token has an executable exit bid above `entry_ask + GAP_MIN_EXIT_EDGE`.
 
 Tradable window:
-The subset of that delay where the stale Polymarket quote was actually fillable at the relevant side of the local CLOB. For a hypothetical BUY, the detector requires a complete local book, a best ask, enough `best_ask_size`, acceptable spread, and a non-invalid market. `tradable_window_ms` is allowed to end before `repricing_delay_ms`, and it may be recorded even when repricing never occurs.
+The period where the stale Polymarket quote remains enterable at the ask. For a hypothetical BUY, the detector requires a complete local book, a fresh quote, a non-invalid market, a best ask, enough `best_ask_size`, acceptable spread, and an ask no higher than `entry_ask + GAP_MAX_ENTRY_PRICE_MOVE`. A low current bid does not end the tradable window.
 
 Estimated edge:
-Only counted for monitor averages when the stale quote was fillable, the spread was below the configured threshold, and the repriced quote leaves positive spread-adjusted value. For a hypothetical BUY, `estimated_edge_after_spread = later_best_bid - detection_best_ask`. A repricing delay without fillability is not treated as executable edge.
+Only counted when executable repricing occurs. For a hypothetical BUY, `exit_edge_after_spread = executable_exit_bid - entry_ask`. Mid repricing without a profitable bid is not executable repricing.
 
 Fillability:
 For a BUY measurement, the visible entry is `best_ask`. The quote is not fillable if the ask is missing, the ask size is missing, the ask size is below `min_order_size`, the spread is too wide, the quote/book is stale, or the market lifecycle invalidates the book.
@@ -58,8 +61,10 @@ Entry-window controls:
 
 - `GAP_MAX_ENTRY_SPREAD`, default `0.05`
 - `GAP_MAX_ENTRY_PRICE_MOVE`, default `0.02`
+- `GAP_MIN_EXIT_EDGE`, default `0.0`
+- `GAP_MAX_PENDING_MS`, default `5000`
 
-The tradable window ends when a quote update makes the selected token non-executable: ask moves beyond the configured entry tolerance, ask size disappears, spread widens beyond the configured threshold, spread-adjusted edge decays to zero or below, the quote becomes stale, the book becomes incomplete, the tick size changes, or the market resolves.
+The tradable window ends when a quote update makes the selected token non-enterable: ask moves beyond the configured entry tolerance, ask size disappears, spread widens beyond the configured threshold, the quote becomes stale, the book becomes incomplete, the tick size changes, or the market resolves. It does not end merely because the current bid is below the entry ask.
 
 ## Local Order Book
 
@@ -73,7 +78,7 @@ Polymarket CLOB websocket messages are applied to an in-memory `PolymarketLocalO
 
 ## Why Price Change Alone Is Not Enough
 
-A standalone `price_change` row can show a price level delta and sometimes reports best bid/ask fields, but those reported bests do not prove executable size at the top of book. Without a prior snapshot and local deltas, a detector can mistake a price update for fillable liquidity. Phase 3.7 treats the local book as source of truth and marks quotes incomplete when size cannot be established.
+A standalone `price_change` row can show a price level delta and sometimes reports best bid/ask fields, but those reported bests do not prove executable size at the top of book. Without a prior snapshot and local deltas, a detector can mistake a price update for fillable liquidity. Phase 3.8 treats the local book as source of truth and marks quotes incomplete when size cannot be established.
 
 ## Lifecycle Events
 
@@ -85,16 +90,30 @@ The Polymarket websocket can emit lifecycle events:
 
 Tick-size changes and resolved markets invalidate related local books and close pending gap measurements for that market with a reject reason. New-market events are surfaced so discovery can be rerun; they are not silently ignored.
 
+## Reject Taxonomy
+
+Each completed observation carries:
+
+- `pre_entry_reject_reason`
+- `window_end_reason`
+- `exit_reject_reason`
+- `reject_stage`: `pre_entry`, `window`, `exit`, `lifecycle`, `timeout`, or `none`
+- `reject_reason`: final summary reason for dashboards and quick scans
+
+Pending gaps are closed by executable repricing, window failure, lifecycle invalidation, or `GAP_MAX_PENDING_MS`. The timeout path prevents unresolved gaps from staying open forever.
+
 ## Observation Fields
 
 Completed observations are `TradableGapObservation` JSON events with:
 
 - Binance move data: `symbol`, `direction`, `binance_move_pct`, `binance_event_ts_ns`
 - Polymarket quote data: before/after bid, ask, sizes, mids, and spreads
-- Timing data: `detected_ts_ns`, `poly_quote_ts_ns`, `repricing_delay_ms`, `tradable_window_ms`
+- Timing data: `detected_ts_ns`, `poly_quote_ts_ns`, `mid_repricing_delay_ms`, `executable_repricing_delay_ms`, `tradable_window_ms`
+- Repricing timestamps: `first_mid_repriced_ts_ns`, `first_executable_repriced_ts_ns`
 - Hypothetical prices: `hypothetical_entry_price`, `hypothetical_exit_price`
+- Entry/exit prices: `entry_ask`, `entry_ask_size`, `executable_exit_bid`
 - Fillability data: `quote_was_fillable`, `reject_reason`
-- Edge data: `estimated_edge_raw`, `estimated_edge_after_spread`
+- Edge data: `estimated_edge_raw`, `estimated_edge_after_spread`, `exit_edge_after_spread`
 
 Internal processing latency uses monotonic timestamps:
 
@@ -114,12 +133,13 @@ The monitor prints:
 
 - number of detected gaps
 - number of completed observations
-- median repricing delay
-- p95 repricing delay
+- fillable and non-fillable detection counts
+- median and p95 mid repricing delay
+- median and p95 executable repricing delay
 - median tradable window
 - p95 tradable window
-- average executable estimated edge after spread
 - reject counts by reason
+- reject counts by stage
 - stale feed count
 
 Completed observations are written asynchronously to:

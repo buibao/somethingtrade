@@ -47,6 +47,7 @@ def _quote(
     bid_size: float | None = 100.0,
     ask_size: float | None = 100.0,
     book_complete: bool = True,
+    recv_monotonic_ns: int | None = None,
 ) -> PolymarketQuote:
     half_spread = spread / 2.0
     return PolymarketQuote(
@@ -65,6 +66,7 @@ def _quote(
         exchange_event_ts=ts,
         local_received_ts=ts,
         book_complete=book_complete,
+        recv_monotonic_ns=recv_monotonic_ns,
     )
 
 
@@ -79,6 +81,7 @@ def _book_quote(
     ask_size: float | None = 100.0,
     book_complete: bool = True,
     book_stale: bool = False,
+    recv_monotonic_ns: int | None = None,
 ) -> PolymarketQuote:
     mid = None if best_bid is None or best_ask is None else (best_bid + best_ask) / 2.0
     spread = None if best_bid is None or best_ask is None else best_ask - best_bid
@@ -99,6 +102,7 @@ def _book_quote(
         local_received_ts=ts,
         book_complete=book_complete,
         book_stale=book_stale,
+        recv_monotonic_ns=recv_monotonic_ns,
     )
 
 
@@ -192,12 +196,21 @@ def test_gap_detector_records_tradable_observation_for_delayed_repricing() -> No
     assert observation.before_best_ask_size == pytest.approx(100.0)
     assert observation.after_best_bid == pytest.approx(0.53)
     assert observation.repricing_delay_ms == pytest.approx(250.0)
+    assert observation.mid_repricing_delay_ms == pytest.approx(250.0)
+    assert observation.executable_repricing_delay_ms == pytest.approx(250.0)
+    assert observation.first_mid_repriced_ts_ns == repriced_ts
+    assert observation.first_executable_repriced_ts_ns == repriced_ts
     assert observation.tradable_window_ms == pytest.approx(250.0)
+    assert observation.entry_ask == pytest.approx(0.51)
+    assert observation.entry_ask_size == pytest.approx(100.0)
+    assert observation.executable_exit_bid == pytest.approx(0.53)
     assert observation.hypothetical_entry_price == pytest.approx(0.51)
     assert observation.hypothetical_exit_price == pytest.approx(0.53)
     assert observation.quote_was_fillable is True
     assert observation.estimated_edge_raw == pytest.approx(0.04)
     assert observation.estimated_edge_after_spread == pytest.approx(0.02)
+    assert observation.exit_edge_after_spread == pytest.approx(0.02)
+    assert observation.reject_stage == "none"
     assert observation.reject_reason is None
 
 
@@ -301,8 +314,11 @@ def test_quote_with_no_best_ask_size_is_not_fillable_for_buy() -> None:
     detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
     stats = detector.stats(state, now_ts=detected_ts)
 
-    assert stats.detected_count == 0
+    assert stats.detected_gaps == 1
+    assert stats.fillable_at_detection_count == 0
+    assert stats.non_fillable_at_detection_count == 1
     assert stats.reject_count_by_reason["missing_best_ask_size"] == 1
+    assert stats.reject_count_by_stage["pre_entry"] == 1
 
 
 def test_wide_spread_is_marked_non_tradable() -> None:
@@ -320,7 +336,9 @@ def test_wide_spread_is_marked_non_tradable() -> None:
     detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
     stats = detector.stats(state, now_ts=detected_ts)
 
-    assert stats.detected_count == 0
+    assert stats.detected_gaps == 1
+    assert stats.fillable_at_detection_count == 0
+    assert stats.non_fillable_at_detection_count == 1
     assert stats.reject_count_by_reason["spread_too_wide"] == 1
 
 
@@ -379,7 +397,9 @@ def test_stale_polymarket_quote_rejects_candidate() -> None:
     detected_ts = _apply_binance_move(state, detector, base_ts=base_ts + 1_000_000_000)
 
     stats = detector.stats(state, now_ts=detected_ts)
-    assert stats.detected_count == 0
+    assert stats.detected_gaps == 1
+    assert stats.fillable_at_detection_count == 0
+    assert stats.non_fillable_at_detection_count == 1
     assert stats.reject_count_by_reason["quote_stale"] == 1
 
 
@@ -397,7 +417,9 @@ def test_incomplete_book_rejects_candidate() -> None:
     detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
     stats = detector.stats(state, now_ts=detected_ts)
 
-    assert stats.detected_count == 0
+    assert stats.detected_gaps == 1
+    assert stats.fillable_at_detection_count == 0
+    assert stats.non_fillable_at_detection_count == 1
     assert stats.reject_count_by_reason["book_incomplete"] == 1
 
 
@@ -418,10 +440,166 @@ def test_repricing_in_opposite_direction_does_not_close_gap() -> None:
 
     observations = detector.on_market_event(opposite_quote, state, now_ts=detected_ts + 100_000_000)
 
+    assert observations == ()
+    assert detector.stats(state, now_ts=detected_ts + 100_000_000).completed_gaps == 0
+
+
+def test_current_bid_below_entry_ask_does_not_end_tradable_window() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    still_stale = state.apply(
+        _book_quote(best_bid=0.50, best_ask=0.52, ts=detected_ts + 100_000_000)
+    )
+    assert isinstance(still_stale, PolymarketQuote)
+    observations = detector.on_market_event(still_stale, state, now_ts=detected_ts + 100_000_000)
+
+    assert observations == ()
+    stats = detector.stats(state, now_ts=detected_ts + 100_000_000)
+    assert stats.completed_gaps == 0
+    assert stats.fillable_at_detection_count == 1
+
+
+def test_mid_repricing_without_profitable_bid_waits_until_timeout() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        max_pending_gap_ms=200.0,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    mid_only_ts = detected_ts + 100_000_000
+    mid_only = state.apply(_book_quote(best_bid=0.50, best_ask=0.52, ts=mid_only_ts))
+    assert isinstance(mid_only, PolymarketQuote)
+    assert detector.on_market_event(mid_only, state, now_ts=mid_only_ts) == ()
+
+    timeout_ts = detected_ts + 300_000_000
+    timeout_quote = state.apply(_book_quote(best_bid=0.50, best_ask=0.52, ts=timeout_ts))
+    assert isinstance(timeout_quote, PolymarketQuote)
+    observations = detector.on_market_event(timeout_quote, state, now_ts=timeout_ts)
+
     assert len(observations) == 1
-    assert observations[0].repricing_delay_ms is None
-    assert observations[0].reject_reason == "edge_not_positive_after_spread"
-    assert detector.stats(state, now_ts=detected_ts + 100_000_000).completed_count == 1
+    assert observations[0].mid_repricing_delay_ms == pytest.approx(100.0)
+    assert observations[0].executable_repricing_delay_ms is None
+    assert observations[0].first_executable_repriced_ts_ns is None
+    assert observations[0].reject_stage == "timeout"
+    assert observations[0].reject_reason == "max_observation_lifetime_reached"
+    assert observations[0].exit_reject_reason == "edge_not_positive_after_spread"
+
+
+def test_executable_repricing_requires_bid_above_entry_plus_min_edge() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        min_exit_edge=0.005,
+        max_pending_gap_ms=1_000.0,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    not_enough_ts = detected_ts + 100_000_000
+    not_enough = state.apply(
+        _book_quote(best_bid=0.515, best_ask=0.52, ts=not_enough_ts)
+    )
+    assert isinstance(not_enough, PolymarketQuote)
+    assert detector.on_market_event(not_enough, state, now_ts=not_enough_ts) == ()
+
+    executable_ts = detected_ts + 250_000_000
+    executable = state.apply(
+        _book_quote(best_bid=0.516, best_ask=0.52, ts=executable_ts)
+    )
+    assert isinstance(executable, PolymarketQuote)
+    observations = detector.on_market_event(executable, state, now_ts=executable_ts)
+
+    assert len(observations) == 1
+    assert observations[0].executable_repricing_delay_ms == pytest.approx(250.0)
+    assert observations[0].executable_exit_bid == pytest.approx(0.516)
+    assert observations[0].exit_edge_after_spread == pytest.approx(0.006)
+    assert observations[0].reject_stage == "none"
+    assert observations[0].reject_reason is None
+
+
+def test_monotonic_timestamps_drive_window_duration_despite_wall_clock_drift() -> None:
+    base_ts = 1_700_000_000_000_000_000
+    base_mono = 10_000_000_000
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts, recv_monotonic_ns=base_mono + 50_000_000))
+
+    first_tick = state.apply(
+        MarketTick(
+            source="binance",
+            symbol="BTCUSDT",
+            price=100.0,
+            size=1.0,
+            exchange_event_ts=base_ts,
+            local_received_ts=base_ts,
+            recv_monotonic_ns=base_mono + 100_000_000,
+        )
+    )
+    assert isinstance(first_tick, MarketTick)
+    assert detector.on_market_event(first_tick, state, now_ts=base_ts) == ()
+    state.apply(
+        OrderBookTop(
+            source="binance",
+            symbol="BTCUSDT",
+            bid_price=99.99,
+            bid_size=1.0,
+            ask_price=100.01,
+            ask_size=1.0,
+            local_received_ts=base_ts,
+        )
+    )
+    second_tick = state.apply(
+        MarketTick(
+            source="binance",
+            symbol="BTCUSDT",
+            price=101.0,
+            size=1.0,
+            exchange_event_ts=base_ts + 1_000_000_000,
+            local_received_ts=base_ts + 1_000_000_000,
+            recv_monotonic_ns=base_mono + 200_000_000,
+        )
+    )
+    assert isinstance(second_tick, MarketTick)
+    assert detector.on_market_event(second_tick, state, now_ts=base_ts + 1_000_000_000) == ()
+
+    drifted_quote = state.apply(
+        _book_quote(
+            best_bid=0.53,
+            best_ask=0.55,
+            ts=base_ts - 60_000_000_000,
+            recv_monotonic_ns=base_mono + 450_000_000,
+        )
+    )
+    assert isinstance(drifted_quote, PolymarketQuote)
+    observations = detector.on_market_event(drifted_quote, state, now_ts=base_ts - 60_000_000_000)
+
+    assert len(observations) == 1
+    assert observations[0].tradable_window_ms == pytest.approx(250.0)
+    assert observations[0].executable_repricing_delay_ms == pytest.approx(250.0)
 
 
 def test_tradable_window_ends_before_repricing_when_ask_jumps() -> None:
@@ -447,6 +625,8 @@ def test_tradable_window_ends_before_repricing_when_ask_jumps() -> None:
     assert observations[0].repricing_delay_ms is None
     assert observations[0].tradable_window_ms == pytest.approx(100.0)
     assert observations[0].repricing_delay_ms != observations[0].tradable_window_ms
+    assert observations[0].reject_stage == "window"
+    assert observations[0].window_end_reason == "entry_price_moved"
     assert observations[0].reject_reason == "entry_price_moved"
     assert observations[0].estimated_edge_after_spread is None
 
@@ -471,6 +651,8 @@ def test_tradable_window_ends_when_best_ask_size_disappears() -> None:
     assert len(observations) == 1
     assert observations[0].repricing_delay_ms is None
     assert observations[0].tradable_window_ms == pytest.approx(100.0)
+    assert observations[0].reject_stage == "window"
+    assert observations[0].window_end_reason == "insufficient_best_ask_size"
     assert observations[0].reject_reason == "insufficient_best_ask_size"
 
 
@@ -499,6 +681,7 @@ def test_market_resolved_cancels_pending_gap() -> None:
 
     assert len(observations) == 1
     assert observations[0].reject_reason == "market_resolved"
+    assert observations[0].reject_stage == "lifecycle"
     assert observations[0].tradable_window_ms == pytest.approx(100.0)
     assert detector.stats(state, now_ts=detected_ts + 250_000_000).completed_count == 1
 
@@ -531,6 +714,7 @@ def test_tick_size_change_marks_market_invalid() -> None:
     assert "0xmarket" in state.invalid_polymarket_markets
     assert len(observations) == 1
     assert observations[0].reject_reason == "tick_size_change"
+    assert observations[0].reject_stage == "lifecycle"
     assert detector.stats(state, now_ts=detected_ts + 100_000_000).completed_count == 1
 
 
@@ -553,7 +737,41 @@ def test_stale_quote_ends_tradable_window() -> None:
 
     assert len(observations) == 1
     assert observations[0].tradable_window_ms == pytest.approx(100.0)
+    assert observations[0].reject_stage == "window"
     assert observations[0].reject_reason == "quote_stale"
+
+
+def test_max_pending_gap_ms_closes_stale_pending_gap() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        max_pending_gap_ms=100.0,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    heartbeat = state.apply(
+        OrderBookTop(
+            source="binance",
+            symbol="BTCUSDT",
+            bid_price=101.0,
+            bid_size=1.0,
+            ask_price=101.1,
+            ask_size=1.0,
+            local_received_ts=detected_ts + 200_000_000,
+        )
+    )
+    assert isinstance(heartbeat, OrderBookTop)
+    observations = detector.on_market_event(heartbeat, state, now_ts=detected_ts + 200_000_000)
+
+    assert len(observations) == 1
+    assert observations[0].reject_stage == "timeout"
+    assert observations[0].reject_reason == "max_observation_lifetime_reached"
+    assert observations[0].tradable_window_ms == pytest.approx(200.0)
 
 
 def test_p95_stats_with_multiple_completed_observations() -> None:
@@ -587,10 +805,16 @@ def test_p95_stats_with_multiple_completed_observations() -> None:
 
     assert stats.detected_gaps == 3
     assert stats.completed_gaps == 3
-    assert stats.median_repricing_delay_ms == pytest.approx(200.0)
-    assert stats.p95_repricing_delay_ms == pytest.approx(300.0)
+    assert stats.fillable_at_detection_count == 3
+    assert stats.non_fillable_at_detection_count == 0
+    assert stats.median_mid_repricing_delay_ms == pytest.approx(200.0)
+    assert stats.p95_mid_repricing_delay_ms == pytest.approx(300.0)
+    assert stats.median_executable_repricing_delay_ms == pytest.approx(200.0)
+    assert stats.p95_executable_repricing_delay_ms == pytest.approx(300.0)
     assert stats.median_tradable_window_ms == pytest.approx(200.0)
     assert stats.p95_tradable_window_ms == pytest.approx(300.0)
+    assert stats.reject_count_by_reason == {}
+    assert stats.reject_count_by_stage == {}
     assert stats.average_estimated_edge == pytest.approx(0.02)
 
 

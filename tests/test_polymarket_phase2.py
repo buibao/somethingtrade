@@ -337,3 +337,37 @@ def test_market_state_rejects_stale_polymarket_quote() -> None:
     updated = state.apply(fresh)
     assert isinstance(updated, PolymarketQuote)
     assert state.polymarket_quotes["yes-token"].best_bid == 0.40
+
+
+def test_market_state_applies_lifecycle_and_marks_market_invalid() -> None:
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    quote = PolymarketQuote(
+        market_id="0xmarket",
+        token_id="yes-token",
+        side_label="UP",
+        best_bid=0.40,
+        best_bid_size=10.0,
+        best_ask=0.42,
+        best_ask_size=10.0,
+        mid_price=0.41,
+        spread=0.02,
+        event_ts=utc_now_ns(),
+        received_ts=utc_now_ns(),
+        book_complete=True,
+    )
+    assert isinstance(state.apply(quote), PolymarketQuote)
+
+    lifecycle = MarketLifecycleEvent(
+        market_id="0xmarket",
+        token_id="yes-token",
+        lifecycle_type="market_resolved",
+        event_ts=quote.event_ts,
+        received_ts=quote.received_ts,
+    )
+    updated = state.apply(lifecycle)
+
+    assert isinstance(updated, MarketLifecycleEvent)
+    assert state.is_market_invalid("0xmarket") is True
+    assert state.lifecycle_events_by_market["0xmarket"].lifecycle_type == "market_resolved"
+    assert state.polymarket_quotes["yes-token"].book_complete is False
+    assert state.polymarket_quotes["yes-token"].validation_error == "market_invalidated"

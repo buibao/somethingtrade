@@ -109,6 +109,14 @@ def test_all_required_events_are_json_serializable() -> None:
             after_mid=0.54,
             spread_before=0.02,
             spread_after=0.02,
+            mid_repricing_delay_ms=100.0,
+            executable_repricing_delay_ms=0.00015,
+            first_mid_repriced_ts_ns=200,
+            first_executable_repriced_ts_ns=250,
+            executable_exit_bid=0.53,
+            entry_ask=0.51,
+            entry_ask_size=20.0,
+            exit_edge_after_spread=0.02,
             repricing_delay_ms=0.00015,
             tradable_window_ms=0.00015,
             hypothetical_entry_price=0.51,
@@ -116,6 +124,10 @@ def test_all_required_events_are_json_serializable() -> None:
             quote_was_fillable=True,
             estimated_edge_raw=0.04,
             estimated_edge_after_spread=0.02,
+            pre_entry_reject_reason=None,
+            window_end_reason=None,
+            exit_reject_reason=None,
+            reject_stage="none",
             reject_reason=None,
         ),
         MarketLifecycleEvent(
@@ -205,6 +217,14 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
         after_mid=0.54,
         spread_before=0.02,
         spread_after=0.02,
+        mid_repricing_delay_ms=120.0,
+        executable_repricing_delay_ms=150.0,
+        first_mid_repriced_ts_ns=220,
+        first_executable_repriced_ts_ns=250,
+        executable_exit_bid=0.53,
+        entry_ask=0.51,
+        entry_ask_size=20.0,
+        exit_edge_after_spread=0.02,
         repricing_delay_ms=150.0,
         tradable_window_ms=100.0,
         hypothetical_entry_price=0.51,
@@ -212,10 +232,15 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
         quote_was_fillable=True,
         estimated_edge_raw=0.04,
         estimated_edge_after_spread=0.02,
+        pre_entry_reject_reason=None,
+        window_end_reason=None,
+        exit_reject_reason=None,
+        reject_stage="none",
         reject_reason=None,
     )
 
     assert event.repricing_delay_ms == 150.0
+    assert event.executable_repricing_delay_ms == 150.0
     assert event.gap_duration_ms == 150.0
 
 
