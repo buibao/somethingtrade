@@ -58,6 +58,12 @@ def test_all_required_events_are_json_serializable() -> None:
             spread=0.02,
             event_ts=100,
             received_ts=110,
+            book_complete=True,
+            book_stale=False,
+            book_hash="hash-1",
+            validation_error=None,
+            recv_monotonic_ns=10,
+            parse_done_monotonic_ns=20,
         ),
         SignalEvent(
             strategy_id="test",
@@ -103,7 +109,7 @@ def test_all_required_events_are_json_serializable() -> None:
             after_mid=0.54,
             spread_before=0.02,
             spread_after=0.02,
-            gap_duration_ms=0.00015,
+            repricing_delay_ms=0.00015,
             tradable_window_ms=0.00015,
             hypothetical_entry_price=0.51,
             hypothetical_exit_price=0.53,
@@ -129,6 +135,88 @@ def test_all_required_events_are_json_serializable() -> None:
         decoded = orjson.loads(payload)
         assert decoded["event_id"] == event.event_id
         assert decoded["event_type"] == event.event_type
+
+
+def test_polymarket_quote_constructs_with_phase37_fields() -> None:
+    quote = PolymarketQuote(
+        market_id="market-1",
+        condition_id="condition-1",
+        token_id="token-up",
+        side_label="UP",
+        best_bid=0.49,
+        best_bid_size=10.0,
+        best_ask=0.51,
+        best_ask_size=20.0,
+        mid_price=0.50,
+        spread=0.02,
+        event_ts=100,
+        received_ts=110,
+        book_complete=True,
+        book_stale=False,
+        book_hash="hash-1",
+        validation_error=None,
+        recv_monotonic_ns=1_000,
+        parse_done_monotonic_ns=1_100,
+    )
+
+    assert quote.book_complete is True
+    assert quote.available_liquidity_at_best == 30.0
+    assert quote.book_hash == "hash-1"
+
+
+def test_market_lifecycle_event_constructs_with_latency_fields() -> None:
+    event = MarketLifecycleEvent(
+        market_id="market-1",
+        token_id="token-up",
+        lifecycle_type="market_resolved",
+        old_tick_size=0.01,
+        new_tick_size=0.001,
+        raw_metadata={"event_type": "market_resolved"},
+        event_ts=100,
+        received_ts=110,
+        exchange_event_ts=100,
+        local_received_ts=110,
+        recv_monotonic_ns=1_000,
+        parse_done_monotonic_ns=1_100,
+        latency_ms=0.0001,
+    )
+
+    assert event.event_type == "market_lifecycle"
+    assert event.lifecycle_type == "market_resolved"
+
+
+def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
+    event = TradableGapObservation(
+        symbol="BTCUSDT",
+        market_id="market-1",
+        token_id="token-up",
+        direction="UP",
+        binance_move_pct=1.0,
+        detected_ts_ns=100,
+        binance_event_ts_ns=90,
+        poly_quote_ts_ns=250,
+        before_best_bid=0.49,
+        before_best_ask=0.51,
+        before_best_bid_size=10.0,
+        before_best_ask_size=20.0,
+        before_mid=0.50,
+        after_best_bid=0.53,
+        after_best_ask=0.55,
+        after_mid=0.54,
+        spread_before=0.02,
+        spread_after=0.02,
+        repricing_delay_ms=150.0,
+        tradable_window_ms=100.0,
+        hypothetical_entry_price=0.51,
+        hypothetical_exit_price=0.53,
+        quote_was_fillable=True,
+        estimated_edge_raw=0.04,
+        estimated_edge_after_spread=0.02,
+        reject_reason=None,
+    )
+
+    assert event.repricing_delay_ms == 150.0
+    assert event.gap_duration_ms == 150.0
 
 
 def test_latency_trace_total_ns() -> None:

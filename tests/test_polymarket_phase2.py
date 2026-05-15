@@ -271,6 +271,43 @@ def test_polymarket_lifecycle_events_are_not_silently_ignored() -> None:
     assert event.new_tick_size == pytest.approx(0.001)
 
 
+def test_polymarket_market_resolved_lifecycle_invalidates_book() -> None:
+    market = _metadata()
+    client = PolymarketWSClient(markets=(market,), token_ids=flatten_token_ids((market,)))
+    received_ts = 1_700_000_000_100_000_000
+
+    lifecycle = client.normalize_message(
+        orjson.dumps(
+            {
+                "event_type": "market_resolved",
+                "market": "0xmarket",
+                "asset_id": "yes-token",
+                "timestamp": "1700000000000",
+            }
+        ),
+        received_ts=received_ts,
+    )[0]
+    quote = client.normalize_message(
+        orjson.dumps(
+            {
+                "event_type": "book",
+                "asset_id": "yes-token",
+                "market": "0xmarket",
+                "bids": [{"price": ".48", "size": "30"}],
+                "asks": [{"price": ".52", "size": "25"}],
+                "timestamp": "1700000000001",
+                "hash": "0xabc",
+            }
+        ),
+        received_ts=received_ts + 1,
+    )[0]
+
+    assert isinstance(lifecycle, MarketLifecycleEvent)
+    assert lifecycle.lifecycle_type == "market_resolved"
+    assert isinstance(quote, PolymarketQuote)
+    assert quote.book_complete is False
+
+
 def test_market_state_rejects_stale_polymarket_quote() -> None:
     state = MarketState(max_polymarket_quote_age_ms=1.0)
     stale = PolymarketQuote(

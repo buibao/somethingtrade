@@ -104,6 +104,7 @@ class PolymarketLocalOrderBook:
         if not book.has_snapshot:
             book.incomplete = True
         book.invalid = book.metadata.market_id in self._market_invalid
+        self._clear_resolved_overrides(book)
         self._validate_reported_best(book, row)
         self._touch(book, event_ts=event_ts, received_ts=received_ts, sequence=sequence)
         return self._quote(
@@ -130,6 +131,8 @@ class PolymarketLocalOrderBook:
         book = self._book(token_id, payload)
         reported_bid = _optional_float(payload.get("best_bid"))
         reported_ask = _optional_float(payload.get("best_ask"))
+        book.incomplete = not book.has_snapshot
+        book.validation_error = None
 
         if reported_bid is not None:
             local_bid, _ = _best_bid(book.bids)
@@ -142,7 +145,7 @@ class PolymarketLocalOrderBook:
             else:
                 book.best_bid_override = reported_bid
                 book.incomplete = True
-                book.validation_error = "best_bid_size_unknown"
+                book.validation_error = "reported_best_bid_mismatch"
 
         if reported_ask is not None:
             local_ask, _ = _best_ask(book.asks)
@@ -155,7 +158,7 @@ class PolymarketLocalOrderBook:
             else:
                 book.best_ask_override = reported_ask
                 book.incomplete = True
-                book.validation_error = "best_ask_size_unknown"
+                book.validation_error = "reported_best_ask_mismatch"
 
         if not book.has_snapshot:
             book.incomplete = True
@@ -262,8 +265,18 @@ class PolymarketLocalOrderBook:
         local_ask, _ = _best_ask(book.asks)
         if reported_bid is not None and local_bid is not None and reported_bid != local_bid:
             book.validation_error = "reported_best_bid_mismatch"
+            book.incomplete = True
         if reported_ask is not None and local_ask is not None and reported_ask != local_ask:
             book.validation_error = "reported_best_ask_mismatch"
+            book.incomplete = True
+
+    def _clear_resolved_overrides(self, book: _TokenBook) -> None:
+        local_bid, _ = _best_bid(book.bids)
+        local_ask, _ = _best_ask(book.asks)
+        if book.best_bid_override is not None and book.best_bid_override == local_bid:
+            book.best_bid_override = None
+        if book.best_ask_override is not None and book.best_ask_override == local_ask:
+            book.best_ask_override = None
 
     def _is_stale(self, book: _TokenBook, *, now_ts: int) -> bool:
         if book.last_received_ts is None:

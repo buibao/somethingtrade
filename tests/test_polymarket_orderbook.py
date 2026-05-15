@@ -190,8 +190,39 @@ def test_best_bid_ask_without_size_does_not_corrupt_known_size() -> None:
 
     assert compatible.best_bid_size == pytest.approx(15.0)
     assert compatible.best_ask_size == pytest.approx(25.0)
+    assert compatible.book_complete is True
     assert incompatible.best_ask == pytest.approx(0.51)
     assert incompatible.best_ask_size is None
     assert incompatible.book_complete is False
+    assert incompatible.validation_error == "reported_best_ask_mismatch"
     assert restored.best_ask == pytest.approx(0.52)
     assert restored.best_ask_size == pytest.approx(25.0)
+    assert restored.book_complete is True
+
+
+def test_reported_best_mismatch_marks_book_incomplete() -> None:
+    orderbook = _book()
+    _snapshot(orderbook)
+
+    quote = orderbook.apply_best_bid_ask(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "token-up",
+            "market": "0xmarket",
+            "best_bid": "0.47",
+            "best_ask": "0.52",
+        },
+        received_ts=2_000,
+        parse_done_ts=2_001,
+        recv_monotonic_ns=2_000,
+        parse_done_monotonic_ns=2_001,
+        event_ts=2_000,
+        sequence="hash-2",
+    )
+
+    assert quote.best_bid == pytest.approx(0.47)
+    assert quote.best_bid_size is None
+    assert quote.best_ask_size == pytest.approx(25.0)
+    assert quote.book_complete is False
+    assert quote.validation_error == "reported_best_bid_mismatch"
+    assert quote.book_hash == "hash-2"

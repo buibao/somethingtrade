@@ -341,13 +341,19 @@ def _short_token(token_id: str | None) -> str:
 
 
 def _format_gap_stats(stats: GapMonitorStats) -> str:
+    rejects = ",".join(
+        f"{reason}:{count}" for reason, count in sorted(stats.reject_count_by_reason.items())
+    )
     return " ".join(
         [
-            f"detected={stats.detected_gaps}",
-            f"completed={stats.completed_gaps}",
-            f"median_gap={_fmt_ms(stats.median_gap_duration_ms)}",
-            f"p95_gap={_fmt_ms(stats.p95_gap_duration_ms)}",
+            f"detected={stats.detected_count}",
+            f"completed={stats.completed_count}",
+            f"median_reprice={_fmt_ms(stats.median_repricing_delay_ms)}",
+            f"p95_reprice={_fmt_ms(stats.p95_repricing_delay_ms)}",
+            f"median_window={_fmt_ms(stats.median_tradable_window_ms)}",
+            f"p95_window={_fmt_ms(stats.p95_tradable_window_ms)}",
             f"avg_edge={_fmt_edge(stats.average_estimated_edge)}",
+            f"rejects={rejects or '-'}",
             f"stale_feeds={stats.stale_feed_count}",
         ]
     )

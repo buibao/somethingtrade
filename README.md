@@ -57,7 +57,7 @@ See `docs/polymarket_notes.md` for API assumptions and cache contents. Real orde
 
 ## Gap Monitor
 
-Phase 3.6 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates quote repricing delay from the true fillable stale-quote window and only reports spread-adjusted estimated edge when the entry was executable by local-book size and spread filters.
+Phase 3.7 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates quote repricing delay from the true fillable stale-quote window and only reports spread-adjusted estimated edge when the entry was executable by local-book size and spread filters.
 
 ```bash
 python -m app.main gap-monitor

@@ -3,7 +3,14 @@ from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_serializer
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_serializer,
+)
 
 from app.core.clock import utc_now_ns
 
@@ -134,7 +141,7 @@ class PolymarketQuote(RealtimeMarketEvent):
     spread: float | None = None
     event_ts: int | None = None
     received_ts: int | None = None
-    book_complete: bool = True
+    book_complete: bool = False
     book_stale: bool = False
     book_hash: str | None = None
     validation_error: str | None = None
@@ -256,7 +263,10 @@ class TradableGapObservation(EventModel):
     after_mid: float | None = None
     spread_before: float | None = None
     spread_after: float | None = None
-    gap_duration_ms: float | None = None
+    repricing_delay_ms: float | None = Field(
+        None,
+        validation_alias=AliasChoices("repricing_delay_ms", "gap_duration_ms"),
+    )
     tradable_window_ms: float | None = None
     hypothetical_entry_price: float | None = None
     hypothetical_exit_price: float | None = None
@@ -264,6 +274,13 @@ class TradableGapObservation(EventModel):
     estimated_edge_raw: float | None = None
     estimated_edge_after_spread: float | None = None
     reject_reason: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def gap_duration_ms(self) -> float | None:
+        """Backward-compatible alias for older Phase 3 JSONL readers."""
+
+        return self.repricing_delay_ms
 
 
 class MarketLifecycleEvent(RealtimeMarketEvent):

@@ -60,7 +60,9 @@ class MarketState:
         self.depth_updates: dict[str, DepthUpdate] = {}
         self.polymarket_quotes: dict[str, PolymarketQuote] = {}
         self.market_lifecycle_events: list[MarketLifecycleEvent] = []
-        self.invalid_polymarket_markets: set[str] = set()
+        self.lifecycle_events_by_market: dict[str, MarketLifecycleEvent] = {}
+        self.market_invalid: set[str] = set()
+        self.invalid_polymarket_markets: set[str] = self.market_invalid
         self.symbols: dict[str, SymbolState] = {}
         self.max_polymarket_quote_age_ms = max_polymarket_quote_age_ms
 
@@ -70,9 +72,17 @@ class MarketState:
     ) -> BinanceMarketEvent | PolymarketQuote | MarketLifecycleEvent | None:
         state_updated_ts = utc_now_ns()
         state_updated_monotonic_ns = monotonic_now_ns()
+        if isinstance(event, PolymarketQuote) and event.market_id in self.market_invalid:
+            event = event.model_copy(
+                update={
+                    "book_complete": False,
+                    "validation_error": event.validation_error or "market_invalidated",
+                }
+            )
         if isinstance(event, PolymarketQuote) and self.is_stale_quote(
             event,
             now_ts=state_updated_ts,
+            now_monotonic_ns=state_updated_monotonic_ns,
         ):
             return None
 
@@ -116,18 +126,33 @@ class MarketState:
             self.polymarket_quotes[updated_event.token_id] = updated_event
         elif isinstance(updated_event, MarketLifecycleEvent):
             self.market_lifecycle_events.append(updated_event)
+            self.lifecycle_events_by_market[updated_event.market_id] = updated_event
             if updated_event.lifecycle_type in {"market_resolved", "tick_size_change"}:
-                self.invalid_polymarket_markets.add(updated_event.market_id)
+                self.market_invalid.add(updated_event.market_id)
+                self._invalidate_polymarket_quotes(updated_event.market_id)
 
         return updated_event
 
-    def is_stale_quote(self, quote: PolymarketQuote, *, now_ts: int | None = None) -> bool:
+    def is_stale_quote(
+        self,
+        quote: PolymarketQuote,
+        *,
+        now_ts: int | None = None,
+        now_monotonic_ns: int | None = None,
+    ) -> bool:
+        if quote.recv_monotonic_ns is not None and now_monotonic_ns is not None:
+            age_ms = (now_monotonic_ns - quote.recv_monotonic_ns) / 1_000_000.0
+            return age_ms > self.max_polymarket_quote_age_ms
+
         reference_ts = quote.event_ts or quote.received_ts or quote.exchange_event_ts
         if reference_ts is None:
             return False
         current_ts = now_ts or utc_now_ns()
         age_ms = (current_ts - reference_ts) / 1_000_000.0
         return age_ms > self.max_polymarket_quote_age_ms
+
+    def is_market_invalid(self, market_id: str) -> bool:
+        return market_id in self.market_invalid
 
     def snapshot(self) -> dict[str, dict[str, object]]:
         return {symbol: state.snapshot() for symbol, state in self.symbols.items()}
@@ -182,6 +207,17 @@ class MarketState:
         if symbol not in self.symbols:
             self.symbols[symbol] = SymbolState(symbol=symbol)
         return self.symbols[symbol]
+
+    def _invalidate_polymarket_quotes(self, market_id: str) -> None:
+        for token_id, quote in list(self.polymarket_quotes.items()):
+            if quote.market_id != market_id:
+                continue
+            self.polymarket_quotes[token_id] = quote.model_copy(
+                update={
+                    "book_complete": False,
+                    "validation_error": quote.validation_error or "market_invalidated",
+                }
+            )
 
     def _append_price(self, state: SymbolState, *, timestamp: int, price: float) -> None:
         state.price_history.append((timestamp, price))
