@@ -65,6 +65,9 @@ def _quote(
     ask_size: float | None = 100.0,
     book_complete: bool = True,
     recv_monotonic_ns: int | None = None,
+    book_update_type: str | None = None,
+    book_has_snapshot: bool = False,
+    validation_error: str | None = None,
 ) -> PolymarketQuote:
     half_spread = spread / 2.0
     return PolymarketQuote(
@@ -83,7 +86,10 @@ def _quote(
         exchange_event_ts=ts,
         local_received_ts=ts,
         book_complete=book_complete,
+        validation_error=validation_error,
         recv_monotonic_ns=recv_monotonic_ns,
+        book_update_type=book_update_type,  # type: ignore[arg-type]
+        book_has_snapshot=book_has_snapshot,
     )
 
 
@@ -99,6 +105,9 @@ def _book_quote(
     book_complete: bool = True,
     book_stale: bool = False,
     recv_monotonic_ns: int | None = None,
+    book_update_type: str | None = None,
+    book_has_snapshot: bool = False,
+    validation_error: str | None = None,
 ) -> PolymarketQuote:
     mid = None if best_bid is None or best_ask is None else (best_bid + best_ask) / 2.0
     spread = None if best_bid is None or best_ask is None else best_ask - best_bid
@@ -119,7 +128,10 @@ def _book_quote(
         local_received_ts=ts,
         book_complete=book_complete,
         book_stale=book_stale,
+        validation_error=validation_error,
         recv_monotonic_ns=recv_monotonic_ns,
+        book_update_type=book_update_type,  # type: ignore[arg-type]
+        book_has_snapshot=book_has_snapshot,
     )
 
 
@@ -236,6 +248,11 @@ def test_gap_detector_records_tradable_observation_for_delayed_repricing() -> No
     assert observation.estimated_edge_raw == pytest.approx(0.04)
     assert observation.estimated_edge_after_spread == pytest.approx(0.02)
     assert observation.exit_edge_after_spread == pytest.approx(0.02)
+    assert observation.market_classification_at_detection == "current"
+    assert observation.signal_enabled_at_detection is True
+    assert observation.book_complete_at_detection is True
+    assert observation.book_validation_error_at_detection is None
+    assert observation.book_warmup_ms_at_detection is not None
     assert observation.reject_stage == "none"
     assert observation.reject_reason is None
 
@@ -379,6 +396,121 @@ def test_current_market_can_create_candidate() -> None:
 
     assert detector.stats(state, now_ts=detected_ts).detected_gaps == 1
     assert detector.stats(state, now_ts=detected_ts).fillable_at_detection_count == 1
+
+
+def test_signal_candidate_suppressed_before_book_ready() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        book_warmup_max_ms=3_000.0,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    stats = detector.stats(state, now_ts=detected_ts)
+
+    assert stats.detected_gaps == 0
+    assert stats.completed_gaps == 0
+    assert stats.book_warmup_suppressed == 1
+
+
+def test_after_book_ready_candidate_can_be_created() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(
+        _book_quote(
+            token_id="up-token",
+            side_label="UP",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+        )
+    )
+    state.apply(
+        _book_quote(
+            token_id="down-token",
+            side_label="DOWN",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_update_type="book",
+            book_has_snapshot=True,
+        )
+    )
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    stats = detector.stats(state, now_ts=detected_ts)
+
+    assert stats.detected_gaps == 1
+    assert stats.fillable_at_detection_count == 1
+    assert stats.book_warmup_suppressed == 0
+
+
+def test_after_warmup_timeout_book_incomplete_observation_can_be_written() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        book_warmup_max_ms=100.0,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(
+        _book_quote(
+            token_id="up-token",
+            side_label="UP",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_complete=False,
+            book_update_type="price_change",
+            book_has_snapshot=False,
+            validation_error="no_snapshot",
+        )
+    )
+    state.apply(
+        _book_quote(
+            token_id="down-token",
+            side_label="DOWN",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=base_ts,
+            book_complete=False,
+            book_update_type="price_change",
+            book_has_snapshot=False,
+            validation_error="no_snapshot",
+        )
+    )
+
+    detected_ts = _apply_binance_move(
+        state,
+        detector,
+        base_ts=base_ts,
+        expected_second_observations=1,
+    )
+    stats = detector.stats(state, now_ts=detected_ts)
+
+    assert stats.detected_gaps == 1
+    assert stats.completed_gaps == 1
+    assert stats.book_warmup_suppressed == 0
+    assert stats.reject_count_by_reason["book_incomplete"] == 1
+    assert stats.reject_count_by_stage["pre_entry"] == 1
+    observation = detector._completed[-1]  # type: ignore[attr-defined]
+    assert observation.book_warmup_timeout is True
+    assert observation.book_complete_at_detection is False
+    assert observation.book_validation_error_at_detection == "no_snapshot"
 
 
 def test_next_market_becomes_current_after_event_start_time_can_create_candidate() -> None:
@@ -700,6 +832,7 @@ def test_incomplete_book_rejects_candidate() -> None:
     state = MarketState(max_polymarket_quote_age_ms=60_000.0)
     detector = GapDetector(
         markets=(market,),
+        require_book_ready=False,
         binance_stale_ms=60_000.0,
         polymarket_stale_ms=60_000.0,
     )

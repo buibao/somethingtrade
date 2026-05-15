@@ -1,6 +1,9 @@
 import pytest
+import orjson
 
 from app.marketdata.polymarket_orderbook import PolymarketLocalOrderBook, TokenBookMetadata
+from app.marketdata.polymarket_discovery import PolymarketMarketMetadata
+from app.marketdata.polymarket_ws import PolymarketWSClient
 
 
 def _book() -> PolymarketLocalOrderBook:
@@ -94,6 +97,104 @@ def test_price_change_buy_updates_bid_side() -> None:
     assert quote.best_bid_size == pytest.approx(8.0)
     assert quote.best_ask == pytest.approx(0.52)
     assert quote.best_ask_size == pytest.approx(25.0)
+
+
+def test_price_change_before_snapshot_does_not_mark_book_complete() -> None:
+    orderbook = _book()
+
+    quote = orderbook.apply_price_change(
+        {"asset_id": "token-up", "side": "BUY", "price": "0.51", "size": "8"},
+        parent_payload={"market": "0xmarket"},
+        received_ts=2_000,
+        parse_done_ts=2_001,
+        recv_monotonic_ns=2_000,
+        parse_done_monotonic_ns=2_001,
+        event_ts=2_000,
+        sequence="hash-2",
+    )
+    readiness = orderbook.token_readiness_snapshot()["token-up"]
+
+    assert quote.book_complete is False
+    assert quote.book_has_snapshot is False
+    assert quote.book_update_type == "price_change"
+    assert readiness["price_change_before_snapshot_count"] == 1
+    assert readiness["delta_count"] == 1
+    assert readiness["first_book_snapshot_ts_ns"] is None
+
+
+def test_book_snapshot_marks_token_complete() -> None:
+    orderbook = _book()
+
+    quote = orderbook.apply_book(
+        {
+            "event_type": "book",
+            "asset_id": "token-up",
+            "market": "0xmarket",
+            "bids": [{"price": "0.50", "size": "15"}],
+            "asks": [{"price": "0.52", "size": "25"}],
+        },
+        received_ts=1_000,
+        parse_done_ts=1_001,
+        recv_monotonic_ns=1_000,
+        parse_done_monotonic_ns=1_001,
+        event_ts=900,
+        sequence="hash-1",
+    )
+    readiness = orderbook.token_readiness_snapshot()["token-up"]
+
+    assert quote.book_complete is True
+    assert quote.book_has_snapshot is True
+    assert quote.book_update_type == "book"
+    assert readiness["first_book_snapshot_ts_ns"] == 1_000
+    assert readiness["first_complete_quote_ts_ns"] == 1_000
+    assert readiness["snapshot_count"] == 1
+    assert readiness["book_complete_true_count"] == 1
+
+
+def test_both_up_down_snapshots_mark_market_book_ready() -> None:
+    market = PolymarketMarketMetadata(
+        condition_id="0xcondition",
+        market_id="0xmarket",
+        market_slug="bitcoin-up-or-down-15m",
+        question="Bitcoin Up or Down - 15 minute",
+        end_time="2099-05-15T12:15:00Z",
+        event_start_time="2000-01-01T00:00:00Z",
+        tick_size=0.01,
+        min_order_size=5.0,
+        active=True,
+        closed=False,
+        accepting_orders=True,
+        enable_order_book=True,
+        selected_for_runtime=True,
+        signal_enabled=True,
+        up_token_id="token-up",
+        down_token_id="token-down",
+        token_outcomes={"token-up": "Up", "token-down": "Down"},
+        base_asset="BTC",
+        duration_minutes=15,
+    )
+    client = PolymarketWSClient(markets=(market,))
+    for token_id in ("token-up", "token-down"):
+        client.normalize_message(
+            orjson.dumps(
+                {
+                "event_type": "book",
+                "asset_id": token_id,
+                "market": "0xmarket",
+                "bids": [{"price": "0.50", "size": "15"}],
+                "asks": [{"price": "0.52", "size": "25"}],
+                "timestamp": "1700000000000",
+                }
+            )
+        )
+
+    readiness = client.book_readiness_snapshot(now_ts=1_700_000_001_000_000_000)
+    market_row = readiness["markets"][0]
+
+    assert market_row["up_token_book_complete"] is True
+    assert market_row["down_token_book_complete"] is True
+    assert market_row["both_tokens_complete"] is True
+    assert readiness["summary"]["complete_markets"] == 1
 
 
 def test_price_change_sell_updates_ask_side() -> None:

@@ -1,0 +1,449 @@
+{
+  "generated_ts_ns": 1778862785328665500,
+  "tokens": {
+    "10223154175404995462442108409801892331975717599123533955234149058564320984744": {
+      "token_id": "10223154175404995462442108409801892331975717599123533955234149058564320984744",
+      "market_id": "2261402",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 45806,
+      "book_complete_false_count": 11920,
+      "validation_error_count_by_reason": {
+        "reported_best_bid_mismatch": 3388,
+        "reported_best_ask_mismatch": 4136,
+        "best_bid_size_unknown": 143
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 2844,
+      "delta_count": 51631,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    "106277660076251634388718177502442519546167116248194044403137875855970824554452": {
+      "token_id": "106277660076251634388718177502442519546167116248194044403137875855970824554452",
+      "market_id": "2261428",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 6629,
+      "book_complete_false_count": 1530,
+      "validation_error_count_by_reason": {
+        "reported_best_bid_mismatch": 761,
+        "reported_best_ask_mismatch": 769
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 262,
+      "delta_count": 7547,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    "11316796070877159978973785749401798323823925601880968366220095278176717361873": {
+      "token_id": "11316796070877159978973785749401798323823925601880968366220095278176717361873",
+      "market_id": "2261399",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 11055,
+      "book_complete_false_count": 8970,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 4925,
+        "reported_best_bid_mismatch": 2847,
+        "best_bid_size_unknown": 43
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 447,
+      "delta_count": 18776,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    "16499433909958831063931217352387899412530721421064469804588120535349561211507": {
+      "token_id": "16499433909958831063931217352387899412530721421064469804588120535349561211507",
+      "market_id": "2261381",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 59425,
+      "book_complete_false_count": 30310,
+      "validation_error_count_by_reason": {
+        "reported_best_bid_mismatch": 16784,
+        "reported_best_ask_mismatch": 12186,
+        "best_ask_size_unknown": 40
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 1721,
+      "delta_count": 85534,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "3351243156836091175264135167758992140165504632883143183792381613621088365408": {
+      "token_id": "3351243156836091175264135167758992140165504632883143183792381613621088365408",
+      "market_id": "2261402",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 45798,
+      "book_complete_false_count": 11927,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 3427,
+        "reported_best_bid_mismatch": 4103,
+        "best_ask_size_unknown": 144
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 2843,
+      "delta_count": 51631,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "39560244272317650587310858790537781616402758591106698883648142065902693032572": {
+      "token_id": "39560244272317650587310858790537781616402758591106698883648142065902693032572",
+      "market_id": "2261387",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 2595,
+      "book_complete_false_count": 3938,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 1547,
+        "reported_best_bid_mismatch": 1766,
+        "best_bid_size_unknown": 23
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 277,
+      "delta_count": 5699,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    "51974018419643116645142588260154623708027491995132101032690079591763233873110": {
+      "token_id": "51974018419643116645142588260154623708027491995132101032690079591763233873110",
+      "market_id": "2261381",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 59464,
+      "book_complete_false_count": 30271,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 16815,
+        "reported_best_bid_mismatch": 12117,
+        "best_bid_size_unknown": 39
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 1721,
+      "delta_count": 85534,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    "53646477947201282904521950289455478473806480038423427402065258465780846316847": {
+      "token_id": "53646477947201282904521950289455478473806480038423427402065258465780846316847",
+      "market_id": "2261390",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 16189,
+      "book_complete_false_count": 24950,
+      "validation_error_count_by_reason": {
+        "reported_best_bid_mismatch": 15737,
+        "reported_best_ask_mismatch": 8281,
+        "best_ask_size_unknown": 7
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 369,
+      "delta_count": 39798,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "63789709140635950325707003134288511549781188113324402086072006200880416612069": {
+      "token_id": "63789709140635950325707003134288511549781188113324402086072006200880416612069",
+      "market_id": "2261399",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 11055,
+      "book_complete_false_count": 8970,
+      "validation_error_count_by_reason": {
+        "reported_best_bid_mismatch": 4634,
+        "reported_best_ask_mismatch": 2863,
+        "best_ask_size_unknown": 321
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 447,
+      "delta_count": 18776,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "64220888992569042161133727463097880491344661668833380683274314362213812504639": {
+      "token_id": "64220888992569042161133727463097880491344661668833380683274314362213812504639",
+      "market_id": "2261390",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 16249,
+      "book_complete_false_count": 24890,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 15705,
+        "reported_best_bid_mismatch": 8254,
+        "best_bid_size_unknown": 6
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 369,
+      "delta_count": 39798,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    "65785866811298921948847550344770284627273507593953412849276630944487689498539": {
+      "token_id": "65785866811298921948847550344770284627273507593953412849276630944487689498539",
+      "market_id": "2261387",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 2589,
+      "book_complete_false_count": 3944,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 1839,
+        "reported_best_bid_mismatch": 1478,
+        "best_ask_size_unknown": 25
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 277,
+      "delta_count": 5699,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "68497773987686838756266305151855436236296974364223236928458760531433398465635": {
+      "token_id": "68497773987686838756266305151855436236296974364223236928458760531433398465635",
+      "market_id": "2261382",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 7684,
+      "book_complete_false_count": 3082,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 607,
+        "reported_best_bid_mismatch": 842,
+        "best_ask_size_unknown": 383
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 703,
+      "delta_count": 9261,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "68859516746828365566081114984456546636872837664921953600410794177814520524963": {
+      "token_id": "68859516746828365566081114984456546636872837664921953600410794177814520524963",
+      "market_id": "2261434",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 2585,
+      "book_complete_false_count": 2467,
+      "validation_error_count_by_reason": {
+        "reported_best_bid_mismatch": 1222,
+        "reported_best_ask_mismatch": 1245
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 90,
+      "delta_count": 4760,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "73526688382614605681608362646262233854401318467813061957061992610341870071386": {
+      "token_id": "73526688382614605681608362646262233854401318467813061957061992610341870071386",
+      "market_id": "2261382",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 7683,
+      "book_complete_false_count": 3081,
+      "validation_error_count_by_reason": {
+        "reported_best_bid_mismatch": 599,
+        "reported_best_ask_mismatch": 908,
+        "best_bid_size_unknown": 325
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 701,
+      "delta_count": 9261,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    "93039526000392312033275988713525351594734381731666611626804897467623286922038": {
+      "token_id": "93039526000392312033275988713525351594734381731666611626804897467623286922038",
+      "market_id": "2261428",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 6629,
+      "book_complete_false_count": 1530,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 767,
+        "reported_best_bid_mismatch": 763
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 262,
+      "delta_count": 7547,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    "99275231584077521163197019492730784397757339987149143633060796569299320949164": {
+      "token_id": "99275231584077521163197019492730784397757339987149143633060796569299320949164",
+      "market_id": "2261434",
+      "first_ws_message_ts_ns": 1778861953959264300,
+      "first_book_snapshot_ts_ns": 1778861953959264300,
+      "first_complete_quote_ts_ns": 1778861953959264300,
+      "book_complete_true_count": 2585,
+      "book_complete_false_count": 2467,
+      "validation_error_count_by_reason": {
+        "reported_best_ask_mismatch": 1232,
+        "reported_best_bid_mismatch": 1235
+      },
+      "price_change_before_snapshot_count": 0,
+      "best_bid_ask_before_snapshot_count": 0,
+      "snapshot_count": 90,
+      "delta_count": 4760,
+      "reconnect_count": 0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    }
+  },
+  "markets": [
+    {
+      "market_id": "2261382",
+      "market_slug": "btc-updown-5m-1778861700",
+      "classification_at_now": "expired",
+      "signal_enabled_at_now": false,
+      "up_token_id": "73526688382614605681608362646262233854401318467813061957061992610341870071386",
+      "down_token_id": "68497773987686838756266305151855436236296974364223236928458760531433398465635",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    {
+      "market_id": "2261402",
+      "market_slug": "btc-updown-5m-1778862000",
+      "classification_at_now": "expired",
+      "signal_enabled_at_now": false,
+      "up_token_id": "3351243156836091175264135167758992140165504632883143183792381613621088365408",
+      "down_token_id": "10223154175404995462442108409801892331975717599123533955234149058564320984744",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    {
+      "market_id": "2261381",
+      "market_slug": "btc-updown-15m-1778861700",
+      "classification_at_now": "expired",
+      "signal_enabled_at_now": false,
+      "up_token_id": "16499433909958831063931217352387899412530721421064469804588120535349561211507",
+      "down_token_id": "51974018419643116645142588260154623708027491995132101032690079591763233873110",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    {
+      "market_id": "2261428",
+      "market_slug": "btc-updown-15m-1778862600",
+      "classification_at_now": "current",
+      "signal_enabled_at_now": true,
+      "up_token_id": "106277660076251634388718177502442519546167116248194044403137875855970824554452",
+      "down_token_id": "93039526000392312033275988713525351594734381731666611626804897467623286922038",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_bid_mismatch"
+    },
+    {
+      "market_id": "2261387",
+      "market_slug": "eth-updown-5m-1778861700",
+      "classification_at_now": "expired",
+      "signal_enabled_at_now": false,
+      "up_token_id": "65785866811298921948847550344770284627273507593953412849276630944487689498539",
+      "down_token_id": "39560244272317650587310858790537781616402758591106698883648142065902693032572",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    {
+      "market_id": "2261399",
+      "market_slug": "eth-updown-5m-1778862000",
+      "classification_at_now": "expired",
+      "signal_enabled_at_now": false,
+      "up_token_id": "63789709140635950325707003134288511549781188113324402086072006200880416612069",
+      "down_token_id": "11316796070877159978973785749401798323823925601880968366220095278176717361873",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    {
+      "market_id": "2261390",
+      "market_slug": "eth-updown-15m-1778861700",
+      "classification_at_now": "expired",
+      "signal_enabled_at_now": false,
+      "up_token_id": "53646477947201282904521950289455478473806480038423427402065258465780846316847",
+      "down_token_id": "64220888992569042161133727463097880491344661668833380683274314362213812504639",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    },
+    {
+      "market_id": "2261434",
+      "market_slug": "eth-updown-15m-1778862600",
+      "classification_at_now": "current",
+      "signal_enabled_at_now": true,
+      "up_token_id": "68859516746828365566081114984456546636872837664921953600410794177814520524963",
+      "down_token_id": "99275231584077521163197019492730784397757339987149143633060796569299320949164",
+      "up_token_book_complete": true,
+      "down_token_book_complete": true,
+      "both_tokens_complete": true,
+      "warmup_duration_ms": 831369.4012,
+      "time_to_first_complete_quote_ms": 0.0,
+      "last_validation_error": "reported_best_ask_mismatch"
+    }
+  ],
+  "summary": {
+    "selected_runtime_markets": 8,
+    "signal_enabled_markets": 2,
+    "warmup_only_markets": 6,
+    "complete_markets": 8,
+    "incomplete_markets": 0,
+    "average_time_to_first_complete_quote_ms": 0.0,
+    "top_validation_errors": {
+      "reported_best_ask_mismatch": 77252,
+      "reported_best_bid_mismatch": 76530,
+      "best_ask_size_unknown": 920,
+      "best_bid_size_unknown": 579
+    }
+  }
+}

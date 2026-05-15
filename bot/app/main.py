@@ -138,6 +138,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Cooldown for duplicate pre-entry reject JSONL rows.",
     )
+    gap_monitor.add_argument(
+        "--require-book-ready",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Gate new candidates until both UP/DOWN local books have snapshots.",
+    )
+    gap_monitor.add_argument(
+        "--book-warmup-max-ms",
+        type=float,
+        default=None,
+        help="Maximum book warmup gate duration before recording normal rejects.",
+    )
 
     rolling_debug = subparsers.add_parser(
         "polymarket-rolling-discovery-debug",
@@ -291,6 +303,15 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
             args.pre_entry_log_cooldown_ms,
             settings.gap_pre_entry_log_cooldown_ms,
         ),
+        require_book_ready=(
+            settings.gap_require_book_ready
+            if args.require_book_ready is None
+            else args.require_book_ready
+        ),
+        book_warmup_max_ms=_arg_or_setting(
+            args.book_warmup_max_ms,
+            settings.gap_book_warmup_max_ms,
+        ),
     )
     symbols = _symbols_for_markets(markets) or settings.binance_symbols
     binance = BinanceWSClient(
@@ -304,6 +325,8 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
     )
     logger = AsyncJsonlEventLogger(log_dir=args.log_dir or settings.gap_log_dir)
     logger.start()
+    _write_book_readiness_debug(polymarket)
+    print(_format_book_readiness_summary(polymarket.book_readiness_snapshot()), flush=True)
 
     tasks = [
         asyncio.create_task(_ingest_gap_binance(binance, state, detector, logger)),
@@ -312,7 +335,10 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
     try:
         while True:
             await asyncio.sleep(1.0)
+            readiness = polymarket.book_readiness_snapshot()
+            _write_book_readiness_debug(polymarket, payload=readiness)
             print(_format_gap_stats(detector.stats(state)), flush=True)
+            print(_format_book_readiness_summary(readiness), flush=True)
     finally:
         for task in tasks:
             task.cancel()
@@ -532,6 +558,22 @@ def _print_runtime_selection_diagnostics(
     )
 
 
+def _write_book_readiness_debug(
+    client: PolymarketWSClient,
+    *,
+    payload: dict[str, object] | None = None,
+) -> None:
+    output_path = Path("data/debug/polymarket_book_readiness.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    debug_payload = payload if payload is not None else client.book_readiness_snapshot()
+    output_path.write_bytes(
+        orjson.dumps(
+            debug_payload,
+            option=orjson.OPT_INDENT_2 | orjson.OPT_APPEND_NEWLINE,
+        )
+    )
+
+
 def _symbols_for_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> tuple[str, ...]:
     symbols: set[str] = set()
     for market in markets:
@@ -565,6 +607,7 @@ def _format_gap_stats(stats: GapMonitorStats) -> str:
             f"non_fillable={stats.non_fillable_at_detection_count}",
             f"pre_entry_written={stats.pre_entry_observations_written}",
             f"pre_entry_suppressed={stats.pre_entry_observations_suppressed}",
+            f"book_warmup_suppressed={stats.book_warmup_suppressed}",
             f"warmup_quotes={stats.warmup_quotes_received}",
             f"signal_markets={stats.signal_enabled_markets}",
             f"warmup_markets={stats.warmup_only_markets}",
@@ -578,6 +621,33 @@ def _format_gap_stats(stats: GapMonitorStats) -> str:
             f"rejects={rejects or '-'}",
             f"reject_stages={reject_stages or '-'}",
             f"stale_feeds={stats.stale_feed_count}",
+        ]
+    )
+
+
+def _format_book_readiness_summary(payload: dict[str, object]) -> str:
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return "book_readiness=unavailable"
+    top_errors = summary.get("top_validation_errors")
+    if isinstance(top_errors, dict):
+        top_error_text = ",".join(
+            f"{reason}:{count}" for reason, count in sorted(top_errors.items())
+        )
+    else:
+        top_error_text = "-"
+    avg_ms = summary.get("average_time_to_first_complete_quote_ms")
+    avg_text = "-" if not isinstance(avg_ms, int | float) else f"{avg_ms:.2f}ms"
+    return " ".join(
+        [
+            "book_readiness",
+            f"selected={summary.get('selected_runtime_markets', 0)}",
+            f"signal={summary.get('signal_enabled_markets', 0)}",
+            f"warmup_only={summary.get('warmup_only_markets', 0)}",
+            f"complete={summary.get('complete_markets', 0)}",
+            f"incomplete={summary.get('incomplete_markets', 0)}",
+            f"avg_first_complete={avg_text}",
+            f"top_validation_errors={top_error_text or '-'}",
         ]
     )
 

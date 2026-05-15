@@ -118,6 +118,8 @@ class PolymarketWSClient:
                     close_timeout=1,
                     max_queue=self.max_queue,
                 ) as websocket:
+                    if reconnect_attempt > 0:
+                        self._orderbooks.record_reconnect()
                     await websocket.send(self.subscription_message())
                     self._logger.info(
                         "polymarket_ws_connected",
@@ -289,6 +291,12 @@ class PolymarketWSClient:
 
     def _backoff_delay(self, attempt: int) -> float:
         return min(self.max_backoff_sec, self.initial_backoff_sec * (2**attempt))
+
+    def book_readiness_snapshot(self, *, now_ts: int | None = None) -> dict[str, Any]:
+        return self._orderbooks.market_readiness_snapshot(
+            self.market_metadata,
+            now_ts=now_ts or utc_now_ns(),
+        )
 
 
 def _build_token_metadata(

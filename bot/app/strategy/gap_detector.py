@@ -53,6 +53,17 @@ class BinanceMoveSnapshot:
         return max(values, key=abs)
 
 
+@dataclass(frozen=True, slots=True)
+class BookReadinessGate:
+    suppress: bool
+    warmup_ms: float | None
+    warmup_timeout: bool
+    book_complete: bool | None
+    validation_error: str | None
+    market_classification: str | None
+    signal_enabled: bool
+
+
 @dataclass(slots=True)
 class PendingTradableGap:
     symbol: str
@@ -89,6 +100,12 @@ class PendingTradableGap:
     current_spread: float | None = None
     current_quote_ts_ns: int | None = None
     current_quote_monotonic_ns: int | None = None
+    market_classification_at_detection: str | None = None
+    signal_enabled_at_detection: bool | None = None
+    book_complete_at_detection: bool | None = None
+    book_validation_error_at_detection: str | None = None
+    book_warmup_ms_at_detection: float | None = None
+    book_warmup_timeout: bool = False
     pre_entry_reject_reason: str | None = None
     window_end_reason: str | None = None
     exit_reject_reason: str | None = None
@@ -119,6 +136,7 @@ class GapMonitorStats:
     warmup_quotes_received: int = 0
     signal_enabled_markets: int = 0
     warmup_only_markets: int = 0
+    book_warmup_suppressed: int = 0
 
     @property
     def detected_count(self) -> int:
@@ -161,6 +179,8 @@ class GapDetector:
         polymarket_stale_ms: float = 1_000.0,
         measurement_stale_ms: float = 5_000.0,
         pre_entry_log_cooldown_ms: float = 500.0,
+        require_book_ready: bool = True,
+        book_warmup_max_ms: float = 3_000.0,
     ) -> None:
         self.markets = markets
         self.min_move_pct = min_move_pct
@@ -173,6 +193,9 @@ class GapDetector:
         self.polymarket_stale_ms = polymarket_stale_ms
         self.measurement_stale_ms = measurement_stale_ms
         self.pre_entry_log_cooldown_ms = pre_entry_log_cooldown_ms
+        self.require_book_ready = require_book_ready
+        self.book_warmup_max_ms = book_warmup_max_ms
+        self._detector_started_ns = utc_now_ns()
         self._markets_by_symbol = _markets_by_symbol(markets)
         self._markets_by_token = _markets_by_token(markets)
         self._pending: dict[tuple[str, str, GapDirection], PendingTradableGap] = {}
@@ -187,6 +210,7 @@ class GapDetector:
         self.pre_entry_observations_written = 0
         self.pre_entry_observations_suppressed = 0
         self.warmup_quotes_received = 0
+        self.book_warmup_suppressed = 0
 
     def on_market_event(
         self,
@@ -319,6 +343,7 @@ class GapDetector:
             warmup_quotes_received=self.warmup_quotes_received,
             signal_enabled_markets=signal_enabled_markets,
             warmup_only_markets=warmup_only_markets,
+            book_warmup_suppressed=self.book_warmup_suppressed,
         )
 
     def stale_feed_count(self, state: MarketState, *, now_ts: int | None = None) -> int:
@@ -384,6 +409,11 @@ class GapDetector:
             if not self._market_signal_enabled(market, now_ts):
                 continue
 
+            book_gate = self._book_readiness_gate(market, state, now_ts=now_ts)
+            if book_gate.suppress:
+                self.book_warmup_suppressed += 1
+                continue
+
             self.detected_gaps += 1
             token_id = market.token_for_direction(direction)
 
@@ -400,9 +430,10 @@ class GapDetector:
                         move_pct=move_pct,
                         now_ts=now_ts,
                         binance_event_ts=binance_event_ts,
-                        quote=None,
-                        reason="market_invalidated",
-                    )
+                            quote=None,
+                            reason="market_invalidated",
+                            book_gate=book_gate,
+                        )
                 )
                 continue
 
@@ -419,6 +450,7 @@ class GapDetector:
                         binance_event_ts=binance_event_ts,
                         quote=None,
                         reason="direction_token_unmapped",
+                        book_gate=book_gate,
                     )
                 )
                 continue
@@ -441,6 +473,7 @@ class GapDetector:
                         binance_event_ts=binance_event_ts,
                         quote=None,
                         reason="missing_quote",
+                        book_gate=book_gate,
                     )
                 )
                 continue
@@ -462,6 +495,7 @@ class GapDetector:
                         binance_event_ts=binance_event_ts,
                         quote=quote,
                         reason="quote_stale",
+                        book_gate=book_gate,
                     )
                 )
                 continue
@@ -480,6 +514,7 @@ class GapDetector:
                         binance_event_ts=binance_event_ts,
                         quote=quote,
                         reason=reject_reason or "quote_not_fillable",
+                        book_gate=book_gate,
                     )
                 )
                 continue
@@ -516,6 +551,12 @@ class GapDetector:
                 current_spread=quote.spread,
                 current_quote_ts_ns=quote_ts,
                 current_quote_monotonic_ns=quote_mono,
+                market_classification_at_detection=book_gate.market_classification,
+                signal_enabled_at_detection=book_gate.signal_enabled,
+                book_complete_at_detection=book_gate.book_complete,
+                book_validation_error_at_detection=book_gate.validation_error,
+                book_warmup_ms_at_detection=book_gate.warmup_ms,
+                book_warmup_timeout=book_gate.warmup_timeout,
             )
             self.fillable_at_detection_count += 1
 
@@ -838,6 +879,12 @@ class GapDetector:
             quote_was_fillable=True,
             estimated_edge_raw=raw_edge,
             estimated_edge_after_spread=exit_edge if reject_stage == "none" else None,
+            market_classification_at_detection=pending.market_classification_at_detection,
+            signal_enabled_at_detection=pending.signal_enabled_at_detection,
+            book_complete_at_detection=pending.book_complete_at_detection,
+            book_validation_error_at_detection=pending.book_validation_error_at_detection,
+            book_warmup_ms_at_detection=pending.book_warmup_ms_at_detection,
+            book_warmup_timeout=pending.book_warmup_timeout,
             pre_entry_reject_reason=pending.pre_entry_reject_reason,
             window_end_reason=pending.window_end_reason,
             exit_reject_reason=exit_reject_reason,
@@ -897,10 +944,21 @@ class GapDetector:
         binance_event_ts: int | None,
         quote: PolymarketQuote | None,
         reason: str,
+        book_gate: BookReadinessGate | None = None,
     ) -> TradableGapObservation:
         quote_ts = _quote_timestamp(quote) if quote is not None else None
         entry_ask = quote.best_ask if quote is not None else None
         entry_ask_size = quote.best_ask_size if quote is not None else None
+        book_complete = (
+            quote.book_complete
+            if book_gate is None and quote is not None
+            else (None if book_gate is None else book_gate.book_complete)
+        )
+        validation_error = (
+            quote.validation_error
+            if book_gate is None and quote is not None
+            else (None if book_gate is None else book_gate.validation_error)
+        )
         return TradableGapObservation(
             symbol=symbol,
             market_id=market.market_id,
@@ -927,6 +985,14 @@ class GapDetector:
             quote_was_fillable=False,
             entry_ask=entry_ask,
             entry_ask_size=entry_ask_size,
+            market_classification_at_detection=(
+                None if book_gate is None else book_gate.market_classification
+            ),
+            signal_enabled_at_detection=None if book_gate is None else book_gate.signal_enabled,
+            book_complete_at_detection=book_complete,
+            book_validation_error_at_detection=validation_error,
+            book_warmup_ms_at_detection=None if book_gate is None else book_gate.warmup_ms,
+            book_warmup_timeout=False if book_gate is None else book_gate.warmup_timeout,
             pre_entry_reject_reason=reason,
             reject_stage="pre_entry",
             reject_reason=reason,
@@ -985,6 +1051,48 @@ class GapDetector:
         return (
             is_runtime_tradable_market(market, now_ts=now_ts // 1_000_000_000)
             and classify_market_window(market, now_ts=now_ts // 1_000_000_000) == "current"
+        )
+
+    def _book_readiness_gate(
+        self,
+        market: PolymarketMarketMetadata,
+        state: MarketState,
+        *,
+        now_ts: int,
+    ) -> BookReadinessGate:
+        classification = classify_market_window(market, now_ts=now_ts // 1_000_000_000)
+        signal_enabled = self._market_signal_enabled(market, now_ts)
+        quotes = [
+            state.polymarket_quotes.get(token_id)
+            for token_id in (market.up_token_id, market.down_token_id)
+            if token_id is not None
+        ]
+        known_quotes = [quote for quote in quotes if quote is not None]
+        explicit_ready = len(quotes) >= 2 and all(
+            quote is not None and _quote_has_initial_snapshot(quote)
+            for quote in quotes
+        )
+        legacy_synthetic_ready = bool(known_quotes) and all(
+            quote.book_update_type is None and quote.book_complete
+            for quote in known_quotes
+        )
+        both_ready = explicit_ready or legacy_synthetic_ready
+        warmup_start = _min_quote_timestamp(known_quotes) or self._detector_started_ns
+        warmup_ms = _duration_ms(warmup_start, now_ts)
+        warmup_timeout = (
+            not both_ready
+            and warmup_ms is not None
+            and warmup_ms >= self.book_warmup_max_ms
+        )
+        suppress = self.require_book_ready and not both_ready and not warmup_timeout
+        return BookReadinessGate(
+            suppress=suppress,
+            warmup_ms=warmup_ms,
+            warmup_timeout=warmup_timeout,
+            book_complete=both_ready,
+            validation_error=_first_validation_error(known_quotes),
+            market_classification=classification,
+            signal_enabled=signal_enabled,
         )
 
     def _record_reject(self, reason: str, stage: RejectStage) -> None:
@@ -1068,6 +1176,28 @@ def _quote_timestamp(quote: PolymarketQuote) -> int | None:
 
 def _quote_monotonic(quote: PolymarketQuote) -> int | None:
     return quote.recv_monotonic_ns
+
+
+def _quote_has_initial_snapshot(quote: PolymarketQuote) -> bool:
+    if quote.book_has_snapshot:
+        return True
+    return quote.book_update_type is None and quote.book_complete
+
+
+def _min_quote_timestamp(quotes: Iterable[PolymarketQuote]) -> int | None:
+    timestamps = [
+        timestamp
+        for quote in quotes
+        if (timestamp := _quote_timestamp(quote)) is not None
+    ]
+    return min(timestamps) if timestamps else None
+
+
+def _first_validation_error(quotes: Iterable[PolymarketQuote]) -> str | None:
+    for quote in quotes:
+        if quote.validation_error is not None:
+            return quote.validation_error
+    return None
 
 
 def _is_stale_wall(timestamp: int | None, *, now_ts: int, stale_ms: float) -> bool:

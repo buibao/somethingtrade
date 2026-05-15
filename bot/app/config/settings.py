@@ -41,6 +41,8 @@ class Settings(BaseModel):
         500.0,
         alias="GAP_PRE_ENTRY_LOG_COOLDOWN_MS",
     )
+    gap_require_book_ready: bool = Field(True, alias="GAP_REQUIRE_BOOK_READY")
+    gap_book_warmup_max_ms: float = Field(3_000.0, alias="GAP_BOOK_WARMUP_MAX_MS")
     polymarket_api_key: str = Field("replace-me", alias="POLYMARKET_API_KEY")
     wallet_private_key: str = Field("replace-me", alias="WALLET_PRIVATE_KEY")
     mode: Literal["paper", "live"] = Field("paper", alias="MODE")
@@ -77,6 +79,8 @@ def get_settings() -> Settings:
             "GAP_POLYMARKET_STALE_MS",
             "GAP_MEASUREMENT_STALE_MS",
             "GAP_PRE_ENTRY_LOG_COOLDOWN_MS",
+            "GAP_REQUIRE_BOOK_READY",
+            "GAP_BOOK_WARMUP_MAX_MS",
             "POLYMARKET_API_KEY",
             "WALLET_PRIVATE_KEY",
             "MODE",

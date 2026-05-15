@@ -146,6 +146,8 @@ class PolymarketQuote(RealtimeMarketEvent):
     book_stale: bool = False
     book_hash: str | None = None
     validation_error: str | None = None
+    book_update_type: Literal["book", "price_change", "best_bid_ask"] | None = None
+    book_has_snapshot: bool = False
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -282,6 +284,12 @@ class TradableGapObservation(EventModel):
     quote_was_fillable: bool
     estimated_edge_raw: float | None = None
     estimated_edge_after_spread: float | None = None
+    market_classification_at_detection: str | None = None
+    signal_enabled_at_detection: bool | None = None
+    book_complete_at_detection: bool | None = None
+    book_validation_error_at_detection: str | None = None
+    book_warmup_ms_at_detection: float | None = None
+    book_warmup_timeout: bool = False
     pre_entry_reject_reason: str | None = None
     window_end_reason: str | None = None
     exit_reject_reason: str | None = None
