@@ -1,8 +1,10 @@
 import argparse
 import asyncio
 from collections.abc import Sequence
+from pathlib import Path
 
 import aiohttp
+import orjson
 
 from app.config.settings import get_settings
 from app.execution.paper_executor import PaperExecutor
@@ -128,6 +130,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Wider feed stale threshold for monitor stats.",
     )
 
+    rolling_debug = subparsers.add_parser(
+        "polymarket-rolling-discovery-debug",
+        help="Debug direct rolling BTC/ETH 5m/15m Polymarket slug discovery.",
+    )
+    rolling_debug.add_argument("--gamma-url", default=None, help="Polymarket Gamma API base URL.")
+    rolling_debug.add_argument("--cache-path", default=None, help="Market metadata cache path.")
+    rolling_debug.add_argument(
+        "--now-ts",
+        type=int,
+        default=None,
+        help="Unix seconds to use for deterministic rolling slug generation.",
+    )
+    rolling_debug.add_argument(
+        "--output",
+        default="data/debug/polymarket_rolling_discovery.json",
+        help="Path for raw and parsed rolling discovery debug JSON.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -141,6 +161,9 @@ async def run(argv: Sequence[str] | None = None) -> None:
         return
     if args.command == "gap-monitor":
         await run_gap_monitor(args)
+        return
+    if args.command == "polymarket-rolling-discovery-debug":
+        await run_polymarket_rolling_discovery_debug(args)
         return
 
     settings = get_settings()
@@ -220,6 +243,11 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
     )
     markets = await _discover_polymarket_markets(discovery)
     if not markets:
+        print(
+            "No rolling BTC/ETH 5m/15m markets found from direct slugs. Run:\n"
+            " python -m app.main polymarket-rolling-discovery-debug",
+            flush=True,
+        )
         print("no active BTC/ETH 5m/15m Polymarket markets discovered", flush=True)
         return
 
@@ -281,6 +309,56 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
             except asyncio.CancelledError:
                 pass
         await logger.close()
+
+
+async def run_polymarket_rolling_discovery_debug(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    discovery = PolymarketDiscoveryClient(
+        gamma_url=args.gamma_url or settings.polymarket_gamma_url,
+        cache_path=args.cache_path or settings.polymarket_market_cache_path,
+    )
+    debug = await discovery.debug_rolling_discovery(now_ts=args.now_ts)
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(
+        orjson.dumps(
+            debug,
+            option=orjson.OPT_INDENT_2 | orjson.OPT_APPEND_NEWLINE,
+        )
+    )
+
+    print("generated slugs:", flush=True)
+    for slug in debug["generated_slugs"]:
+        print(f"  {slug}", flush=True)
+
+    print("rolling discovery results:", flush=True)
+    for result in debug["results"]:
+        endpoint = result.get("endpoint_used") or "-"
+        status = "FOUND" if result.get("parsed_markets") else "missing/rejected"
+        print(f"  {result['slug']} status={status} endpoint={endpoint}", flush=True)
+        rejects = result.get("reject_reasons") or []
+        if rejects:
+            print(f"    reject_reasons={','.join(str(reason) for reason in rejects)}", flush=True)
+        for market in result.get("parsed_markets") or []:
+            token_outcomes = market.get("token_outcomes") or {}
+            print(
+                "    "
+                + " ".join(
+                    [
+                        f"market_id={market.get('market_id')}",
+                        f"asset={market.get('base_asset')}",
+                        f"duration={market.get('duration_minutes')}m",
+                        f"end={market.get('end_time')}",
+                        f"UP={market.get('up_token_id')}",
+                        f"DOWN={market.get('down_token_id')}",
+                        f"outcomes={token_outcomes}",
+                    ]
+                ),
+                flush=True,
+            )
+
+    print(f"debug output written to {output_path}", flush=True)
 
 
 async def _ingest_binance(client: BinanceWSClient, state: MarketState) -> None:

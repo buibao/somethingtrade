@@ -67,7 +67,7 @@ def test_yes_no_outcomes_reject_ambiguous_question() -> None:
     )
 
     assert metadata is None
-    assert reasons == ["yes_no_direction_ambiguous"]
+    assert reasons == ["no_direction_mapping"]
 
 
 def test_malformed_outcomes_rejected() -> None:

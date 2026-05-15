@@ -5,6 +5,8 @@ from app.marketdata.polymarket_discovery import (
     PolymarketDiscoveryClient,
     PolymarketMarketCache,
     PolymarketMarketMetadata,
+    floor_to_window,
+    generate_crypto_updown_slugs,
 )
 from app.marketdata.polymarket_orderbook import PolymarketLocalOrderBook, TokenBookMetadata
 from app.marketdata.polymarket_ws import (
@@ -25,4 +27,6 @@ __all__ = [
     "PolymarketLocalOrderBook",
     "PolymarketWSClient",
     "TokenBookMetadata",
+    "floor_to_window",
+    "generate_crypto_updown_slugs",
 ]
