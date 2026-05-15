@@ -59,11 +59,13 @@ See `docs/polymarket_notes.md` for API assumptions and cache contents. Real orde
 
 Phase 3.9 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates mid repricing from executable repricing, measures the true fillable stale-quote window, and records reject stage/reason taxonomy for modeling.
 
+Phase 3.10 hardens those measurement semantics before Phase 4. It locks delayed executable repricing after mid repricing in tests, documents timeout precedence, documents the runtime invariant that `state.apply(event)` must run before `detector.on_market_event(event, state)`, and adds a Phase 4 dataset field guide. It still does not add trading, wallet, or private-key logic.
+
 ```bash
 python -m app.main gap-monitor
 ```
 
-See `docs/phase3_gap_measurement.md` for interpretation guidance. The monitor does not place orders, and a measured gap is not a live trading signal.
+See `docs/phase3_gap_measurement.md` for interpretation guidance and `docs/phase4_dataset_fields.md` for dataset-field usage. The monitor does not place orders, and a measured gap is not a live trading signal.
 
 ## Status
 

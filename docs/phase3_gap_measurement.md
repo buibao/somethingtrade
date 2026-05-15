@@ -102,6 +102,9 @@ Each completed observation carries:
 
 Pending gaps are closed by executable repricing, window failure, lifecycle invalidation, or `GAP_MAX_PENDING_MS`. Lifecycle invalidation and timeout always produce completed observations; pending gaps are not silently deleted. If a timeout happens before mid repricing, `exit_reject_reason` is `no_mid_repricing_before_timeout`. If mid repricing happened but no profitable executable bid appeared, `exit_reject_reason` is `no_executable_repricing_before_timeout`.
 
+Timeout precedence:
+When a Polymarket quote arrives after `GAP_MAX_PENDING_MS`, timeout is recorded before structural, entry-window, or executable checks on that same quote. This keeps old observations from being reclassified by a late update. In that case `reject_stage` is `timeout`, `reject_reason` is `max_observation_lifetime_reached`, and `window_end_reason` remains unset unless the implementation later chooses to store secondary context.
+
 ## Observation Fields
 
 Completed observations are `TradableGapObservation` JSON events with:
@@ -122,6 +125,17 @@ Internal processing latency uses monotonic timestamps:
 - `state_updated_monotonic_ns`
 
 Exchange timestamps remain separate wall-clock data and are not used for internal processing latency.
+
+## Runtime Pipeline Invariant
+
+Every raw or normalized event should be applied to `MarketState` before being passed to `GapDetector`.
+
+Correct runtime order:
+
+1. `normalized = state.apply(event)`
+2. `detector.on_market_event(normalized, state, now_ts=...)`
+
+The detector reads latest Binance state, Polymarket quote state, invalid markets, and lifecycle state from `MarketState`. If lifecycle events reach the detector before `state.apply()` runs, pending gaps may still close because the lifecycle event is self-contained, but `MarketState` invalidation can be stale. Runtime code must enforce this ordering.
 
 ## Monitor
 

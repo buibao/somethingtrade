@@ -555,10 +555,52 @@ def test_mid_repricing_without_profitable_bid_waits_until_timeout() -> None:
     assert len(observations) == 1
     assert observations[0].mid_repricing_delay_ms == pytest.approx(100.0)
     assert observations[0].executable_repricing_delay_ms is None
+    assert observations[0].repricing_delay_ms is None
     assert observations[0].first_executable_repriced_ts_ns is None
     assert observations[0].reject_stage == "timeout"
     assert observations[0].reject_reason == "max_observation_lifetime_reached"
     assert observations[0].exit_reject_reason == "no_executable_repricing_before_timeout"
+
+
+def test_mid_repricing_then_executable_repricing_records_two_delays() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        min_exit_edge=0.005,
+        max_entry_price_move=0.04,
+        max_pending_gap_ms=1_000.0,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_book_quote(best_bid=0.49, best_ask=0.51, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+
+    mid_reprice_ts = detected_ts + 100_000_000
+    mid_reprice_only = state.apply(
+        _book_quote(best_bid=0.505, best_ask=0.535, ts=mid_reprice_ts)
+    )
+    assert isinstance(mid_reprice_only, PolymarketQuote)
+    assert detector.on_market_event(mid_reprice_only, state, now_ts=mid_reprice_ts) == ()
+
+    executable_ts = detected_ts + 250_000_000
+    executable = state.apply(_book_quote(best_bid=0.516, best_ask=0.536, ts=executable_ts))
+    assert isinstance(executable, PolymarketQuote)
+    observations = detector.on_market_event(executable, state, now_ts=executable_ts)
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation.mid_repricing_delay_ms == pytest.approx(100.0)
+    assert observation.executable_repricing_delay_ms == pytest.approx(250.0)
+    assert observation.repricing_delay_ms == observation.executable_repricing_delay_ms
+    assert observation.first_mid_repriced_ts_ns == mid_reprice_ts
+    assert observation.first_executable_repriced_ts_ns == executable_ts
+    assert observation.executable_exit_bid == pytest.approx(0.516)
+    assert observation.exit_edge_after_spread == pytest.approx(0.006)
+    assert observation.reject_stage == "none"
+    assert observation.reject_reason is None
 
 
 def test_timeout_without_mid_repricing_records_no_mid_repricing_reason() -> None:
@@ -587,6 +629,33 @@ def test_timeout_without_mid_repricing_records_no_mid_repricing_reason() -> None
     assert observations[0].reject_stage == "timeout"
     assert observations[0].reject_reason == "max_observation_lifetime_reached"
     assert observations[0].exit_reject_reason == "no_mid_repricing_before_timeout"
+
+
+def test_timeout_precedence_over_window_end_when_same_event() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    detector = GapDetector(
+        markets=(market,),
+        max_pending_gap_ms=100.0,
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    state.apply(_book_quote(best_bid=0.49, best_ask=0.51, ts=base_ts))
+
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    timeout_ts = detected_ts + 200_000_000
+    no_size = state.apply(
+        _book_quote(best_bid=0.49, best_ask=0.51, ts=timeout_ts, ask_size=0.0)
+    )
+    assert isinstance(no_size, PolymarketQuote)
+    observations = detector.on_market_event(no_size, state, now_ts=timeout_ts)
+
+    assert len(observations) == 1
+    assert observations[0].reject_stage == "timeout"
+    assert observations[0].reject_reason == "max_observation_lifetime_reached"
+    assert observations[0].exit_reject_reason == "no_mid_repricing_before_timeout"
+    assert observations[0].window_end_reason is None
 
 
 def test_executable_repricing_requires_bid_above_entry_plus_min_edge() -> None:
@@ -619,6 +688,7 @@ def test_executable_repricing_requires_bid_above_entry_plus_min_edge() -> None:
 
     assert len(observations) == 1
     assert observations[0].executable_repricing_delay_ms == pytest.approx(250.0)
+    assert observations[0].repricing_delay_ms == observations[0].executable_repricing_delay_ms
     assert observations[0].executable_exit_bid == pytest.approx(0.516)
     assert observations[0].exit_edge_after_spread == pytest.approx(0.006)
     assert observations[0].reject_stage == "none"
