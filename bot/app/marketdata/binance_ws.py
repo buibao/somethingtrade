@@ -7,7 +7,7 @@ import orjson
 import structlog
 import websockets
 
-from app.core.clock import utc_now_ns
+from app.core.clock import monotonic_now_ns, utc_now_ns
 from app.core.events import BinanceMarketEvent, BookLevel, DepthUpdate, MarketTick, OrderBookTop
 
 DEFAULT_BINANCE_SYMBOLS = ("BTCUSDT", "ETHUSDT")
@@ -109,9 +109,11 @@ class BinanceWSClient:
                     while True:
                         raw_message = await self._recv_with_heartbeat(websocket)
                         local_received_ts = utc_now_ns()
+                        recv_monotonic_ns = monotonic_now_ns()
                         for event in self.normalize_message(
                             raw_message,
                             local_received_ts=local_received_ts,
+                            recv_monotonic_ns=recv_monotonic_ns,
                         ):
                             yield event
                             yielded += 1
@@ -158,12 +160,15 @@ class BinanceWSClient:
         raw_message: str | bytes,
         *,
         local_received_ts: int | None = None,
+        recv_monotonic_ns: int | None = None,
     ) -> tuple[BinanceMarketEvent, ...]:
         local_ts = local_received_ts or utc_now_ns()
+        recv_mono = recv_monotonic_ns or monotonic_now_ns()
         payload = _decode_payload(raw_message)
         data = _message_data(payload)
         stream_name = str(payload.get("stream", ""))
         parse_done_ts = utc_now_ns()
+        parse_done_mono = monotonic_now_ns()
 
         if _is_agg_trade(data, stream_name):
             return (
@@ -171,6 +176,8 @@ class BinanceWSClient:
                     data,
                     local_received_ts=local_ts,
                     parse_done_ts=parse_done_ts,
+                    recv_monotonic_ns=recv_mono,
+                    parse_done_monotonic_ns=parse_done_mono,
                 ),
             )
 
@@ -181,6 +188,8 @@ class BinanceWSClient:
                     stream_name=stream_name,
                     local_received_ts=local_ts,
                     parse_done_ts=parse_done_ts,
+                    recv_monotonic_ns=recv_mono,
+                    parse_done_monotonic_ns=parse_done_mono,
                 ),
             )
 
@@ -190,6 +199,8 @@ class BinanceWSClient:
                     data,
                     local_received_ts=local_ts,
                     parse_done_ts=parse_done_ts,
+                    recv_monotonic_ns=recv_mono,
+                    parse_done_monotonic_ns=parse_done_mono,
                 ),
             )
 
@@ -230,6 +241,8 @@ def _normalize_agg_trade(
     *,
     local_received_ts: int,
     parse_done_ts: int,
+    recv_monotonic_ns: int,
+    parse_done_monotonic_ns: int,
 ) -> MarketTick:
     exchange_event_ts = _event_ts_ms_to_ns(data.get("E") or data.get("T"))
     return MarketTick(
@@ -241,7 +254,9 @@ def _normalize_agg_trade(
         exchange_ts_ns=exchange_event_ts,
         local_received_ts=local_received_ts,
         parse_done_ts=parse_done_ts,
-        latency_ms=_latency_ms(exchange_event_ts or local_received_ts, parse_done_ts),
+        recv_monotonic_ns=recv_monotonic_ns,
+        parse_done_monotonic_ns=parse_done_monotonic_ns,
+        latency_ms=_latency_ms(recv_monotonic_ns, parse_done_monotonic_ns),
         sequence=_int_or_none(data.get("a")),
     )
 
@@ -252,6 +267,8 @@ def _normalize_book_ticker(
     stream_name: str,
     local_received_ts: int,
     parse_done_ts: int,
+    recv_monotonic_ns: int,
+    parse_done_monotonic_ns: int,
 ) -> OrderBookTop:
     symbol = str(data.get("s") or stream_name.split("@", maxsplit=1)[0]).upper()
     return OrderBookTop(
@@ -263,7 +280,9 @@ def _normalize_book_ticker(
         ask_size=float(data["A"]),
         local_received_ts=local_received_ts,
         parse_done_ts=parse_done_ts,
-        latency_ms=_latency_ms(local_received_ts, parse_done_ts),
+        recv_monotonic_ns=recv_monotonic_ns,
+        parse_done_monotonic_ns=parse_done_monotonic_ns,
+        latency_ms=_latency_ms(recv_monotonic_ns, parse_done_monotonic_ns),
         sequence=_int_or_none(data.get("u")),
     )
 
@@ -273,6 +292,8 @@ def _normalize_depth_update(
     *,
     local_received_ts: int,
     parse_done_ts: int,
+    recv_monotonic_ns: int,
+    parse_done_monotonic_ns: int,
 ) -> DepthUpdate:
     exchange_event_ts = _event_ts_ms_to_ns(data.get("E"))
     return DepthUpdate(
@@ -287,7 +308,9 @@ def _normalize_depth_update(
         exchange_ts_ns=exchange_event_ts,
         local_received_ts=local_received_ts,
         parse_done_ts=parse_done_ts,
-        latency_ms=_latency_ms(exchange_event_ts or local_received_ts, parse_done_ts),
+        recv_monotonic_ns=recv_monotonic_ns,
+        parse_done_monotonic_ns=parse_done_monotonic_ns,
+        latency_ms=_latency_ms(recv_monotonic_ns, parse_done_monotonic_ns),
         sequence=_int_or_none(data.get("u")),
     )
 

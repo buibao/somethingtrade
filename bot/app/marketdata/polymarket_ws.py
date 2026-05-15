@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Protocol, cast
 
 import orjson
 import structlog
 import websockets
 
-from app.core.clock import utc_now_ns
+from app.core.clock import monotonic_now_ns, utc_now_ns
 from app.core.events import MarketTick, PolymarketQuote, PolymarketSideLabel
 from app.marketdata.polymarket_discovery import PolymarketMarketMetadata
 
@@ -113,9 +113,11 @@ class PolymarketWSClient:
                     while True:
                         raw_message = await self._recv_with_heartbeat(websocket)
                         received_ts = utc_now_ns()
+                        recv_monotonic_ns = monotonic_now_ns()
                         for event in self.normalize_message(
                             raw_message,
                             received_ts=received_ts,
+                            recv_monotonic_ns=recv_monotonic_ns,
                         ):
                             yield event
                             yielded += 1
@@ -162,10 +164,13 @@ class PolymarketWSClient:
         raw_message: str | bytes,
         *,
         received_ts: int | None = None,
+        recv_monotonic_ns: int | None = None,
     ) -> tuple[PolymarketStreamEvent, ...]:
         local_received_ts = received_ts or utc_now_ns()
+        recv_mono = recv_monotonic_ns or monotonic_now_ns()
         payloads = _decode_payloads(raw_message)
         parse_done_ts = utc_now_ns()
+        parse_done_mono = monotonic_now_ns()
         events: list[PolymarketStreamEvent] = []
 
         for payload in payloads:
@@ -177,6 +182,8 @@ class PolymarketWSClient:
                         token_info=self._token_info,
                         received_ts=local_received_ts,
                         parse_done_ts=parse_done_ts,
+                        recv_monotonic_ns=recv_mono,
+                        parse_done_monotonic_ns=parse_done_mono,
                     )
                 )
             elif event_type in {"price_change", "best_bid_ask"}:
@@ -186,6 +193,8 @@ class PolymarketWSClient:
                         token_info=self._token_info,
                         received_ts=local_received_ts,
                         parse_done_ts=parse_done_ts,
+                        recv_monotonic_ns=recv_mono,
+                        parse_done_monotonic_ns=parse_done_mono,
                     )
                 )
             elif event_type in {"last_trade_price", "trade"}:
@@ -194,6 +203,8 @@ class PolymarketWSClient:
                         payload,
                         received_ts=local_received_ts,
                         parse_done_ts=parse_done_ts,
+                        recv_monotonic_ns=recv_mono,
+                        parse_done_monotonic_ns=parse_done_mono,
                     )
                 )
             elif event_type in {"tick_size_change", "new_market", "market_resolved"}:
@@ -217,8 +228,12 @@ def _build_token_info(
 ) -> dict[str, TokenInfo]:
     token_info: dict[str, TokenInfo] = {}
     for market in markets:
-        token_info[market.yes_token_id] = (market.condition_id, market.market_id, "YES")
-        token_info[market.no_token_id] = (market.condition_id, market.market_id, "NO")
+        for token_id, outcome in market.token_outcomes.items():
+            token_info[token_id] = (
+                market.condition_id,
+                market.market_id,
+                _side_label_for_outcome(outcome),
+            )
 
     if overrides:
         for token_id, side_label in overrides.items():
@@ -228,7 +243,7 @@ def _build_token_info(
     for index, token_id in enumerate(token_ids):
         token_info.setdefault(
             token_id,
-            (None, "", "YES" if index % 2 == 0 else "NO"),
+            (None, "", "UNKNOWN"),
         )
 
     return token_info
@@ -258,6 +273,8 @@ def _quote_from_book(
     token_info: Mapping[str, TokenInfo],
     received_ts: int,
     parse_done_ts: int,
+    recv_monotonic_ns: int,
+    parse_done_monotonic_ns: int,
 ) -> PolymarketQuote:
     token_id = str(payload["asset_id"])
     bids = _levels(payload.get("bids", []))
@@ -278,6 +295,8 @@ def _quote_from_book(
         event_ts=event_ts,
         received_ts=received_ts,
         parse_done_ts=parse_done_ts,
+        recv_monotonic_ns=recv_monotonic_ns,
+        parse_done_monotonic_ns=parse_done_monotonic_ns,
         sequence=payload.get("hash"),
     )
 
@@ -288,6 +307,8 @@ def _quotes_from_price_message(
     token_info: Mapping[str, TokenInfo],
     received_ts: int,
     parse_done_ts: int,
+    recv_monotonic_ns: int,
+    parse_done_monotonic_ns: int,
 ) -> tuple[PolymarketQuote, ...]:
     event_ts = _timestamp_to_ns(payload.get("timestamp"))
     changes = payload.get("price_changes")
@@ -316,6 +337,8 @@ def _quotes_from_price_message(
                 event_ts=event_ts,
                 received_ts=received_ts,
                 parse_done_ts=parse_done_ts,
+                recv_monotonic_ns=recv_monotonic_ns,
+                parse_done_monotonic_ns=parse_done_monotonic_ns,
                 sequence=row.get("hash"),
             )
         )
@@ -327,6 +350,8 @@ def _tick_from_trade(
     *,
     received_ts: int,
     parse_done_ts: int,
+    recv_monotonic_ns: int,
+    parse_done_monotonic_ns: int,
 ) -> MarketTick:
     event_ts = _timestamp_to_ns(payload.get("timestamp"))
     return MarketTick(
@@ -338,7 +363,9 @@ def _tick_from_trade(
         exchange_ts_ns=event_ts,
         local_received_ts=received_ts,
         parse_done_ts=parse_done_ts,
-        latency_ms=_latency_ms(event_ts or received_ts, parse_done_ts),
+        recv_monotonic_ns=recv_monotonic_ns,
+        parse_done_monotonic_ns=parse_done_monotonic_ns,
+        latency_ms=_latency_ms(recv_monotonic_ns, parse_done_monotonic_ns),
     )
 
 
@@ -355,29 +382,32 @@ def _quote(
     event_ts: int | None,
     received_ts: int,
     parse_done_ts: int,
+    recv_monotonic_ns: int,
+    parse_done_monotonic_ns: int,
     sequence: object,
 ) -> PolymarketQuote:
     mid_price = _mid(best_bid, best_ask)
     spread = None if best_bid is None or best_ask is None else max(0.0, best_ask - best_bid)
-    known_sizes = [value for value in (best_bid_size, best_ask_size) if value is not None]
-    liquidity = sum(known_sizes) if known_sizes else None
     return PolymarketQuote(
         market_id=market_id,
         condition_id=condition_id,
         token_id=token_id,
         side_label=side_label,
         best_bid=best_bid,
+        best_bid_size=best_bid_size,
         best_ask=best_ask,
+        best_ask_size=best_ask_size,
         mid_price=mid_price,
         spread=spread,
-        available_liquidity_at_best=liquidity,
         event_ts=event_ts,
         received_ts=received_ts,
         exchange_event_ts=event_ts,
         exchange_ts_ns=event_ts,
         local_received_ts=received_ts,
         parse_done_ts=parse_done_ts,
-        latency_ms=_latency_ms(event_ts or received_ts, parse_done_ts),
+        recv_monotonic_ns=recv_monotonic_ns,
+        parse_done_monotonic_ns=parse_done_monotonic_ns,
+        latency_ms=_latency_ms(recv_monotonic_ns, parse_done_monotonic_ns),
         sequence=_sequence_or_none(sequence),
     )
 
@@ -464,3 +494,10 @@ def _sequence_or_none(value: object) -> int | None:
     if isinstance(value, int):
         return value
     return abs(hash(str(value)))
+
+
+def _side_label_for_outcome(outcome: str) -> PolymarketSideLabel:
+    normalized = outcome.strip().upper().replace("-", "_").replace(" ", "_")
+    if normalized in {"YES", "NO", "UP", "DOWN", "ABOVE", "BELOW", "HIGHER", "LOWER"}:
+        return cast(PolymarketSideLabel, normalized)
+    return "UNKNOWN"

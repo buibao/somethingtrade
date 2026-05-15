@@ -30,7 +30,10 @@ class Settings(BaseModel):
     gap_log_dir: str = Field("data/logs", alias="GAP_LOG_DIR")
     gap_min_move_pct: float = Field(0.10, alias="GAP_MIN_MOVE_PCT")
     gap_reprice_threshold: float = Field(0.005, alias="GAP_REPRICE_THRESHOLD")
-    gap_stale_feed_ms: float = Field(5_000.0, alias="GAP_STALE_FEED_MS")
+    gap_max_entry_spread: float = Field(0.05, alias="GAP_MAX_ENTRY_SPREAD")
+    gap_binance_stale_ms: float = Field(500.0, alias="GAP_BINANCE_STALE_MS")
+    gap_polymarket_stale_ms: float = Field(1_000.0, alias="GAP_POLYMARKET_STALE_MS")
+    gap_measurement_stale_ms: float = Field(5_000.0, alias="GAP_MEASUREMENT_STALE_MS")
     polymarket_api_key: str = Field("replace-me", alias="POLYMARKET_API_KEY")
     wallet_private_key: str = Field("replace-me", alias="WALLET_PRIVATE_KEY")
     mode: Literal["paper", "live"] = Field("paper", alias="MODE")
@@ -59,7 +62,10 @@ def get_settings() -> Settings:
             "GAP_LOG_DIR",
             "GAP_MIN_MOVE_PCT",
             "GAP_REPRICE_THRESHOLD",
-            "GAP_STALE_FEED_MS",
+            "GAP_MAX_ENTRY_SPREAD",
+            "GAP_BINANCE_STALE_MS",
+            "GAP_POLYMARKET_STALE_MS",
+            "GAP_MEASUREMENT_STALE_MS",
             "POLYMARKET_API_KEY",
             "WALLET_PRIVATE_KEY",
             "MODE",

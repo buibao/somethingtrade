@@ -8,10 +8,10 @@ from app.core.clock import utc_now_ns
 from app.core.events import (
     DepthUpdate,
     GapDirection,
-    GapEvent,
     MarketTick,
     OrderBookTop,
     PolymarketQuote,
+    TradableGapObservation,
 )
 from app.marketdata.polymarket_discovery import PolymarketMarketMetadata
 from app.state.market_state import MarketState, SymbolState
@@ -46,15 +46,23 @@ class BinanceMoveSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class PendingGap:
+class PendingTradableGap:
     symbol: str
     market: PolymarketMarketMetadata
     direction: GapDirection
     token_id: str
     binance_move_pct: float
-    poly_market_price_before: float | None
-    detected_ts: int
-    estimated_edge: float
+    detected_ts_ns: int
+    binance_event_ts_ns: int | None
+    before_quote_ts_ns: int | None
+    before_best_bid: float | None
+    before_best_ask: float | None
+    before_best_bid_size: float | None
+    before_best_ask_size: float | None
+    before_mid: float | None
+    spread_before: float | None
+    quote_was_fillable: bool
+    pre_reject_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +76,7 @@ class GapMonitorStats:
 
 
 class GapDetector:
-    """Detect Binance-led moves and measure delayed Polymarket repricing."""
+    """Measure Binance-led Polymarket repricing delays and tradable windows."""
 
     def __init__(
         self,
@@ -76,17 +84,21 @@ class GapDetector:
         *,
         min_move_pct: float = 0.10,
         reprice_threshold: float = 0.005,
-        probability_move_multiplier: float = 1.0,
-        stale_feed_ms: float = 5_000.0,
+        max_entry_spread: float = 0.05,
+        binance_stale_ms: float = 500.0,
+        polymarket_stale_ms: float = 1_000.0,
+        measurement_stale_ms: float = 5_000.0,
     ) -> None:
         self.markets = markets
         self.min_move_pct = min_move_pct
         self.reprice_threshold = reprice_threshold
-        self.probability_move_multiplier = probability_move_multiplier
-        self.stale_feed_ms = stale_feed_ms
+        self.max_entry_spread = max_entry_spread
+        self.binance_stale_ms = binance_stale_ms
+        self.polymarket_stale_ms = polymarket_stale_ms
+        self.measurement_stale_ms = measurement_stale_ms
         self._markets_by_symbol = _markets_by_symbol(markets)
-        self._pending: dict[tuple[str, str, GapDirection], PendingGap] = {}
-        self._completed: list[GapEvent] = []
+        self._pending: dict[tuple[str, str, GapDirection], PendingTradableGap] = {}
+        self._completed: list[TradableGapObservation] = []
         self.detected_count = 0
 
     def on_market_event(
@@ -95,13 +107,23 @@ class GapDetector:
         state: MarketState,
         *,
         now_ts: int | None = None,
-    ) -> tuple[GapEvent, ...]:
+    ) -> tuple[TradableGapObservation, ...]:
         current_ts = now_ts or utc_now_ns()
         if isinstance(event, MarketTick) and event.source == "binance":
-            self._detect_binance_move(event.symbol, state, now_ts=current_ts)
+            self._detect_binance_move(
+                event.symbol,
+                state,
+                now_ts=current_ts,
+                binance_event_ts=event.exchange_event_ts or event.local_received_ts,
+            )
             return ()
         if isinstance(event, OrderBookTop) and event.source == "binance":
-            self._detect_binance_move(event.symbol, state, now_ts=current_ts)
+            self._detect_binance_move(
+                event.symbol,
+                state,
+                now_ts=current_ts,
+                binance_event_ts=event.exchange_event_ts or event.local_received_ts,
+            )
             return ()
         if isinstance(event, PolymarketQuote):
             return self._detect_polymarket_repricing(event, now_ts=current_ts)
@@ -114,13 +136,19 @@ class GapDetector:
             for event in self._completed
             if event.gap_duration_ms is not None
         ]
-        edges = [event.estimated_edge for event in self._completed]
+        executable_edges = [
+            event.estimated_edge_after_spread
+            for event in self._completed
+            if event.reject_reason is None and event.estimated_edge_after_spread is not None
+        ]
         return GapMonitorStats(
             detected_gaps=self.detected_count,
             completed_gaps=len(self._completed),
             median_gap_duration_ms=median(durations) if durations else None,
             p95_gap_duration_ms=_percentile(durations, 0.95) if durations else None,
-            average_estimated_edge=sum(edges) / len(edges) if edges else None,
+            average_estimated_edge=(
+                sum(executable_edges) / len(executable_edges) if executable_edges else None
+            ),
             stale_feed_count=self.stale_feed_count(state, now_ts=current_ts),
         )
 
@@ -133,7 +161,7 @@ class GapDetector:
             if symbol_state is None or _is_stale(
                 symbol_state.local_receive_timestamp or symbol_state.last_event_timestamp,
                 now_ts=current_ts,
-                stale_ms=self.stale_feed_ms,
+                stale_ms=self.measurement_stale_ms,
             ):
                 stale += 1
 
@@ -144,7 +172,7 @@ class GapDetector:
                 if quote is None or _is_stale(
                     quote_ts,
                     now_ts=current_ts,
-                    stale_ms=self.stale_feed_ms,
+                    stale_ms=self.measurement_stale_ms,
                 ):
                     stale += 1
 
@@ -156,13 +184,18 @@ class GapDetector:
         state: MarketState,
         *,
         now_ts: int,
+        binance_event_ts: int | None,
     ) -> None:
         markets = self._markets_by_symbol.get(symbol, ())
         if not markets:
             return
 
         symbol_state = state.symbols.get(symbol)
-        if symbol_state is None:
+        if symbol_state is None or _is_stale(
+            symbol_state.local_receive_timestamp or symbol_state.last_event_timestamp,
+            now_ts=now_ts,
+            stale_ms=self.binance_stale_ms,
+        ):
             return
 
         snapshot = build_move_snapshot(symbol_state)
@@ -176,26 +209,40 @@ class GapDetector:
 
         direction: GapDirection = "UP" if move_pct > 0.0 else "DOWN"
         for market in markets:
-            token_id = market.yes_token_id if direction == "UP" else market.no_token_id
+            token_id = market.token_for_direction(direction)
+            if token_id is None:
+                continue
+
             pending_key = (symbol, market.market_id, direction)
             if pending_key in self._pending:
                 continue
 
             quote = state.polymarket_quotes.get(token_id)
-            if quote is None or state.is_stale_quote(quote, now_ts=now_ts):
+            if quote is None or _is_stale(
+                quote.received_ts or quote.local_received_ts or quote.event_ts,
+                now_ts=now_ts,
+                stale_ms=self.polymarket_stale_ms,
+            ):
                 continue
 
-            before_price = quote_price(quote)
-            estimated_edge = self._estimated_edge(move_pct=move_pct, observed_poly_move=0.0)
-            self._pending[pending_key] = PendingGap(
+            fillable, reject_reason = self._fillable_before_repricing(market, quote)
+            self._pending[pending_key] = PendingTradableGap(
                 symbol=symbol,
                 market=market,
                 direction=direction,
                 token_id=token_id,
                 binance_move_pct=move_pct,
-                poly_market_price_before=before_price,
-                detected_ts=now_ts,
-                estimated_edge=estimated_edge,
+                detected_ts_ns=now_ts,
+                binance_event_ts_ns=binance_event_ts,
+                before_quote_ts_ns=quote.event_ts or quote.received_ts,
+                before_best_bid=quote.best_bid,
+                before_best_ask=quote.best_ask,
+                before_best_bid_size=quote.best_bid_size,
+                before_best_ask_size=quote.best_ask_size,
+                before_mid=quote.mid_price,
+                spread_before=quote.spread,
+                quote_was_fillable=fillable,
+                pre_reject_reason=reject_reason,
             )
             self.detected_count += 1
 
@@ -204,46 +251,98 @@ class GapDetector:
         quote: PolymarketQuote,
         *,
         now_ts: int,
-    ) -> tuple[GapEvent, ...]:
-        closed: list[GapEvent] = []
+    ) -> tuple[TradableGapObservation, ...]:
+        closed: list[TradableGapObservation] = []
         for key, pending in list(self._pending.items()):
             if pending.token_id != quote.token_id:
                 continue
-
-            after_price = quote_price(quote)
-            if not self._has_repriced(pending, after_price):
+            if not self._has_repriced_in_expected_direction(pending, quote):
                 continue
 
             repriced_ts = quote.received_ts or quote.local_received_ts or now_ts
-            gap_duration_ms = (repriced_ts - pending.detected_ts) / 1_000_000.0
-            event = GapEvent(
+            gap_duration_ms = (repriced_ts - pending.detected_ts_ns) / 1_000_000.0
+            raw_edge = _diff(quote.mid_price, pending.before_mid)
+            after_spread_edge = _diff(quote.best_bid, pending.before_best_ask)
+            reject_reason = self._final_reject_reason(
+                pending,
+                after_spread_edge=after_spread_edge,
+                after_best_bid=quote.best_bid,
+            )
+            observation = TradableGapObservation(
                 symbol=pending.symbol,
-                timeframe=_timeframe_label(pending.market.duration_minutes),
+                market_id=pending.market.market_id,
+                token_id=pending.token_id,
                 direction=pending.direction,
                 binance_move_pct=pending.binance_move_pct,
-                poly_market_price_before=pending.poly_market_price_before,
-                poly_market_price_after=after_price,
-                detected_ts=pending.detected_ts,
-                repriced_ts=repriced_ts,
+                detected_ts_ns=pending.detected_ts_ns,
+                binance_event_ts_ns=pending.binance_event_ts_ns,
+                poly_quote_ts_ns=quote.event_ts or quote.received_ts,
+                before_best_bid=pending.before_best_bid,
+                before_best_ask=pending.before_best_ask,
+                before_best_bid_size=pending.before_best_bid_size,
+                before_best_ask_size=pending.before_best_ask_size,
+                before_mid=pending.before_mid,
+                after_best_bid=quote.best_bid,
+                after_best_ask=quote.best_ask,
+                after_mid=quote.mid_price,
+                spread_before=pending.spread_before,
+                spread_after=quote.spread,
                 gap_duration_ms=gap_duration_ms,
-                estimated_edge=pending.estimated_edge,
+                tradable_window_ms=gap_duration_ms if reject_reason is None else 0.0,
+                hypothetical_entry_price=pending.before_best_ask,
+                hypothetical_exit_price=quote.best_bid,
+                quote_was_fillable=pending.quote_was_fillable,
+                estimated_edge_raw=raw_edge,
+                estimated_edge_after_spread=after_spread_edge if reject_reason is None else None,
+                reject_reason=reject_reason,
             )
-            closed.append(event)
-            self._completed.append(event)
+            closed.append(observation)
+            self._completed.append(observation)
             del self._pending[key]
 
         return tuple(closed)
 
-    def _has_repriced(self, pending: PendingGap, after_price: float | None) -> bool:
-        before_price = pending.poly_market_price_before
-        if before_price is None or after_price is None:
+    def _has_repriced_in_expected_direction(
+        self,
+        pending: PendingTradableGap,
+        quote: PolymarketQuote,
+    ) -> bool:
+        if pending.before_mid is None or quote.mid_price is None:
             return False
         threshold = max(self.reprice_threshold, pending.market.tick_size)
-        return after_price >= before_price + threshold
+        return quote.mid_price >= pending.before_mid + threshold
 
-    def _estimated_edge(self, *, move_pct: float, observed_poly_move: float) -> float:
-        expected_probability_move = abs(move_pct) / 100.0 * self.probability_move_multiplier
-        return max(0.0, expected_probability_move - abs(observed_poly_move))
+    def _fillable_before_repricing(
+        self,
+        market: PolymarketMarketMetadata,
+        quote: PolymarketQuote,
+    ) -> tuple[bool, str | None]:
+        if quote.best_ask is None:
+            return False, "missing_best_ask"
+        if quote.best_ask_size is None:
+            return False, "missing_best_ask_size"
+        if quote.best_ask_size < market.min_order_size:
+            return False, "insufficient_best_ask_size"
+        if quote.spread is None:
+            return False, "missing_spread"
+        if quote.spread > self.max_entry_spread:
+            return False, "spread_too_wide"
+        return True, None
+
+    def _final_reject_reason(
+        self,
+        pending: PendingTradableGap,
+        *,
+        after_spread_edge: float | None,
+        after_best_bid: float | None,
+    ) -> str | None:
+        if pending.pre_reject_reason is not None:
+            return pending.pre_reject_reason
+        if after_best_bid is None:
+            return "missing_exit_bid"
+        if after_spread_edge is None or after_spread_edge <= 0.0:
+            return "edge_not_positive_after_spread"
+        return None
 
 
 def build_move_snapshot(symbol_state: SymbolState) -> BinanceMoveSnapshot:
@@ -255,10 +354,6 @@ def build_move_snapshot(symbol_state: SymbolState) -> BinanceMoveSnapshot:
         volatility_30s=symbol_state.volatility_30s,
         bid_ask_spread=symbol_state.bid_ask_spread,
     )
-
-
-def quote_price(quote: PolymarketQuote) -> float | None:
-    return quote.mid_price if quote.mid_price is not None else quote.best_ask
 
 
 def _markets_by_symbol(
@@ -286,14 +381,16 @@ def _symbol_for_market(market: PolymarketMarketMetadata) -> str | None:
     return None
 
 
-def _timeframe_label(duration_minutes: int | None) -> Literal["5m", "15m"]:
-    return "5m" if duration_minutes == 5 else "15m"
-
-
 def _is_stale(timestamp: int | None, *, now_ts: int, stale_ms: float) -> bool:
     if timestamp is None:
         return True
     return (now_ts - timestamp) / 1_000_000.0 > stale_ms
+
+
+def _diff(after: float | None, before: float | None) -> float | None:
+    if after is None or before is None:
+        return None
+    return after - before
 
 
 def _percentile(values: list[float], percentile: float) -> float:

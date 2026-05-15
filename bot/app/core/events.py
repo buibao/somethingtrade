@@ -3,7 +3,7 @@ from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_serializer
 
 from app.core.clock import utc_now_ns
 
@@ -52,7 +52,17 @@ class ExecutionStatus(StrEnum):
     CANCELED = "canceled"
 
 
-type PolymarketSideLabel = Literal["YES", "NO"]
+type PolymarketSideLabel = Literal[
+    "YES",
+    "NO",
+    "UP",
+    "DOWN",
+    "ABOVE",
+    "BELOW",
+    "HIGHER",
+    "LOWER",
+    "UNKNOWN",
+]
 type GapDirection = Literal["UP", "DOWN"]
 
 
@@ -72,6 +82,9 @@ class RealtimeMarketEvent(EventModel):
     local_received_ts: int | None = None
     parse_done_ts: int | None = None
     state_updated_ts: int | None = None
+    recv_monotonic_ns: int | None = None
+    parse_done_monotonic_ns: int | None = None
+    state_updated_monotonic_ns: int | None = None
     latency_ms: float | None = None
     exchange_ts_ns: int | None = None
     sequence: int | None = None
@@ -113,12 +126,23 @@ class PolymarketQuote(RealtimeMarketEvent):
     token_id: str
     side_label: PolymarketSideLabel
     best_bid: float | None = None
+    best_bid_size: float | None = None
     best_ask: float | None = None
+    best_ask_size: float | None = None
     mid_price: float | None = None
     spread: float | None = None
-    available_liquidity_at_best: float | None = None
     event_ts: int | None = None
     received_ts: int | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def available_liquidity_at_best(self) -> float | None:
+        known_sizes = [
+            value
+            for value in (self.best_bid_size, self.best_ask_size)
+            if value is not None
+        ]
+        return sum(known_sizes) if known_sizes else None
 
     @property
     def outcome(self) -> str:
@@ -134,11 +158,11 @@ class PolymarketQuote(RealtimeMarketEvent):
 
     @property
     def bid_size(self) -> float:
-        return self.available_liquidity_at_best or 0.0
+        return self.best_bid_size or 0.0
 
     @property
     def ask_size(self) -> float:
-        return self.available_liquidity_at_best or 0.0
+        return self.best_ask_size or 0.0
 
 
 class SignalEvent(EventModel):
@@ -207,18 +231,34 @@ class LatencyTrace(EventModel):
         return last - self.recv_ns
 
 
-class GapEvent(EventModel):
-    event_type: Literal["gap_event"] = "gap_event"
+class TradableGapObservation(EventModel):
+    event_type: Literal["tradable_gap_observation"] = "tradable_gap_observation"
     symbol: str
-    timeframe: Literal["5m", "15m"]
+    market_id: str
+    token_id: str
     direction: GapDirection
     binance_move_pct: float
-    poly_market_price_before: float | None = None
-    poly_market_price_after: float | None = None
-    detected_ts: int
-    repriced_ts: int | None = None
+    detected_ts_ns: int
+    binance_event_ts_ns: int | None = None
+    poly_quote_ts_ns: int | None = None
+    before_best_bid: float | None = None
+    before_best_ask: float | None = None
+    before_best_bid_size: float | None = None
+    before_best_ask_size: float | None = None
+    before_mid: float | None = None
+    after_best_bid: float | None = None
+    after_best_ask: float | None = None
+    after_mid: float | None = None
+    spread_before: float | None = None
+    spread_after: float | None = None
     gap_duration_ms: float | None = None
-    estimated_edge: float
+    tradable_window_ms: float | None = None
+    hypothetical_entry_price: float | None = None
+    hypothetical_exit_price: float | None = None
+    quote_was_fillable: bool
+    estimated_edge_raw: float | None = None
+    estimated_edge_after_spread: float | None = None
+    reject_reason: str | None = None
 
 
 BinanceMarketEvent: TypeAlias = MarketTick | OrderBookTop | DepthUpdate
@@ -232,5 +272,5 @@ Event: TypeAlias = (
     | OrderIntent
     | ExecutionReport
     | LatencyTrace
-    | GapEvent
+    | TradableGapObservation
 )

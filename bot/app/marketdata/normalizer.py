@@ -35,7 +35,9 @@ def normalize_polymarket_quote(payload: dict[str, Any]) -> PolymarketQuote:
     """Normalize a Polymarket quote payload."""
 
     best_bid = _optional_float(payload.get("best_bid"))
+    best_bid_size = _optional_float(payload.get("best_bid_size"))
     best_ask = _optional_float(payload.get("best_ask"))
+    best_ask_size = _optional_float(payload.get("best_ask_size"))
     spread = None if best_bid is None or best_ask is None else max(0.0, best_ask - best_bid)
     mid_price = None if best_bid is None or best_ask is None else (best_bid + best_ask) / 2.0
     return PolymarketQuote(
@@ -44,14 +46,18 @@ def normalize_polymarket_quote(payload: dict[str, Any]) -> PolymarketQuote:
         token_id=str(payload["token_id"]),
         side_label=cast(PolymarketSideLabel, str(payload.get("side_label", "YES")).upper()),
         best_bid=best_bid,
+        best_bid_size=best_bid_size,
         best_ask=best_ask,
+        best_ask_size=best_ask_size,
         mid_price=mid_price,
         spread=spread,
-        available_liquidity_at_best=_optional_float(payload.get("available_liquidity_at_best")),
         event_ts=payload.get("event_ts"),
         received_ts=payload.get("received_ts"),
         exchange_event_ts=payload.get("event_ts") or payload.get("exchange_event_ts"),
         local_received_ts=payload.get("received_ts") or payload.get("local_received_ts"),
+        recv_monotonic_ns=payload.get("recv_monotonic_ns"),
+        parse_done_monotonic_ns=payload.get("parse_done_monotonic_ns"),
+        state_updated_monotonic_ns=payload.get("state_updated_monotonic_ns"),
         exchange_ts_ns=payload.get("exchange_ts_ns"),
         sequence=payload.get("sequence"),
     )

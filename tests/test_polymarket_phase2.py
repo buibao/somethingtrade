@@ -73,8 +73,9 @@ def _metadata() -> PolymarketMarketMetadata:
         market_slug="bitcoin-up-or-down-15m",
         question="Bitcoin Up or Down - 15 minute",
         end_time="2026-05-15T12:15:00Z",
-        yes_token_id="yes-token",
-        no_token_id="no-token",
+        up_token_id="yes-token",
+        down_token_id="no-token",
+        token_outcomes={"yes-token": "Up", "no-token": "Down"},
         tick_size=0.01,
         min_order_size=5.0,
         base_asset="BTC",
@@ -90,7 +91,7 @@ def test_discovery_parses_and_caches_short_duration_markets(tmp_path) -> None:
         "question": "Bitcoin Up or Down - 15 minute",
         "endDateIso": "2026-05-15T12:15:00Z",
         "clobTokenIds": '["yes-token","no-token"]',
-        "outcomes": '["Yes","No"]',
+        "outcomes": '["Up","Down"]',
         "order_price_min_tick_size": "0.01",
         "minimum_order_size": "5",
         "active": True,
@@ -110,8 +111,10 @@ def test_discovery_parses_and_caches_short_duration_markets(tmp_path) -> None:
 
     assert len(markets) == 1
     assert parse_market_metadata(payload) == markets[0]
-    assert markets[0].yes_token_id == "yes-token"
-    assert markets[0].no_token_id == "no-token"
+    assert markets[0].up_token_id == "yes-token"
+    assert markets[0].down_token_id == "no-token"
+    assert markets[0].token_for_direction("UP") == "yes-token"
+    assert markets[0].token_for_direction("DOWN") == "no-token"
     assert markets[0].duration_minutes == 15
     assert cached.markets == list(markets)
     assert "replace-me" not in cache_path.read_text()
@@ -179,7 +182,7 @@ def test_normalizes_polymarket_book_price_change_and_trade() -> None:
     )[0]
 
     assert isinstance(book, PolymarketQuote)
-    assert book.side_label == "YES"
+    assert book.side_label == "UP"
     assert book.best_bid == 0.50
     assert book.best_ask == 0.52
     assert book.mid_price == pytest.approx(0.51)
@@ -188,7 +191,7 @@ def test_normalizes_polymarket_book_price_change_and_trade() -> None:
     assert book.event_ts == 1_700_000_000_000_000_000
 
     assert isinstance(price_change, PolymarketQuote)
-    assert price_change.side_label == "NO"
+    assert price_change.side_label == "DOWN"
     assert price_change.best_bid == 0.48
     assert price_change.best_ask == 0.51
     assert price_change.available_liquidity_at_best == 200.0
@@ -243,10 +246,11 @@ def test_market_state_rejects_stale_polymarket_quote() -> None:
         token_id="yes-token",
         side_label="YES",
         best_bid=0.40,
+        best_bid_size=10.0,
         best_ask=0.42,
+        best_ask_size=10.0,
         mid_price=0.41,
         spread=0.02,
-        available_liquidity_at_best=10.0,
         event_ts=1,
         received_ts=1,
     )

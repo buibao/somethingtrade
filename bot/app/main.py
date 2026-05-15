@@ -83,10 +83,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Minimum Polymarket probability move to count as repricing.",
     )
     gap_monitor.add_argument(
-        "--stale-feed-ms",
+        "--max-entry-spread",
         type=float,
         default=None,
-        help="Feed stale threshold for monitor stats.",
+        help="Maximum Polymarket spread for a fillable stale quote.",
+    )
+    gap_monitor.add_argument(
+        "--binance-stale-ms",
+        type=float,
+        default=None,
+        help="Strict Binance staleness threshold for candidate detection.",
+    )
+    gap_monitor.add_argument(
+        "--polymarket-stale-ms",
+        type=float,
+        default=None,
+        help="Strict Polymarket quote staleness threshold for candidate detection.",
+    )
+    gap_monitor.add_argument(
+        "--measurement-stale-ms",
+        type=float,
+        default=None,
+        help="Wider feed stale threshold for monitor stats.",
     )
 
     return parser.parse_args(argv)
@@ -199,7 +217,12 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         markets=markets,
         min_move_pct=args.min_move_pct or settings.gap_min_move_pct,
         reprice_threshold=args.reprice_threshold or settings.gap_reprice_threshold,
-        stale_feed_ms=args.stale_feed_ms or settings.gap_stale_feed_ms,
+        max_entry_spread=args.max_entry_spread or settings.gap_max_entry_spread,
+        binance_stale_ms=args.binance_stale_ms or settings.gap_binance_stale_ms,
+        polymarket_stale_ms=args.polymarket_stale_ms
+        or settings.gap_polymarket_stale_ms,
+        measurement_stale_ms=args.measurement_stale_ms
+        or settings.gap_measurement_stale_ms,
     )
     symbols = _symbols_for_markets(markets) or settings.binance_symbols
     binance = BinanceWSClient(
@@ -285,8 +308,8 @@ def _print_polymarket_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> 
                     market.market_slug,
                     f"asset={market.base_asset or '-'}",
                     f"duration={market.duration_minutes or '-'}m",
-                    f"YES={market.yes_token_id[:10]}",
-                    f"NO={market.no_token_id[:10]}",
+                    f"UP={_short_token(market.up_token_id)}",
+                    f"DOWN={_short_token(market.down_token_id)}",
                     f"tick={market.tick_size:g}",
                     f"min={market.min_order_size:g}",
                 ]
@@ -303,6 +326,10 @@ def _symbols_for_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> tuple
         elif market.base_asset == "ETH":
             symbols.add("ETHUSDT")
     return tuple(sorted(symbols))
+
+
+def _short_token(token_id: str | None) -> str:
+    return "-" if token_id is None else token_id[:10]
 
 
 def _format_gap_stats(stats: GapMonitorStats) -> str:

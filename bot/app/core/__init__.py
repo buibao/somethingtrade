@@ -5,7 +5,6 @@ from app.core.events import (
     DepthUpdate,
     ExecutionReport,
     GapDirection,
-    GapEvent,
     LatencyTrace,
     MarketTick,
     OrderBookTop,
@@ -13,6 +12,7 @@ from app.core.events import (
     PolymarketSideLabel,
     PolymarketQuote,
     SignalEvent,
+    TradableGapObservation,
 )
 
 __all__ = [
@@ -20,7 +20,6 @@ __all__ = [
     "DepthUpdate",
     "ExecutionReport",
     "GapDirection",
-    "GapEvent",
     "LatencyTrace",
     "MarketTick",
     "OrderBookTop",
@@ -28,4 +27,5 @@ __all__ = [
     "PolymarketSideLabel",
     "PolymarketQuote",
     "SignalEvent",
+    "TradableGapObservation",
 ]

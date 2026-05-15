@@ -2,7 +2,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from math import sqrt
 
-from app.core.clock import utc_now_ns
+from app.core.clock import monotonic_now_ns, utc_now_ns
 from app.core.events import (
     BinanceMarketEvent,
     DepthUpdate,
@@ -33,6 +33,9 @@ class SymbolState:
     local_receive_timestamp: int | None = None
     parse_done_timestamp: int | None = None
     state_updated_timestamp: int | None = None
+    recv_monotonic_ns: int | None = None
+    parse_done_monotonic_ns: int | None = None
+    state_updated_monotonic_ns: int | None = None
     latency_ms: float | None = None
     last_depth_update_id: int | None = None
     price_history: deque[tuple[int, float]] = field(default_factory=deque)
@@ -63,13 +66,18 @@ class MarketState:
         event: BinanceMarketEvent | PolymarketQuote,
     ) -> BinanceMarketEvent | PolymarketQuote | None:
         state_updated_ts = utc_now_ns()
+        state_updated_monotonic_ns = monotonic_now_ns()
         if isinstance(event, PolymarketQuote) and self.is_stale_quote(
             event,
             now_ts=state_updated_ts,
         ):
             return None
 
-        updated_event = self._with_state_latency(event, state_updated_ts)
+        updated_event = self._with_state_latency(
+            event,
+            state_updated_ts=state_updated_ts,
+            state_updated_monotonic_ns=state_updated_monotonic_ns,
+        )
 
         if isinstance(updated_event, MarketTick):
             self.ticks[updated_event.symbol] = updated_event
@@ -155,7 +163,8 @@ class MarketState:
                         f"ask={_fmt_prob(quote.best_ask)}",
                         f"mid={_fmt_prob(quote.mid_price)}",
                         f"spr={_fmt_prob(quote.spread)}",
-                        f"liq={_fmt_float(quote.available_liquidity_at_best)}",
+                        f"bidSz={_fmt_float(quote.best_bid_size)}",
+                        f"askSz={_fmt_float(quote.best_ask_size)}",
                         f"lat={_fmt_latency(quote.latency_ms)}",
                     ]
                 )
@@ -223,21 +232,30 @@ class MarketState:
         state.local_receive_timestamp = event.local_received_ts
         state.parse_done_timestamp = event.parse_done_ts
         state.state_updated_timestamp = state_updated_ts
+        state.recv_monotonic_ns = event.recv_monotonic_ns
+        state.parse_done_monotonic_ns = event.parse_done_monotonic_ns
+        state.state_updated_monotonic_ns = event.state_updated_monotonic_ns
         state.latency_ms = event.latency_ms
 
     def _with_state_latency(
         self,
         event: BinanceMarketEvent | PolymarketQuote,
+        *,
         state_updated_ts: int,
+        state_updated_monotonic_ns: int,
     ) -> BinanceMarketEvent | PolymarketQuote:
         if not isinstance(event, RealtimeMarketEvent):
             return event
 
-        start_ts = event.exchange_event_ts or event.local_received_ts
-        latency_ms = None if start_ts is None else (state_updated_ts - start_ts) / 1_000_000.0
+        latency_ms = (
+            None
+            if event.recv_monotonic_ns is None
+            else (state_updated_monotonic_ns - event.recv_monotonic_ns) / 1_000_000.0
+        )
         return event.model_copy(
             update={
                 "state_updated_ts": state_updated_ts,
+                "state_updated_monotonic_ns": state_updated_monotonic_ns,
                 "latency_ms": latency_ms,
             }
         )

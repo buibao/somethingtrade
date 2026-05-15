@@ -12,15 +12,19 @@ Official references:
 - Public market discovery uses Gamma: `https://gamma-api.polymarket.com/markets`.
 - The request filters with `active=true`, `closed=false`, and a local `limit`.
 - The bot filters locally for BTC/ETH short-duration up/down style markets because naming conventions can vary.
-- Token IDs are read from `clobTokenIds`; Polymarket documents the first ID as the Yes token and the second as the No token.
+- Token IDs are read from `clobTokenIds` and zipped with the actual Gamma `outcomes` array.
+- Directional mapping is not inferred from token order. The bot parses actual outcomes and only accepts markets where UP/DOWN direction can be mapped confidently.
 - Cached fields are public metadata only:
   - `condition_id`
   - `market_id`
   - `market_slug`
   - `question`
   - `end_time`
+  - `up_token_id`
+  - `down_token_id`
   - `yes_token_id`
   - `no_token_id`
+  - `token_outcomes`
   - `tick_size`
   - `min_order_size`
 
@@ -46,7 +50,8 @@ Official references:
 
 ## Local Assumptions
 
-- `available_liquidity_at_best` is represented as the sum of available size at best bid and best ask when both are known.
+- `best_bid_size` and `best_ask_size` are tracked separately. A hypothetical BUY uses `best_ask_size`; a hypothetical SELL would use `best_bid_size`.
+- `available_liquidity_at_best` is only a backward-compatible computed field.
 - Polymarket timestamps are parsed as seconds, milliseconds, microseconds, or nanoseconds based on digit length; current docs show millisecond timestamps.
 - Quote staleness is enforced in `MarketState` using `POLYMARKET_MAX_QUOTE_AGE_MS`.
 - This phase deliberately does not use authenticated CLOB trading endpoints.

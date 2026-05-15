@@ -285,6 +285,8 @@ def test_market_state_tracks_latest_values_and_returns() -> None:
             exchange_event_ts=base_ts + 1_000_000_000,
             local_received_ts=base_ts + 1_001_000_000,
             parse_done_ts=base_ts + 1_002_000_000,
+            recv_monotonic_ns=1_000,
+            parse_done_monotonic_ns=2_000,
         )
     )
     top = state.apply(

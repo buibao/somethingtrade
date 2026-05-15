@@ -57,13 +57,13 @@ See `docs/polymarket_notes.md` for API assumptions and cache contents. Real orde
 
 ## Gap Monitor
 
-Phase 3 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`.
+Phase 3.5 measures Binance-led repricing gaps and writes completed observations as JSONL under `data/logs/`. It separates quote repricing delay from fillable stale-quote windows and spread-adjusted estimated edge.
 
 ```bash
 python -m app.main gap-monitor
 ```
 
-See `docs/phase3_gap_measurement.md` for interpretation guidance. The monitor does not place orders.
+See `docs/phase3_gap_measurement.md` for interpretation guidance. The monitor does not place orders, and a measured gap is not a live trading signal.
 
 ## Status
 
