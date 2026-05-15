@@ -168,7 +168,11 @@ def test_discovery_uses_cache_when_live_fetch_fails(tmp_path, capsys) -> None:
 
 def test_normalizes_polymarket_book_price_change_and_trade() -> None:
     market = _metadata()
-    client = PolymarketWSClient(markets=(market,), token_ids=flatten_token_ids((market,)))
+    client = PolymarketWSClient(
+        markets=(market,),
+        token_ids=flatten_token_ids((market,)),
+        mismatch_sample_path=None,
+    )
     received_ts = 1_700_000_000_100_000_000
 
     book = client.normalize_message(
@@ -274,6 +278,7 @@ async def test_polymarket_stream_sends_subscription_and_yields_events() -> None:
     client = PolymarketWSClient(
         markets=(market,),
         connect_factory=factory,
+        mismatch_sample_path=None,
     )
 
     events = [event async for event in client.stream(max_events=1)]
@@ -293,7 +298,11 @@ async def test_polymarket_stream_sends_subscription_and_yields_events() -> None:
 
 def test_polymarket_lifecycle_events_are_not_silently_ignored() -> None:
     market = _metadata()
-    client = PolymarketWSClient(markets=(market,), token_ids=flatten_token_ids((market,)))
+    client = PolymarketWSClient(
+        markets=(market,),
+        token_ids=flatten_token_ids((market,)),
+        mismatch_sample_path=None,
+    )
 
     event = client.normalize_message(
         orjson.dumps(
@@ -319,7 +328,11 @@ def test_polymarket_lifecycle_events_are_not_silently_ignored() -> None:
 
 def test_polymarket_market_resolved_lifecycle_invalidates_book() -> None:
     market = _metadata()
-    client = PolymarketWSClient(markets=(market,), token_ids=flatten_token_ids((market,)))
+    client = PolymarketWSClient(
+        markets=(market,),
+        token_ids=flatten_token_ids((market,)),
+        mismatch_sample_path=None,
+    )
     received_ts = 1_700_000_000_100_000_000
 
     lifecycle = client.normalize_message(

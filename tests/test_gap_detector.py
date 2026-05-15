@@ -67,6 +67,8 @@ def _quote(
     recv_monotonic_ns: int | None = None,
     book_update_type: str | None = None,
     book_has_snapshot: bool = False,
+    book_structurally_complete: bool = True,
+    reported_best_validation_ok: bool = True,
     validation_error: str | None = None,
 ) -> PolymarketQuote:
     half_spread = spread / 2.0
@@ -90,6 +92,8 @@ def _quote(
         recv_monotonic_ns=recv_monotonic_ns,
         book_update_type=book_update_type,  # type: ignore[arg-type]
         book_has_snapshot=book_has_snapshot,
+        book_structurally_complete=book_structurally_complete,
+        reported_best_validation_ok=reported_best_validation_ok,
     )
 
 
@@ -107,6 +111,8 @@ def _book_quote(
     recv_monotonic_ns: int | None = None,
     book_update_type: str | None = None,
     book_has_snapshot: bool = False,
+    book_structurally_complete: bool = True,
+    reported_best_validation_ok: bool = True,
     validation_error: str | None = None,
 ) -> PolymarketQuote:
     mid = None if best_bid is None or best_ask is None else (best_bid + best_ask) / 2.0
@@ -132,6 +138,8 @@ def _book_quote(
         recv_monotonic_ns=recv_monotonic_ns,
         book_update_type=book_update_type,  # type: ignore[arg-type]
         book_has_snapshot=book_has_snapshot,
+        book_structurally_complete=book_structurally_complete,
+        reported_best_validation_ok=reported_best_validation_ok,
     )
 
 
@@ -139,6 +147,38 @@ def _iso_from_ns(ts_ns: int) -> str:
     return datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=UTC).isoformat().replace(
         "+00:00",
         "Z",
+    )
+
+
+def _seed_ready_quotes(
+    state: MarketState,
+    *,
+    ts: int,
+    recv_monotonic_ns: int | None = None,
+) -> None:
+    state.apply(
+        _book_quote(
+            token_id="up-token",
+            side_label="UP",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=ts,
+            recv_monotonic_ns=recv_monotonic_ns,
+            book_update_type="book",
+            book_has_snapshot=True,
+        )
+    )
+    state.apply(
+        _book_quote(
+            token_id="down-token",
+            side_label="DOWN",
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=ts,
+            recv_monotonic_ns=recv_monotonic_ns,
+            book_update_type="book",
+            book_has_snapshot=True,
+        )
     )
 
 
@@ -152,6 +192,8 @@ def _apply_binance_move(
     end_price: float = 101.0,
     inspect_first_tick: bool = True,
     expected_second_observations: int = 0,
+    first_recv_monotonic_ns: int | None = None,
+    second_recv_monotonic_ns: int | None = None,
 ) -> int:
     first_tick = state.apply(
         MarketTick(
@@ -161,6 +203,7 @@ def _apply_binance_move(
             size=1.0,
             exchange_event_ts=base_ts,
             local_received_ts=base_ts,
+            recv_monotonic_ns=first_recv_monotonic_ns,
         )
     )
     assert isinstance(first_tick, MarketTick)
@@ -176,6 +219,7 @@ def _apply_binance_move(
             ask_price=start_price + 0.01,
             ask_size=1.0,
             local_received_ts=base_ts,
+            recv_monotonic_ns=first_recv_monotonic_ns,
         )
     )
 
@@ -188,6 +232,7 @@ def _apply_binance_move(
             size=1.0,
             exchange_event_ts=second_ts,
             local_received_ts=second_ts,
+            recv_monotonic_ns=second_recv_monotonic_ns,
         )
     )
     assert isinstance(second_tick, MarketTick)
@@ -199,7 +244,7 @@ def _apply_binance_move(
 def test_gap_detector_records_tradable_observation_for_delayed_repricing() -> None:
     base_ts = utc_now_ns()
     market = _market()
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         min_move_pct=0.10,
@@ -225,6 +270,9 @@ def test_gap_detector_records_tradable_observation_for_delayed_repricing() -> No
     observation = observations[0]
     assert observation.symbol == "BTCUSDT"
     assert observation.market_id == "0xmarket"
+    assert observation.market_slug == "bitcoin-up-or-down-15m"
+    assert observation.base_asset == "BTC"
+    assert observation.duration_minutes == 15
     assert observation.token_id == "up-token"
     assert observation.direction == "UP"
     assert observation.binance_move_pct == pytest.approx(1.0)
@@ -251,6 +299,9 @@ def test_gap_detector_records_tradable_observation_for_delayed_repricing() -> No
     assert observation.market_classification_at_detection == "current"
     assert observation.signal_enabled_at_detection is True
     assert observation.book_complete_at_detection is True
+    assert observation.book_has_snapshot_at_detection is False
+    assert observation.book_structurally_complete_at_detection is False
+    assert observation.reported_best_validation_ok_at_detection is True
     assert observation.book_validation_error_at_detection is None
     assert observation.book_warmup_ms_at_detection is not None
     assert observation.reject_stage == "none"
@@ -260,7 +311,7 @@ def test_gap_detector_records_tradable_observation_for_delayed_repricing() -> No
 def test_up_move_maps_to_up_token() -> None:
     base_ts = utc_now_ns()
     market = _market(up_token_id="token-up", down_token_id="token-down")
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         binance_stale_ms=60_000.0,
@@ -282,7 +333,7 @@ def test_up_move_maps_to_up_token() -> None:
 def test_down_move_maps_to_down_token() -> None:
     base_ts = utc_now_ns()
     market = _market(up_token_id="token-up", down_token_id="token-down")
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         binance_stale_ms=60_000.0,
@@ -333,7 +384,7 @@ def test_reversed_outcomes_still_use_token_for_direction() -> None:
         base_asset="BTC",
         duration_minutes=15,
     )
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         binance_stale_ms=60_000.0,
@@ -361,7 +412,7 @@ def test_next_market_receives_quote_but_does_not_create_candidate() -> None:
         signal_enabled=False,
         classification="next",
     )
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         binance_stale_ms=60_000.0,
@@ -384,7 +435,7 @@ def test_next_market_receives_quote_but_does_not_create_candidate() -> None:
 def test_current_market_can_create_candidate() -> None:
     base_ts = utc_now_ns()
     market = _market()
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         binance_stale_ms=60_000.0,
@@ -401,7 +452,7 @@ def test_current_market_can_create_candidate() -> None:
 def test_signal_candidate_suppressed_before_book_ready() -> None:
     base_ts = utc_now_ns()
     market = _market()
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         book_warmup_max_ms=3_000.0,
@@ -420,7 +471,7 @@ def test_signal_candidate_suppressed_before_book_ready() -> None:
 def test_after_book_ready_candidate_can_be_created() -> None:
     base_ts = utc_now_ns()
     market = _market()
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         binance_stale_ms=60_000.0,
@@ -460,7 +511,7 @@ def test_after_book_ready_candidate_can_be_created() -> None:
 def test_after_warmup_timeout_book_incomplete_observation_can_be_written() -> None:
     base_ts = utc_now_ns()
     market = _market()
-    state = MarketState(max_polymarket_quote_age_ms=60_000.0)
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
         markets=(market,),
         book_warmup_max_ms=100.0,
@@ -529,7 +580,7 @@ def test_next_market_becomes_current_after_event_start_time_can_create_candidate
         binance_stale_ms=60_000.0,
         polymarket_stale_ms=60_000.0,
     )
-    state.apply(_quote(mid=0.50, ts=base_ts))
+    state.apply(_quote(mid=0.50, ts=base_ts + 1_000_000_000))
     _apply_binance_move(state, detector, base_ts=base_ts, expected_second_observations=0)
 
     active_ts = start_ts + 10_000_000
@@ -626,6 +677,10 @@ def test_quote_with_no_best_ask_size_is_not_fillable_for_buy() -> None:
     assert stats.non_fillable_at_detection_count == 1
     assert stats.reject_count_by_reason["missing_best_ask_size"] == 1
     assert stats.reject_count_by_stage["pre_entry"] == 1
+    observation = detector._completed[-1]  # type: ignore[attr-defined]
+    assert observation.market_slug == "bitcoin-up-or-down-15m"
+    assert observation.base_asset == "BTC"
+    assert observation.duration_minutes == 15
 
 
 def test_repeated_pre_entry_rejects_within_cooldown_write_one_observation() -> None:
@@ -824,6 +879,136 @@ def test_stale_polymarket_quote_rejects_candidate() -> None:
     assert stats.fillable_at_detection_count == 0
     assert stats.non_fillable_at_detection_count == 1
     assert stats.reject_count_by_reason["quote_stale"] == 1
+
+
+def test_quote_stale_due_to_polymarket_sets_stale_source() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        binance_stale_ms=60_000.0,
+        polymarket_stale_ms=500.0,
+    )
+    _seed_ready_quotes(state, ts=base_ts, recv_monotonic_ns=1_000_000_000)
+
+    detected_ts = _apply_binance_move(
+        state,
+        detector,
+        base_ts=base_ts,
+        expected_second_observations=1,
+        first_recv_monotonic_ns=1_900_000_000,
+        second_recv_monotonic_ns=2_000_000_000,
+    )
+
+    observation = detector._completed[-1]  # type: ignore[attr-defined]
+    assert observation.reject_reason == "quote_stale"
+    assert observation.stale_source == "polymarket"
+    assert observation.polymarket_quote_age_ms == pytest.approx(1000.0)
+    assert observation.binance_quote_age_ms == pytest.approx(0.0)
+    assert observation.now_monotonic_ns == 2_000_000_000
+    assert observation.last_binance_update_monotonic_ns == 2_000_000_000
+    assert observation.last_polymarket_update_monotonic_ns == 1_000_000_000
+    assert detector.stats(state, now_ts=detected_ts).reject_count_by_reason["quote_stale"] == 1
+
+
+def test_quote_stale_due_to_binance_sets_stale_source() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        binance_stale_ms=500.0,
+        polymarket_stale_ms=60_000.0,
+    )
+    _seed_ready_quotes(state, ts=base_ts, recv_monotonic_ns=2_000_000_000)
+    detected_ts = _apply_binance_move(
+        state,
+        detector,
+        base_ts=base_ts,
+        first_recv_monotonic_ns=1_900_000_000,
+        second_recv_monotonic_ns=2_000_000_000,
+    )
+
+    fresh_poly = state.apply(
+        _book_quote(
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=detected_ts + 1_000_000_000,
+            recv_monotonic_ns=3_000_000_000,
+        )
+    )
+    assert isinstance(fresh_poly, PolymarketQuote)
+    observations = detector.on_market_event(fresh_poly, state, now_ts=detected_ts + 1_000_000_000)
+
+    assert len(observations) == 1
+    assert observations[0].reject_reason == "quote_stale"
+    assert observations[0].stale_source == "binance"
+    assert observations[0].binance_quote_age_ms == pytest.approx(1000.0)
+    assert observations[0].polymarket_quote_age_ms == pytest.approx(0.0)
+
+
+def test_quote_stale_due_to_both_sets_stale_source() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        binance_stale_ms=500.0,
+        polymarket_stale_ms=500.0,
+    )
+    _seed_ready_quotes(state, ts=base_ts, recv_monotonic_ns=2_000_000_000)
+    detected_ts = _apply_binance_move(
+        state,
+        detector,
+        base_ts=base_ts,
+        first_recv_monotonic_ns=1_900_000_000,
+        second_recv_monotonic_ns=2_000_000_000,
+    )
+
+    stale_poly = state.apply(
+        _book_quote(
+            best_bid=0.49,
+            best_ask=0.51,
+            ts=detected_ts + 1_000_000_000,
+            recv_monotonic_ns=3_000_000_000,
+            book_stale=True,
+        )
+    )
+    assert isinstance(stale_poly, PolymarketQuote)
+    observations = detector.on_market_event(stale_poly, state, now_ts=detected_ts + 1_000_000_000)
+
+    assert len(observations) == 1
+    assert observations[0].reject_reason == "quote_stale"
+    assert observations[0].stale_source == "both"
+
+
+def test_quote_stale_missing_monotonic_timestamps_sets_unknown_source() -> None:
+    base_ts = utc_now_ns()
+    market = _market()
+    state = MarketState(max_polymarket_quote_age_ms=10**15)
+    detector = GapDetector(
+        markets=(market,),
+        require_book_ready=False,
+        binance_stale_ms=500.0,
+        polymarket_stale_ms=500.0,
+    )
+    state.apply(_quote(mid=0.50, ts=base_ts + 1_000_000_000))
+    detected_ts = _apply_binance_move(state, detector, base_ts=base_ts)
+    stale = state.apply(
+        _book_quote(
+            best_bid=0.495,
+            best_ask=0.515,
+            ts=detected_ts + 100_000_000,
+            book_stale=True,
+        )
+    )
+    assert isinstance(stale, PolymarketQuote)
+    observations = detector.on_market_event(stale, state, now_ts=detected_ts + 100_000_000)
+
+    assert len(observations) == 1
+    assert observations[0].reject_reason == "quote_stale"
+    assert observations[0].stale_source == "unknown"
 
 
 def test_incomplete_book_rejects_candidate() -> None:
@@ -1195,6 +1380,9 @@ def test_tradable_window_ends_before_repricing_when_ask_jumps() -> None:
     assert observations[0].window_end_reason == "entry_price_moved"
     assert observations[0].reject_reason == "entry_price_moved"
     assert observations[0].estimated_edge_after_spread is None
+    assert observations[0].market_slug == "bitcoin-up-or-down-15m"
+    assert observations[0].base_asset == "BTC"
+    assert observations[0].duration_minutes == 15
 
 
 def test_tradable_window_ends_when_best_ask_size_disappears() -> None:
@@ -1340,6 +1528,9 @@ def test_max_pending_gap_ms_closes_stale_pending_gap() -> None:
     assert observations[0].reject_stage == "timeout"
     assert observations[0].reject_reason == "max_observation_lifetime_reached"
     assert observations[0].tradable_window_ms == pytest.approx(200.0)
+    assert observations[0].market_slug == "bitcoin-up-or-down-15m"
+    assert observations[0].base_asset == "BTC"
+    assert observations[0].duration_minutes == 15
 
 
 def test_p95_stats_with_multiple_completed_observations() -> None:

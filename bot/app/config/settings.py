@@ -43,6 +43,18 @@ class Settings(BaseModel):
     )
     gap_require_book_ready: bool = Field(True, alias="GAP_REQUIRE_BOOK_READY")
     gap_book_warmup_max_ms: float = Field(3_000.0, alias="GAP_BOOK_WARMUP_MAX_MS")
+    polymarket_best_validation_mode: Literal["strict", "tolerant", "diagnostic"] = Field(
+        "strict",
+        alias="POLYMARKET_BEST_VALIDATION_MODE",
+    )
+    polymarket_best_validation_tolerance_ticks: int = Field(
+        1,
+        alias="POLYMARKET_BEST_VALIDATION_TOLERANCE_TICKS",
+    )
+    polymarket_mismatch_sample_per_token_per_min: int = Field(
+        20,
+        alias="POLYMARKET_MISMATCH_SAMPLE_PER_TOKEN_PER_MIN",
+    )
     polymarket_api_key: str = Field("replace-me", alias="POLYMARKET_API_KEY")
     wallet_private_key: str = Field("replace-me", alias="WALLET_PRIVATE_KEY")
     mode: Literal["paper", "live"] = Field("paper", alias="MODE")
@@ -81,6 +93,9 @@ def get_settings() -> Settings:
             "GAP_PRE_ENTRY_LOG_COOLDOWN_MS",
             "GAP_REQUIRE_BOOK_READY",
             "GAP_BOOK_WARMUP_MAX_MS",
+            "POLYMARKET_BEST_VALIDATION_MODE",
+            "POLYMARKET_BEST_VALIDATION_TOLERANCE_TICKS",
+            "POLYMARKET_MISMATCH_SAMPLE_PER_TOKEN_PER_MIN",
             "POLYMARKET_API_KEY",
             "WALLET_PRIVATE_KEY",
             "MODE",

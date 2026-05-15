@@ -167,11 +167,17 @@ def test_polymarket_quote_constructs_with_phase37_fields() -> None:
         book_stale=False,
         book_hash="hash-1",
         validation_error=None,
+        book_has_snapshot=True,
+        book_structurally_complete=True,
+        reported_best_validation_ok=True,
         recv_monotonic_ns=1_000,
         parse_done_monotonic_ns=1_100,
     )
 
     assert quote.book_complete is True
+    assert quote.book_has_snapshot is True
+    assert quote.book_structurally_complete is True
+    assert quote.reported_best_validation_ok is True
     assert quote.available_liquidity_at_best == 30.0
     assert quote.book_hash == "hash-1"
 
@@ -201,6 +207,9 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
     event = TradableGapObservation(
         symbol="BTCUSDT",
         market_id="market-1",
+        market_slug="btc-updown-15m-1778866200",
+        base_asset="BTC",
+        duration_minutes=15,
         token_id="token-up",
         direction="UP",
         binance_move_pct=1.0,
@@ -232,6 +241,19 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
         quote_was_fillable=True,
         estimated_edge_raw=0.04,
         estimated_edge_after_spread=0.02,
+        market_classification_at_detection="current",
+        signal_enabled_at_detection=True,
+        book_complete_at_detection=True,
+        book_has_snapshot_at_detection=True,
+        book_structurally_complete_at_detection=True,
+        reported_best_validation_ok_at_detection=True,
+        book_validation_error_at_detection=None,
+        stale_source=None,
+        binance_quote_age_ms=None,
+        polymarket_quote_age_ms=None,
+        now_monotonic_ns=300,
+        last_binance_update_monotonic_ns=250,
+        last_polymarket_update_monotonic_ns=240,
         pre_entry_reject_reason=None,
         window_end_reason=None,
         exit_reject_reason=None,
@@ -242,6 +264,10 @@ def test_tradable_gap_observation_constructs_with_phase37_fields() -> None:
     assert event.repricing_delay_ms == 150.0
     assert event.executable_repricing_delay_ms == 150.0
     assert event.gap_duration_ms == 150.0
+    assert event.market_slug == "btc-updown-15m-1778866200"
+    assert event.base_asset == "BTC"
+    assert event.duration_minutes == 15
+    assert event.book_has_snapshot_at_detection is True
 
 
 def test_latency_trace_total_ns() -> None:

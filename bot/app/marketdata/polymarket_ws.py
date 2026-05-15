@@ -66,6 +66,10 @@ class PolymarketWSClient:
         max_backoff_sec: float = 8.0,
         max_queue: int = 1024,
         orderbook_stale_after_ms: float = 1_000.0,
+        best_validation_mode: str = "strict",
+        best_validation_tolerance_ticks: int = 1,
+        mismatch_sample_path: str | None = "data/debug/polymarket_orderbook_mismatch_samples.jsonl",
+        mismatch_sample_per_token_per_min: int = 20,
     ) -> None:
         self.url = _market_ws_url(url)
         self.market_metadata = tuple(markets)
@@ -80,6 +84,10 @@ class PolymarketWSClient:
         self._orderbooks = PolymarketLocalOrderBook(
             token_metadata=token_metadata,
             stale_after_ms=orderbook_stale_after_ms,
+            best_validation_mode=best_validation_mode,  # type: ignore[arg-type]
+            best_validation_tolerance_ticks=best_validation_tolerance_ticks,
+            mismatch_sample_path=mismatch_sample_path,
+            mismatch_sample_per_token_per_min=mismatch_sample_per_token_per_min,
         )
         self.heartbeat_timeout_sec = heartbeat_timeout_sec
         self.ping_timeout_sec = ping_timeout_sec
@@ -311,6 +319,11 @@ def _build_token_metadata(
                 condition_id=market.condition_id,
                 market_id=market.market_id,
                 side_label=_side_label_for_outcome(outcome),
+                market_slug=market.market_slug,
+                base_asset=market.base_asset,
+                duration_minutes=market.duration_minutes,
+                token_outcome=outcome,
+                tick_size=market.tick_size,
             )
 
     if overrides:
@@ -320,6 +333,11 @@ def _build_token_metadata(
                 condition_id=None if previous is None else previous.condition_id,
                 market_id="" if previous is None else previous.market_id,
                 side_label=side_label,
+                market_slug=None if previous is None else previous.market_slug,
+                base_asset=None if previous is None else previous.base_asset,
+                duration_minutes=None if previous is None else previous.duration_minutes,
+                token_outcome=None if previous is None else previous.token_outcome,
+                tick_size=0.01 if previous is None else previous.tick_size,
             )
 
     for token_id in token_ids:

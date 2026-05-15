@@ -150,6 +150,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Maximum book warmup gate duration before recording normal rejects.",
     )
+    gap_monitor.add_argument(
+        "--best-validation-mode",
+        choices=("strict", "tolerant", "diagnostic"),
+        default=None,
+        help="Polymarket reported-best validation mode.",
+    )
+    gap_monitor.add_argument(
+        "--best-validation-tolerance-ticks",
+        type=int,
+        default=None,
+        help="Tolerance in ticks for reported-best validation in tolerant mode.",
+    )
+    gap_monitor.add_argument(
+        "--mismatch-sample-per-token-per-min",
+        type=int,
+        default=None,
+        help="Maximum Polymarket orderbook mismatch samples per token per minute.",
+    )
 
     rolling_debug = subparsers.add_parser(
         "polymarket-rolling-discovery-debug",
@@ -322,6 +340,19 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         url=args.poly_ws_url or settings.polymarket_ws_url,
         markets=markets,
         token_ids=flatten_token_ids(markets),
+        best_validation_mode=(
+            args.best_validation_mode or settings.polymarket_best_validation_mode
+        ),
+        best_validation_tolerance_ticks=(
+            args.best_validation_tolerance_ticks
+            if args.best_validation_tolerance_ticks is not None
+            else settings.polymarket_best_validation_tolerance_ticks
+        ),
+        mismatch_sample_per_token_per_min=(
+            args.mismatch_sample_per_token_per_min
+            if args.mismatch_sample_per_token_per_min is not None
+            else settings.polymarket_mismatch_sample_per_token_per_min
+        ),
     )
     logger = AsyncJsonlEventLogger(log_dir=args.log_dir or settings.gap_log_dir)
     logger.start()
@@ -641,6 +672,8 @@ def _format_book_readiness_summary(payload: dict[str, object]) -> str:
     return " ".join(
         [
             "book_readiness",
+            f"validation_mode={summary.get('validation_mode', '-')}",
+            f"tolerance_ticks={summary.get('validation_tolerance_ticks', '-')}",
             f"selected={summary.get('selected_runtime_markets', 0)}",
             f"signal={summary.get('signal_enabled_markets', 0)}",
             f"warmup_only={summary.get('warmup_only_markets', 0)}",
@@ -648,6 +681,7 @@ def _format_book_readiness_summary(payload: dict[str, object]) -> str:
             f"incomplete={summary.get('incomplete_markets', 0)}",
             f"avg_first_complete={avg_text}",
             f"top_validation_errors={top_error_text or '-'}",
+            f"mismatch_samples={summary.get('sampled_mismatch_file_path', '-')}",
         ]
     )
 

@@ -73,6 +73,7 @@ type PolymarketSideLabel = Literal[
 type GapDirection = Literal["UP", "DOWN"]
 type MarketLifecycleType = Literal["tick_size_change", "market_resolved", "new_market"]
 type RejectStage = Literal["pre_entry", "window", "exit", "lifecycle", "timeout", "none"]
+type StaleSource = Literal["binance", "polymarket", "both", "unknown"]
 
 
 class BookLevel(BaseModel):
@@ -148,6 +149,8 @@ class PolymarketQuote(RealtimeMarketEvent):
     validation_error: str | None = None
     book_update_type: Literal["book", "price_change", "best_bid_ask"] | None = None
     book_has_snapshot: bool = False
+    book_structurally_complete: bool = False
+    reported_best_validation_ok: bool = True
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -250,6 +253,9 @@ class TradableGapObservation(EventModel):
     event_type: Literal["tradable_gap_observation"] = "tradable_gap_observation"
     symbol: str
     market_id: str
+    market_slug: str | None = None
+    base_asset: str | None = None
+    duration_minutes: int | None = None
     token_id: str
     direction: GapDirection
     binance_move_pct: float
@@ -287,9 +293,18 @@ class TradableGapObservation(EventModel):
     market_classification_at_detection: str | None = None
     signal_enabled_at_detection: bool | None = None
     book_complete_at_detection: bool | None = None
+    book_has_snapshot_at_detection: bool | None = None
+    book_structurally_complete_at_detection: bool | None = None
+    reported_best_validation_ok_at_detection: bool | None = None
     book_validation_error_at_detection: str | None = None
     book_warmup_ms_at_detection: float | None = None
     book_warmup_timeout: bool = False
+    stale_source: StaleSource | None = None
+    binance_quote_age_ms: float | None = None
+    polymarket_quote_age_ms: float | None = None
+    now_monotonic_ns: int | None = None
+    last_binance_update_monotonic_ns: int | None = None
+    last_polymarket_update_monotonic_ns: int | None = None
     pre_entry_reject_reason: str | None = None
     window_end_reason: str | None = None
     exit_reject_reason: str | None = None

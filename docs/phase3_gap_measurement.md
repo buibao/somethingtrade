@@ -74,6 +74,15 @@ Polymarket CLOB websocket messages are applied to an in-memory `PolymarketLocalO
 - `price_change` mutates the relevant side: `BUY` updates bids, `SELL` updates asks, and size `0` removes the level.
 - `best_bid_ask` carries no size, so it is never allowed to erase known size. If it disagrees with the local book, the emitted quote is marked incomplete with a validation error and the affected size is unknown.
 
+Phase 3.15 splits quote completeness into diagnostic fields:
+
+- `book_has_snapshot`: a full book snapshot has been received for the token.
+- `book_structurally_complete`: the local ladder has usable bid/ask prices and sizes.
+- `reported_best_validation_ok`: reported best prices agree with local book validation rules.
+- `book_complete`: conservative compatibility flag used by the detector.
+
+Reported best validation can run in `strict`, `tolerant`, or `diagnostic` mode. Strict mode is conservative. Diagnostic mode records reported best mismatches without marking a quote incomplete solely for that mismatch. See `docs/phase3_orderbook_diagnostics.md` for the live-run comparison workflow and mismatch sample format.
+
 `PolymarketQuote.best_bid_size` and `best_ask_size` come from the local book. The older `available_liquidity_at_best` field is only a backward-compatible computed summary and should not drive execution simulation.
 
 ## Why Price Change Alone Is Not Enough

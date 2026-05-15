@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import median
 from typing import Literal
 
@@ -14,6 +14,7 @@ from app.core.events import (
     OrderBookTop,
     PolymarketQuote,
     RejectStage,
+    StaleSource,
     TradableGapObservation,
 )
 from app.marketdata.polymarket_discovery import (
@@ -59,9 +60,22 @@ class BookReadinessGate:
     warmup_ms: float | None
     warmup_timeout: bool
     book_complete: bool | None
+    book_has_snapshot: bool | None
+    book_structurally_complete: bool | None
+    reported_best_validation_ok: bool | None
     validation_error: str | None
     market_classification: str | None
     signal_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StaleDiagnostics:
+    stale_source: StaleSource | None = None
+    binance_quote_age_ms: float | None = None
+    polymarket_quote_age_ms: float | None = None
+    now_monotonic_ns: int | None = None
+    last_binance_update_monotonic_ns: int | None = None
+    last_polymarket_update_monotonic_ns: int | None = None
 
 
 @dataclass(slots=True)
@@ -103,9 +117,13 @@ class PendingTradableGap:
     market_classification_at_detection: str | None = None
     signal_enabled_at_detection: bool | None = None
     book_complete_at_detection: bool | None = None
+    book_has_snapshot_at_detection: bool | None = None
+    book_structurally_complete_at_detection: bool | None = None
+    reported_best_validation_ok_at_detection: bool | None = None
     book_validation_error_at_detection: str | None = None
     book_warmup_ms_at_detection: float | None = None
     book_warmup_timeout: bool = False
+    stale_diagnostics: StaleDiagnostics = field(default_factory=StaleDiagnostics)
     pre_entry_reject_reason: str | None = None
     window_end_reason: str | None = None
     exit_reject_reason: str | None = None
@@ -248,6 +266,7 @@ class GapDetector:
             closed.extend(
                 self._handle_polymarket_quote(
                     event,
+                    state,
                     now_ts=current_ts,
                     now_monotonic_ns=current_mono,
                 )
@@ -430,10 +449,10 @@ class GapDetector:
                         move_pct=move_pct,
                         now_ts=now_ts,
                         binance_event_ts=binance_event_ts,
-                            quote=None,
-                            reason="market_invalidated",
-                            book_gate=book_gate,
-                        )
+                        quote=None,
+                        reason="market_invalidated",
+                        book_gate=book_gate,
+                    )
                 )
                 continue
 
@@ -483,6 +502,13 @@ class GapDetector:
                 now_monotonic_ns=now_monotonic_ns,
                 stale_ms=self.polymarket_stale_ms,
             ):
+                stale_diagnostics = self._stale_diagnostics(
+                    symbol,
+                    quote,
+                    state,
+                    now_ts=now_ts,
+                    now_monotonic_ns=now_monotonic_ns,
+                )
                 self._append_pre_entry_observation(
                     observations,
                     self._pre_entry_observation(
@@ -496,6 +522,7 @@ class GapDetector:
                         quote=quote,
                         reason="quote_stale",
                         book_gate=book_gate,
+                        stale_diagnostics=stale_diagnostics,
                     )
                 )
                 continue
@@ -554,6 +581,9 @@ class GapDetector:
                 market_classification_at_detection=book_gate.market_classification,
                 signal_enabled_at_detection=book_gate.signal_enabled,
                 book_complete_at_detection=book_gate.book_complete,
+                book_has_snapshot_at_detection=book_gate.book_has_snapshot,
+                book_structurally_complete_at_detection=book_gate.book_structurally_complete,
+                reported_best_validation_ok_at_detection=book_gate.reported_best_validation_ok,
                 book_validation_error_at_detection=book_gate.validation_error,
                 book_warmup_ms_at_detection=book_gate.warmup_ms,
                 book_warmup_timeout=book_gate.warmup_timeout,
@@ -565,6 +595,7 @@ class GapDetector:
     def _handle_polymarket_quote(
         self,
         quote: PolymarketQuote,
+        state: MarketState,
         *,
         now_ts: int,
         now_monotonic_ns: int,
@@ -591,10 +622,19 @@ class GapDetector:
             structural_end_reason = self._structural_window_end_reason(
                 pending,
                 quote,
+                state,
                 now_ts=now_ts,
                 now_monotonic_ns=now_monotonic_ns,
             )
             if structural_end_reason is not None:
+                if structural_end_reason == "quote_stale":
+                    pending.stale_diagnostics = self._stale_diagnostics(
+                        pending.symbol,
+                        quote,
+                        state,
+                        now_ts=now_ts,
+                        now_monotonic_ns=now_monotonic_ns,
+                    )
                 pending.first_non_tradable_ts_ns = pending.first_non_tradable_ts_ns or quote_ts
                 pending.first_non_tradable_monotonic_ns = (
                     pending.first_non_tradable_monotonic_ns or quote_mono
@@ -756,16 +796,24 @@ class GapDetector:
         self,
         pending: PendingTradableGap,
         quote: PolymarketQuote,
+        state: MarketState,
         *,
         now_ts: int,
         now_monotonic_ns: int,
     ) -> str | None:
+        stale_diagnostics = self._stale_diagnostics(
+            pending.symbol,
+            quote,
+            state,
+            now_ts=now_ts,
+            now_monotonic_ns=now_monotonic_ns,
+        )
         if quote.book_stale or _is_stale_quote(
             quote,
             now_ts=now_ts,
             now_monotonic_ns=now_monotonic_ns,
             stale_ms=self.polymarket_stale_ms,
-        ):
+        ) or stale_diagnostics.stale_source in {"binance", "both"}:
             return "quote_stale"
         if pending.market.market_id in self._invalid_markets:
             return "market_invalidated"
@@ -848,6 +896,9 @@ class GapDetector:
         return TradableGapObservation(
             symbol=pending.symbol,
             market_id=pending.market.market_id,
+            market_slug=pending.market.market_slug,
+            base_asset=pending.market.base_asset,
+            duration_minutes=pending.market.duration_minutes,
             token_id=pending.token_id,
             direction=pending.direction,
             binance_move_pct=pending.binance_move_pct,
@@ -882,9 +933,26 @@ class GapDetector:
             market_classification_at_detection=pending.market_classification_at_detection,
             signal_enabled_at_detection=pending.signal_enabled_at_detection,
             book_complete_at_detection=pending.book_complete_at_detection,
+            book_has_snapshot_at_detection=pending.book_has_snapshot_at_detection,
+            book_structurally_complete_at_detection=(
+                pending.book_structurally_complete_at_detection
+            ),
+            reported_best_validation_ok_at_detection=(
+                pending.reported_best_validation_ok_at_detection
+            ),
             book_validation_error_at_detection=pending.book_validation_error_at_detection,
             book_warmup_ms_at_detection=pending.book_warmup_ms_at_detection,
             book_warmup_timeout=pending.book_warmup_timeout,
+            stale_source=pending.stale_diagnostics.stale_source,
+            binance_quote_age_ms=pending.stale_diagnostics.binance_quote_age_ms,
+            polymarket_quote_age_ms=pending.stale_diagnostics.polymarket_quote_age_ms,
+            now_monotonic_ns=pending.stale_diagnostics.now_monotonic_ns,
+            last_binance_update_monotonic_ns=(
+                pending.stale_diagnostics.last_binance_update_monotonic_ns
+            ),
+            last_polymarket_update_monotonic_ns=(
+                pending.stale_diagnostics.last_polymarket_update_monotonic_ns
+            ),
             pre_entry_reject_reason=pending.pre_entry_reject_reason,
             window_end_reason=pending.window_end_reason,
             exit_reject_reason=exit_reject_reason,
@@ -945,6 +1013,7 @@ class GapDetector:
         quote: PolymarketQuote | None,
         reason: str,
         book_gate: BookReadinessGate | None = None,
+        stale_diagnostics: StaleDiagnostics | None = None,
     ) -> TradableGapObservation:
         quote_ts = _quote_timestamp(quote) if quote is not None else None
         entry_ask = quote.best_ask if quote is not None else None
@@ -959,9 +1028,28 @@ class GapDetector:
             if book_gate is None and quote is not None
             else (None if book_gate is None else book_gate.validation_error)
         )
+        book_has_snapshot = (
+            quote.book_has_snapshot
+            if book_gate is None and quote is not None
+            else (None if book_gate is None else book_gate.book_has_snapshot)
+        )
+        structurally_complete = (
+            quote.book_structurally_complete
+            if book_gate is None and quote is not None
+            else (None if book_gate is None else book_gate.book_structurally_complete)
+        )
+        reported_best_ok = (
+            quote.reported_best_validation_ok
+            if book_gate is None and quote is not None
+            else (None if book_gate is None else book_gate.reported_best_validation_ok)
+        )
+        stale = stale_diagnostics or StaleDiagnostics()
         return TradableGapObservation(
             symbol=symbol,
             market_id=market.market_id,
+            market_slug=market.market_slug,
+            base_asset=market.base_asset,
+            duration_minutes=market.duration_minutes,
             token_id=token_id,
             direction=direction,
             binance_move_pct=move_pct,
@@ -990,9 +1078,18 @@ class GapDetector:
             ),
             signal_enabled_at_detection=None if book_gate is None else book_gate.signal_enabled,
             book_complete_at_detection=book_complete,
+            book_has_snapshot_at_detection=book_has_snapshot,
+            book_structurally_complete_at_detection=structurally_complete,
+            reported_best_validation_ok_at_detection=reported_best_ok,
             book_validation_error_at_detection=validation_error,
             book_warmup_ms_at_detection=None if book_gate is None else book_gate.warmup_ms,
             book_warmup_timeout=False if book_gate is None else book_gate.warmup_timeout,
+            stale_source=stale.stale_source,
+            binance_quote_age_ms=stale.binance_quote_age_ms,
+            polymarket_quote_age_ms=stale.polymarket_quote_age_ms,
+            now_monotonic_ns=stale.now_monotonic_ns,
+            last_binance_update_monotonic_ns=stale.last_binance_update_monotonic_ns,
+            last_polymarket_update_monotonic_ns=stale.last_polymarket_update_monotonic_ns,
             pre_entry_reject_reason=reason,
             reject_stage="pre_entry",
             reject_reason=reason,
@@ -1090,9 +1187,73 @@ class GapDetector:
             warmup_ms=warmup_ms,
             warmup_timeout=warmup_timeout,
             book_complete=both_ready,
+            book_has_snapshot=(
+                len(quotes) >= 2
+                and all(quote is not None and _quote_has_initial_snapshot(quote) for quote in quotes)
+            ),
+            book_structurally_complete=(
+                len(quotes) >= 2
+                and all(
+                    quote is not None and quote.book_structurally_complete
+                    for quote in quotes
+                )
+            ),
+            reported_best_validation_ok=(
+                bool(known_quotes)
+                and all(quote.reported_best_validation_ok for quote in known_quotes)
+            ),
             validation_error=_first_validation_error(known_quotes),
             market_classification=classification,
             signal_enabled=signal_enabled,
+        )
+
+    def _stale_diagnostics(
+        self,
+        symbol: str,
+        quote: PolymarketQuote,
+        state: MarketState,
+        *,
+        now_ts: int,
+        now_monotonic_ns: int,
+    ) -> StaleDiagnostics:
+        if now_monotonic_ns == now_ts:
+            return StaleDiagnostics(
+                stale_source="unknown",
+                now_monotonic_ns=None,
+            )
+        symbol_state = state.symbols.get(symbol)
+        last_binance_mono = None if symbol_state is None else (
+            symbol_state.recv_monotonic_ns
+            or symbol_state.parse_done_monotonic_ns
+            or symbol_state.state_updated_monotonic_ns
+        )
+        last_poly_mono = (
+            quote.recv_monotonic_ns
+            or quote.parse_done_monotonic_ns
+            or quote.state_updated_monotonic_ns
+        )
+        binance_age_ms = _duration_ms(last_binance_mono, now_monotonic_ns)
+        poly_age_ms = _duration_ms(last_poly_mono, now_monotonic_ns)
+        if binance_age_ms is None or poly_age_ms is None:
+            source: StaleSource = "unknown"
+        else:
+            binance_stale = binance_age_ms > self.binance_stale_ms
+            poly_stale = poly_age_ms > self.polymarket_stale_ms or quote.book_stale
+            if binance_stale and poly_stale:
+                source = "both"
+            elif binance_stale:
+                source = "binance"
+            elif poly_stale:
+                source = "polymarket"
+            else:
+                source = "unknown"
+        return StaleDiagnostics(
+            stale_source=source,
+            binance_quote_age_ms=binance_age_ms,
+            polymarket_quote_age_ms=poly_age_ms,
+            now_monotonic_ns=now_monotonic_ns,
+            last_binance_update_monotonic_ns=last_binance_mono,
+            last_polymarket_update_monotonic_ns=last_poly_mono,
         )
 
     def _record_reject(self, reason: str, stage: RejectStage) -> None:
