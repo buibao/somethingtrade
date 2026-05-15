@@ -8,6 +8,7 @@ from app.core.events import (
     MarketTick,
     OrderBookTop,
     OrderIntent,
+    PolymarketSideLabel,
     PolymarketQuote,
     SignalEvent,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "MarketTick",
     "OrderBookTop",
     "OrderIntent",
+    "PolymarketSideLabel",
     "PolymarketQuote",
     "SignalEvent",
 ]

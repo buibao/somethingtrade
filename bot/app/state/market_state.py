@@ -47,18 +47,25 @@ class MarketState:
     path because updates are simple dictionary/deque operations.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_polymarket_quote_age_ms: float = 5_000.0) -> None:
         self.ticks: dict[str, MarketTick] = {}
         self.book_tops: dict[str, OrderBookTop] = {}
         self.depth_updates: dict[str, DepthUpdate] = {}
         self.polymarket_quotes: dict[str, PolymarketQuote] = {}
         self.symbols: dict[str, SymbolState] = {}
+        self.max_polymarket_quote_age_ms = max_polymarket_quote_age_ms
 
     def apply(
         self,
         event: BinanceMarketEvent | PolymarketQuote,
-    ) -> BinanceMarketEvent | PolymarketQuote:
+    ) -> BinanceMarketEvent | PolymarketQuote | None:
         state_updated_ts = utc_now_ns()
+        if isinstance(event, PolymarketQuote) and self.is_stale_quote(
+            event,
+            now_ts=state_updated_ts,
+        ):
+            return None
+
         updated_event = self._with_state_latency(event, state_updated_ts)
 
         if isinstance(updated_event, MarketTick):
@@ -92,6 +99,14 @@ class MarketState:
 
         return updated_event
 
+    def is_stale_quote(self, quote: PolymarketQuote, *, now_ts: int | None = None) -> bool:
+        reference_ts = quote.event_ts or quote.received_ts or quote.exchange_event_ts
+        if reference_ts is None:
+            return False
+        current_ts = now_ts or utc_now_ns()
+        age_ms = (current_ts - reference_ts) / 1_000_000.0
+        return age_ms > self.max_polymarket_quote_age_ms
+
     def snapshot(self) -> dict[str, dict[str, object]]:
         return {symbol: state.snapshot() for symbol, state in self.symbols.items()}
 
@@ -111,6 +126,30 @@ class MarketState:
                         f"r15s={_fmt_bps(state.rolling_returns['15s'])}",
                         f"r30s={_fmt_bps(state.rolling_returns['30s'])}",
                         f"lat={_fmt_latency(state.latency_ms)}",
+                    ]
+                )
+            )
+        return lines
+
+    def polymarket_compact_lines(self) -> list[str]:
+        lines: list[str] = []
+        for token_id, quote in sorted(
+            self.polymarket_quotes.items(),
+            key=lambda item: (item[1].market_id, item[1].side_label),
+        ):
+            token = token_id[:8]
+            lines.append(
+                " ".join(
+                    [
+                        quote.market_id[:10],
+                        quote.side_label,
+                        f"token={token}",
+                        f"bid={_fmt_prob(quote.best_bid)}",
+                        f"ask={_fmt_prob(quote.best_ask)}",
+                        f"mid={_fmt_prob(quote.mid_price)}",
+                        f"spr={_fmt_prob(quote.spread)}",
+                        f"liq={_fmt_float(quote.available_liquidity_at_best)}",
+                        f"lat={_fmt_latency(quote.latency_ms)}",
                     ]
                 )
             )
@@ -200,3 +239,7 @@ def _fmt_bps(value: float | None) -> str:
 
 def _fmt_latency(value: float | None) -> str:
     return "-" if value is None else f"{value:.2f}ms"
+
+
+def _fmt_prob(value: float | None) -> str:
+    return "-" if value is None else f"{value:.3f}"

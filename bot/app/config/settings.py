@@ -11,9 +11,21 @@ class Settings(BaseModel):
 
     binance_ws_url: str = Field("wss://stream.binance.com:9443/ws", alias="BINANCE_WS_URL")
     binance_symbols_csv: str = Field("BTCUSDT,ETHUSDT", alias="BINANCE_SYMBOLS")
+    polymarket_gamma_url: str = Field(
+        "https://gamma-api.polymarket.com",
+        alias="POLYMARKET_GAMMA_URL",
+    )
     polymarket_ws_url: str = Field(
-        "wss://ws-subscriptions-clob.polymarket.com/ws/",
+        "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         alias="POLYMARKET_WS_URL",
+    )
+    polymarket_market_cache_path: str = Field(
+        "data/cache/polymarket_markets.json",
+        alias="POLYMARKET_MARKET_CACHE_PATH",
+    )
+    polymarket_max_quote_age_ms: float = Field(
+        5_000.0,
+        alias="POLYMARKET_MAX_QUOTE_AGE_MS",
     )
     polymarket_api_key: str = Field("replace-me", alias="POLYMARKET_API_KEY")
     wallet_private_key: str = Field("replace-me", alias="WALLET_PRIVATE_KEY")
@@ -36,7 +48,10 @@ def get_settings() -> Settings:
         for key in (
             "BINANCE_WS_URL",
             "BINANCE_SYMBOLS",
+            "POLYMARKET_GAMMA_URL",
             "POLYMARKET_WS_URL",
+            "POLYMARKET_MARKET_CACHE_PATH",
+            "POLYMARKET_MAX_QUOTE_AGE_MS",
             "POLYMARKET_API_KEY",
             "WALLET_PRIVATE_KEY",
             "MODE",

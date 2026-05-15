@@ -52,6 +52,9 @@ class ExecutionStatus(StrEnum):
     CANCELED = "canceled"
 
 
+type PolymarketSideLabel = Literal["YES", "NO"]
+
+
 class BookLevel(BaseModel):
     """Single price level for order book deltas."""
 
@@ -107,11 +110,34 @@ class PolymarketQuote(RealtimeMarketEvent):
     market_id: str
     condition_id: str | None = None
     token_id: str
-    outcome: str
-    bid_probability: float
-    ask_probability: float
-    bid_size: float
-    ask_size: float
+    side_label: PolymarketSideLabel
+    best_bid: float | None = None
+    best_ask: float | None = None
+    mid_price: float | None = None
+    spread: float | None = None
+    available_liquidity_at_best: float | None = None
+    event_ts: int | None = None
+    received_ts: int | None = None
+
+    @property
+    def outcome(self) -> str:
+        return self.side_label
+
+    @property
+    def bid_probability(self) -> float:
+        return self.best_bid if self.best_bid is not None else 0.0
+
+    @property
+    def ask_probability(self) -> float:
+        return self.best_ask if self.best_ask is not None else 1.0
+
+    @property
+    def bid_size(self) -> float:
+        return self.available_liquidity_at_best or 0.0
+
+    @property
+    def ask_size(self) -> float:
+        return self.available_liquidity_at_best or 0.0
 
 
 class SignalEvent(EventModel):

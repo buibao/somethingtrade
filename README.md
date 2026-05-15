@@ -45,6 +45,16 @@ python -m app.main binance-monitor --symbols BTCUSDT,ETHUSDT
 
 The monitor prints compact state once per second. It uses reconnect with exponential backoff and websocket heartbeat pings. No database is used in the realtime path.
 
+## Polymarket Monitor
+
+Phase 2 discovers active BTC/ETH short-duration up/down style markets through public Gamma market data, caches public metadata under `data/cache/`, subscribes to the public CLOB market websocket, and stores latest quotes in memory.
+
+```bash
+python -m app.main polymarket-monitor
+```
+
+See `docs/polymarket_notes.md` for API assumptions and cache contents. Real order execution remains unimplemented.
+
 ## Status
 
 This project does not implement real trading. Websocket clients, Polymarket execution, and strategy logic are deliberately skeletal so real connectivity, key management, persistence, and production risk controls can be added deliberately.

@@ -7,6 +7,7 @@ MODULES = [
     "app.core.events",
     "app.core.telemetry",
     "app.marketdata.binance_ws",
+    "app.marketdata.polymarket_discovery",
     "app.marketdata.polymarket_ws",
     "app.marketdata.normalizer",
     "app.state.market_state",
