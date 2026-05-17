@@ -1,5 +1,0 @@
-cohort,row_count,success_count,success_rate,median_executable_repricing_delay_ms,median_tradable_window_ms,median_exit_edge_ticks,warnings
-A only,2,0,0.0,,506.8536,,"[""row_count_below_bucket_minimum"", ""executable_delay_missing""]"
-A/B,32,2,0.0625,1040.4615,484.3259,0.9999999999999994,[]
-A/B/C,32,2,0.0625,1040.4615,484.3259,0.9999999999999994,[]
-all rows,54,2,0.037037037037037035,1040.4615,0.0,0.9999999999999994,"[""contains_tier_D_diagnostic_rows""]"
