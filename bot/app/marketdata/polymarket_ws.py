@@ -76,10 +76,11 @@ class PolymarketWSClient:
         self.token_ids = tuple(str(token_id) for token_id in token_ids) or tuple(
             token_id for market in self.market_metadata for token_id in market.token_ids
         )
+        self._token_side_label_overrides = token_side_labels
         token_metadata = _build_token_metadata(
             self.market_metadata,
             self.token_ids,
-            token_side_labels,
+            self._token_side_label_overrides,
         )
         self._orderbooks = PolymarketLocalOrderBook(
             token_metadata=token_metadata,
@@ -96,6 +97,13 @@ class PolymarketWSClient:
         self.max_queue = max_queue
         self._connect_factory = cast(ConnectFactory, connect_factory or websockets.connect)
         self._logger = structlog.get_logger("polymarket_ws")
+        self._subscription_version = 0
+        self._active_subscription_version = -1
+        self._active_subscription_token_ids: tuple[str, ...] = ()
+        self._subscription_transition_active = False
+        self._subscription_update_count = 0
+        self._subscription_reconnect_count = 0
+        self._active_websocket: WebSocketConnection | None = None
 
     def subscription_message(self) -> bytes:
         return orjson.dumps(
@@ -105,6 +113,77 @@ class PolymarketWSClient:
                 "custom_feature_enabled": True,
             }
         )
+
+    def update_markets(
+        self,
+        markets: Iterable[PolymarketMarketMetadata],
+        *,
+        token_ids: Iterable[str] | None = None,
+    ) -> None:
+        new_markets = tuple(markets)
+        new_tokens = tuple(str(token_id) for token_id in (token_ids or ())) or tuple(
+            token_id for market in new_markets for token_id in market.token_ids
+        )
+        old_tokens = set(self.token_ids)
+        if tuple(new_tokens) == self.token_ids and new_markets == self.market_metadata:
+            return
+
+        self.market_metadata = new_markets
+        self.token_ids = tuple(new_tokens)
+        token_metadata = _build_token_metadata(
+            self.market_metadata,
+            self.token_ids,
+            self._token_side_label_overrides,
+        )
+        self._orderbooks.update_token_metadata(
+            token_metadata,
+            active_token_ids=self.token_ids,
+        )
+        self._subscription_version += 1
+        self._subscription_update_count += 1
+        self._subscription_transition_active = True
+        self._logger.info(
+            "polymarket_ws_subscription_update_requested",
+            token_count=len(self.token_ids),
+            added_tokens=sorted(set(self.token_ids) - old_tokens),
+            removed_tokens=sorted(old_tokens - set(self.token_ids)),
+            subscription_version=self._subscription_version,
+        )
+        if self._active_websocket is not None:
+            try:
+                asyncio.get_running_loop().create_task(self._active_websocket.close())
+            except RuntimeError:
+                pass
+
+    @property
+    def active_subscription_token_ids(self) -> tuple[str, ...]:
+        return self._active_subscription_token_ids or self.token_ids
+
+    @property
+    def active_ws_token_subscription_count(self) -> int:
+        return len(self.active_subscription_token_ids)
+
+    @property
+    def subscription_transition_active(self) -> bool:
+        return self._subscription_transition_active
+
+    @property
+    def websocket_reconnect_count(self) -> int:
+        return self._subscription_reconnect_count
+
+    def subscription_diagnostics(self) -> dict[str, Any]:
+        runtime_tokens = set(self.token_ids)
+        active_tokens = set(self.active_subscription_token_ids)
+        return {
+            "runtime_token_count": len(runtime_tokens),
+            "active_ws_token_subscription_count": len(active_tokens),
+            "subscription_transition_active": self._subscription_transition_active,
+            "subscription_update_count": self._subscription_update_count,
+            "websocket_reconnect_count": self._subscription_reconnect_count,
+            "missing_active_tokens": sorted(runtime_tokens - active_tokens),
+            "extra_active_tokens": sorted(active_tokens - runtime_tokens),
+            "subscription_out_of_sync": runtime_tokens != active_tokens,
+        }
 
     async def stream(
         self,
@@ -126,17 +205,34 @@ class PolymarketWSClient:
                     close_timeout=1,
                     max_queue=self.max_queue,
                 ) as websocket:
+                    self._active_websocket = websocket
                     if reconnect_attempt > 0:
                         self._orderbooks.record_reconnect()
+                        self._subscription_reconnect_count += 1
                     await websocket.send(self.subscription_message())
+                    self._active_subscription_token_ids = tuple(self.token_ids)
+                    self._active_subscription_version = self._subscription_version
+                    self._subscription_transition_active = False
                     self._logger.info(
                         "polymarket_ws_connected",
                         url=self.url,
                         token_count=len(self.token_ids),
+                        subscription_version=self._active_subscription_version,
                     )
                     reconnect_attempt = 0
 
                     while True:
+                        if self._active_subscription_version != self._subscription_version:
+                            self._subscription_transition_active = True
+                            self._logger.info(
+                                "polymarket_ws_subscription_reconnect",
+                                active_version=self._active_subscription_version,
+                                target_version=self._subscription_version,
+                                active_token_count=len(self._active_subscription_token_ids),
+                                target_token_count=len(self.token_ids),
+                            )
+                            await websocket.close()
+                            break
                         raw_message = await self._recv_with_heartbeat(websocket)
                         received_ts = utc_now_ns()
                         recv_monotonic_ns = monotonic_now_ns()
@@ -149,10 +245,12 @@ class PolymarketWSClient:
                             yielded += 1
                             if max_events is not None and yielded >= max_events:
                                 return
+                    continue
 
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._active_websocket = None
                 if (
                     max_reconnect_attempts is not None
                     and reconnect_attempt >= max_reconnect_attempts
@@ -168,6 +266,8 @@ class PolymarketWSClient:
                 )
                 reconnect_attempt += 1
                 await asyncio.sleep(delay)
+            finally:
+                self._active_websocket = None
 
     async def _recv_with_heartbeat(self, websocket: WebSocketConnection) -> str | bytes:
         while True:
@@ -248,7 +348,13 @@ class PolymarketWSClient:
                         event_ts=event_ts,
                     )
                 )
-            elif event_type in {"tick_size_change", "new_market", "market_resolved"}:
+            elif event_type in {
+                "tick_size_change",
+                "new_market",
+                "market_resolved",
+                "closed",
+                "expired",
+            }:
                 lifecycle = _lifecycle_event(
                     payload,
                     received_ts=local_received_ts,
@@ -257,7 +363,12 @@ class PolymarketWSClient:
                     parse_done_monotonic_ns=parse_done_mono,
                     event_ts=event_ts,
                 )
-                if lifecycle.lifecycle_type in {"tick_size_change", "market_resolved"}:
+                if lifecycle.lifecycle_type in {
+                    "tick_size_change",
+                    "market_resolved",
+                    "closed",
+                    "expired",
+                }:
                     if lifecycle.lifecycle_type == "tick_size_change" and lifecycle.new_tick_size:
                         self._orderbooks.update_tick_size(
                             lifecycle.market_id,
@@ -406,7 +517,13 @@ def _lifecycle_event(
     event_ts: int | None,
 ) -> MarketLifecycleEvent:
     lifecycle_type = str(payload["event_type"])
-    if lifecycle_type not in {"tick_size_change", "market_resolved", "new_market"}:
+    if lifecycle_type not in {
+        "tick_size_change",
+        "market_resolved",
+        "new_market",
+        "closed",
+        "expired",
+    }:
         raise PolymarketMessageError(f"unsupported lifecycle type: {lifecycle_type}")
     return MarketLifecycleEvent(
         market_id=str(payload.get("market") or payload.get("market_id") or ""),

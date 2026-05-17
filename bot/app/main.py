@@ -20,7 +20,14 @@ from app.backtest.dataset_quality_phase4 import (
 )
 from app.config.settings import get_settings
 from app.core.clock import utc_now_ns
-from app.core.events import DepthUpdate, MarketTick, OrderBookTop, TradableGapObservation
+from app.core.events import (
+    DepthUpdate,
+    MarketLifecycleEvent,
+    MarketTick,
+    OrderBookTop,
+    PolymarketQuote,
+    TradableGapObservation,
+)
 from app.execution.paper_executor import PaperExecutor
 from app.logging.event_logger import AsyncJsonlEventLogger
 from app.marketdata.binance_ws import BinanceWSClient
@@ -29,8 +36,17 @@ from app.marketdata.polymarket_discovery import (
     PolymarketMarketCache,
     PolymarketMarketMetadata,
     annotate_runtime_market_roles,
+    classify_market_window,
     flatten_token_ids,
+    is_runtime_tradable_market,
     select_runtime_markets,
+)
+from app.marketdata.market_universe import (
+    MarketUniverseDiff,
+    MarketUniverseSnapshot,
+    RuntimeMarketUniverseManager,
+    build_market_universe_snapshot,
+    select_runtime_market_universe,
 )
 from app.marketdata.polymarket_ws import PolymarketWSClient
 from app.state.market_state import MarketState
@@ -190,6 +206,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=60_000,
         help="Print compact per-symbol/base-asset runtime diagnostics at this interval.",
+    )
+    gap_monitor.add_argument(
+        "--market-refresh-interval-ms",
+        type=int,
+        default=60_000,
+        help="Rediscover rolling BTC/ETH 5m/15m Polymarket markets at this interval.",
+    )
+    gap_monitor.add_argument(
+        "--market-refresh-force-when-no-signal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Force an early market rediscovery when Binance moves continue but no signal markets are active.",
+    )
+    gap_monitor.add_argument(
+        "--market-refresh-lookahead-windows",
+        type=int,
+        default=3,
+        help="Number of future rolling windows to keep in the runtime market universe per asset/duration.",
+    )
+    gap_monitor.add_argument(
+        "--runtime-summary-jsonl",
+        default=None,
+        help="Optional UTF-8 JSONL path for periodic runtime diagnostics.",
     )
 
     rolling_debug = subparsers.add_parser(
@@ -367,7 +406,10 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         gamma_url=args.gamma_url or settings.polymarket_gamma_url,
         cache_path=args.cache_path or settings.polymarket_market_cache_path,
     )
-    markets = await _discover_polymarket_markets(discovery)
+    markets = await _discover_polymarket_markets(
+        discovery,
+        lookahead_windows=args.market_refresh_lookahead_windows,
+    )
     if not markets:
         print(
             "No rolling BTC/ETH 5m/15m markets found from direct slugs. Run:\n"
@@ -377,6 +419,13 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         print("no active BTC/ETH 5m/15m Polymarket markets discovered", flush=True)
         return
 
+    universe_manager = RuntimeMarketUniverseManager(
+        discovery,
+        markets,
+        refresh_interval_ms=args.market_refresh_interval_ms,
+        lookahead_windows=args.market_refresh_lookahead_windows,
+    )
+    markets = universe_manager.markets
     state = MarketState(max_polymarket_quote_age_ms=settings.polymarket_max_quote_age_ms)
     detector = GapDetector(
         markets=markets,
@@ -449,10 +498,14 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
     )
     logger = AsyncJsonlEventLogger(log_dir=args.log_dir or settings.gap_log_dir)
     logger.start()
-    runtime_summary = GapRuntimeSummary(markets)
+    runtime_summary = GapRuntimeSummary(universe_manager.snapshot())
+    runtime_jsonl = RuntimeSummaryJsonlWriter(args.runtime_summary_jsonl)
     runtime_summary_interval_s = max(1, args.runtime_summary_interval_ms) / 1000.0
+    market_refresh_interval_s = max(1, args.market_refresh_interval_ms) / 1000.0
     loop = asyncio.get_running_loop()
     next_runtime_summary_at = loop.time() + runtime_summary_interval_s
+    next_forced_refresh_allowed_at = loop.time()
+    last_forced_refresh_move_total = 0
     _write_book_readiness_debug(polymarket)
     print(_format_book_readiness_summary(polymarket.book_readiness_snapshot()), flush=True)
 
@@ -467,16 +520,46 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
             await asyncio.sleep(1.0)
             readiness = polymarket.book_readiness_snapshot()
             _write_book_readiness_debug(polymarket, payload=readiness)
-            print(_format_gap_stats(detector.stats(state)), flush=True)
+            stats = detector.stats(state)
+            move_total = sum(stats.binance_moves_detected_by_symbol.values())
+            force_no_signal_refresh = (
+                args.market_refresh_force_when_no_signal
+                and stats.signal_enabled_markets == 0
+                and move_total > last_forced_refresh_move_total
+                and loop.time() >= next_forced_refresh_allowed_at
+            )
+            force_lifecycle_refresh = runtime_summary.consume_lifecycle_refresh_request()
+            if universe_manager.refresh_due() or force_no_signal_refresh or force_lifecycle_refresh:
+                forced = force_no_signal_refresh or force_lifecycle_refresh
+                diff = await universe_manager.refresh(forced=forced)
+                if forced:
+                    next_forced_refresh_allowed_at = loop.time() + market_refresh_interval_s
+                    last_forced_refresh_move_total = move_total
+                await _apply_market_universe_refresh(
+                    detector=detector,
+                    polymarket=polymarket,
+                    logger=logger,
+                    runtime_summary=runtime_summary,
+                    snapshot=universe_manager.snapshot(),
+                    diff=diff,
+                )
+                if diff.changed or diff.error or forced:
+                    print(_format_market_universe_diff(diff), flush=True)
+                readiness = polymarket.book_readiness_snapshot()
+                stats = detector.stats(state)
+            print(_format_gap_stats(stats), flush=True)
             print(_format_book_readiness_summary(readiness), flush=True)
             if loop.time() >= next_runtime_summary_at:
-                print(
-                    runtime_summary.format(
-                        detector.stats(state),
-                        readiness,
-                    ),
-                    flush=True,
+                summary_payload = runtime_summary.snapshot_payload(
+                    stats,
+                    readiness,
+                    ws_diagnostics=polymarket.subscription_diagnostics(),
+                    final=False,
                 )
+                print(runtime_summary.format_payload(summary_payload), flush=True)
+                for warning in summary_payload["no_event_warnings"]:
+                    print(f"runtime_warning reason={warning}", flush=True)
+                runtime_jsonl.write(summary_payload)
                 next_runtime_summary_at = loop.time() + runtime_summary_interval_s
     finally:
         for task in tasks:
@@ -490,14 +573,14 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
             final_readiness = polymarket.book_readiness_snapshot()
         except Exception:
             final_readiness = {}
-        print(
-            runtime_summary.format(
-                detector.stats(state),
-                final_readiness,
-                final=True,
-            ),
-            flush=True,
+        final_payload = runtime_summary.snapshot_payload(
+            detector.stats(state),
+            final_readiness,
+            ws_diagnostics=polymarket.subscription_diagnostics(),
+            final=True,
         )
+        print(runtime_summary.format_payload(final_payload), flush=True)
+        runtime_jsonl.write(final_payload)
         await logger.close()
 
 
@@ -595,6 +678,7 @@ async def _ingest_gap_polymarket(
     runtime_summary: "GapRuntimeSummary",
 ) -> None:
     async for event in client.stream():
+        runtime_summary.record_polymarket_event(event)
         updated = state.apply(event)
         if updated is not None:
             for gap in detector.on_market_event(updated, state):
@@ -664,18 +748,56 @@ def run_dataset_quality_report(args: argparse.Namespace) -> None:
 class GapRuntimeSummary:
     """Compact, observability-only gap monitor counters."""
 
-    def __init__(self, markets: Sequence[PolymarketMarketMetadata]) -> None:
-        self.markets = tuple(markets)
+    def __init__(
+        self,
+        markets: Sequence[PolymarketMarketMetadata] | MarketUniverseSnapshot,
+    ) -> None:
+        snapshot = (
+            markets
+            if isinstance(markets, MarketUniverseSnapshot)
+            else build_market_universe_snapshot(
+                tuple(markets),
+                now_ts=utc_now_ns() // 1_000_000_000,
+            )
+        )
+        self.markets = tuple(snapshot.markets)
+        self.market_universe = snapshot
         self.binance_events_seen_by_symbol: Counter[str] = Counter()
         self.gap_events_written_by_symbol: Counter[str] = Counter()
         self._market_by_id = {market.market_id: market for market in self.markets}
+        self._last_gap_event_total = 0
+        self._last_gap_event_change_ts_ns = utc_now_ns()
+        self._last_move_total = 0
+        self._last_move_change_ts_ns: int | None = None
+        self._last_summary_ts_ns = utc_now_ns()
+        self._lifecycle_refresh_requested = False
+        self._last_diff = snapshot.last_diff
 
     def record_binance_event(self, event: object) -> None:
         if isinstance(event, (MarketTick, OrderBookTop, DepthUpdate)):
             self.binance_events_seen_by_symbol[event.symbol] += 1
 
+    def record_polymarket_event(self, event: object) -> None:
+        if isinstance(event, MarketLifecycleEvent) and event.lifecycle_type == "new_market":
+            self._lifecycle_refresh_requested = True
+
     def record_gap_event_written(self, observation: TradableGapObservation) -> None:
         self.gap_events_written_by_symbol[observation.symbol] += 1
+
+    def consume_lifecycle_refresh_request(self) -> bool:
+        requested = self._lifecycle_refresh_requested
+        self._lifecycle_refresh_requested = False
+        return requested
+
+    def update_market_universe(
+        self,
+        snapshot: MarketUniverseSnapshot,
+        diff: MarketUniverseDiff,
+    ) -> None:
+        self.market_universe = snapshot
+        self.markets = tuple(snapshot.markets)
+        self._market_by_id = {market.market_id: market for market in self.markets}
+        self._last_diff = diff
 
     def format(
         self,
@@ -684,59 +806,248 @@ class GapRuntimeSummary:
         *,
         final: bool = False,
     ) -> str:
+        return self.format_payload(
+            self.snapshot_payload(stats, readiness, ws_diagnostics={}, final=final)
+        )
+
+    def snapshot_payload(
+        self,
+        stats: GapMonitorStats,
+        readiness: dict[str, Any],
+        *,
+        ws_diagnostics: dict[str, Any],
+        final: bool = False,
+    ) -> dict[str, Any]:
+        now_ns = utc_now_ns()
+        now_ts = now_ns // 1_000_000_000
         market_counters = self._market_counters(readiness)
+        move_total = sum(int(value) for value in stats.binance_moves_detected_by_symbol.values())
+        gap_total = sum(int(value) for value in self.gap_events_written_by_symbol.values())
+        if move_total > self._last_move_total:
+            self._last_move_change_ts_ns = now_ns
+        if gap_total > self._last_gap_event_total:
+            self._last_gap_event_change_ts_ns = now_ns
+        self._last_move_total = move_total
+        self._last_gap_event_total = gap_total
+
+        universe_snapshot = build_market_universe_snapshot(
+            self.markets,
+            now_ts=now_ts,
+            last_market_discovery_ts=self.market_universe.last_market_discovery_ts,
+            next_market_discovery_ts=self.market_universe.next_market_discovery_ts,
+            market_refresh_count=self.market_universe.market_refresh_count,
+            forced_market_refresh_count=self.market_universe.forced_market_refresh_count,
+            market_refresh_error_count=self.market_universe.market_refresh_error_count,
+            last_diff=self._last_diff,
+        )
+        self.market_universe = universe_snapshot
+        payload: dict[str, Any] = {
+            "event_type": "runtime_summary",
+            "final": final,
+            "generated_ts_ns": now_ns,
+            "binance_events_seen_by_symbol": dict(sorted(self.binance_events_seen_by_symbol.items())),
+            "binance_moves_detected_by_symbol": dict(
+                sorted(stats.binance_moves_detected_by_symbol.items())
+            ),
+            "candidates_created_by_symbol": dict(sorted(stats.candidates_created_by_symbol.items())),
+            "gap_events_written_by_symbol": dict(
+                sorted(self.gap_events_written_by_symbol.items())
+            ),
+            "pre_entry_rejects_by_symbol": dict(sorted(stats.pre_entry_rejects_by_symbol.items())),
+            "window_rejects_by_symbol": dict(sorted(stats.window_rejects_by_symbol.items())),
+            "timeout_rejects_by_symbol": dict(sorted(stats.timeout_rejects_by_symbol.items())),
+            "suppressed_candidates_by_symbol": dict(
+                sorted(stats.suppressed_candidates_by_symbol.items())
+            ),
+            "non_fillable_by_symbol": dict(sorted(stats.non_fillable_by_symbol.items())),
+            "top_reject_reasons_by_symbol": stats.top_reject_reasons_by_symbol,
+            "book_ready_tokens_by_base_asset": dict(sorted(market_counters["book_ready"].items())),
+            "book_not_ready_tokens_by_base_asset": dict(
+                sorted(
+                    (
+                        base,
+                        max(
+                            0,
+                            market_counters["book_total"].get(base, 0)
+                            - market_counters["book_ready"].get(base, 0),
+                        ),
+                    )
+                    for base in market_counters["book_total"]
+                )
+            ),
+            "signal_book_not_ready_tokens_by_base_asset": dict(
+                sorted(
+                    (
+                        base,
+                        max(
+                            0,
+                            market_counters["signal_book_total"].get(base, 0)
+                            - market_counters["signal_book_ready"].get(base, 0),
+                        ),
+                    )
+                    for base in market_counters["signal_book_total"]
+                )
+            ),
+            "current_signal_markets_by_base_asset": _counter_from_markets(
+                universe_snapshot.current_signal_markets
+            ),
+            "next_warmup_markets_by_base_asset": _counter_from_markets(
+                universe_snapshot.next_warmup_markets
+            ),
+            "future_tracked_markets_by_base_asset": _counter_from_markets(
+                universe_snapshot.future_tracked_markets
+            ),
+            "expired_selected_markets_by_base_asset": _counter_from_markets(
+                universe_snapshot.expired_selected_markets
+            ),
+            "closed_removed_markets_by_base_asset": _counter_from_markets(
+                universe_snapshot.closed_removed_markets
+            ),
+            "signal_enabled_markets_by_base_asset": _counter_from_markets(
+                universe_snapshot.current_signal_markets
+            ),
+            "active_ws_token_subscription_count": int(
+                ws_diagnostics.get(
+                    "active_ws_token_subscription_count",
+                    len(universe_snapshot.token_ids),
+                )
+            ),
+            "tracked_market_count": universe_snapshot.tracked_market_count,
+            "last_market_discovery_ts": universe_snapshot.last_market_discovery_ts,
+            "next_market_discovery_ts": universe_snapshot.next_market_discovery_ts,
+            "new_markets_added_count": len(self._last_diff.added_markets),
+            "expired_markets_removed_count": len(self._last_diff.expired_markets),
+            "current_market_slugs_by_base_asset": _slugs_by_base(
+                universe_snapshot.current_signal_markets
+            ),
+            "next_market_slugs_by_base_asset": _slugs_by_base(
+                universe_snapshot.next_warmup_markets
+            ),
+            "market_refresh_count": universe_snapshot.market_refresh_count,
+            "forced_market_refresh_count": universe_snapshot.forced_market_refresh_count,
+            "market_refresh_error_count": universe_snapshot.market_refresh_error_count,
+            "validation_errors_by_type": _validation_errors_by_type(readiness),
+            "websocket_reconnect_count": int(
+                ws_diagnostics.get("websocket_reconnect_count", 0)
+            ),
+            "pending_observation_count": stats.pending_observation_count,
+            "pending_max_age_ms": stats.pending_max_age_ms,
+            "candidate_duplicate_suppressed_count": (
+                stats.candidate_duplicate_suppressed_count
+            ),
+            "candidates_per_symbol_direction_per_minute": (
+                stats.candidates_per_symbol_direction_per_minute
+            ),
+            "market_lifecycle_diff": {
+                "added_markets": self._last_diff.added_markets,
+                "removed_markets": self._last_diff.removed_markets,
+                "expired_markets": self._last_diff.expired_markets,
+                "closed_markets": self._last_diff.closed_markets,
+                "new_token_ids": self._last_diff.new_token_ids,
+                "removed_token_ids": self._last_diff.removed_token_ids,
+            },
+            "subscription_diagnostics": ws_diagnostics,
+        }
+        payload["runtime_status"] = _runtime_status(payload, stats, ws_diagnostics)
+        payload["no_event_warnings"] = self._no_event_warnings(
+            payload,
+            stats,
+            ws_diagnostics,
+            now_ns=now_ns,
+        )
+        self._last_summary_ts_ns = now_ns
+        return payload
+
+    def format_payload(self, payload: dict[str, Any]) -> str:
         return " ".join(
             [
                 "runtime_summary",
-                f"final={str(final).lower()}",
+                f"final={str(payload['final']).lower()}",
                 (
                     "binance_events_seen_by_symbol="
-                    f"{_format_counter(self.binance_events_seen_by_symbol)}"
+                    f"{_format_counter(payload['binance_events_seen_by_symbol'])}"
                 ),
                 (
                     "binance_moves_detected_by_symbol="
-                    f"{_format_counter(stats.binance_moves_detected_by_symbol)}"
+                    f"{_format_counter(payload['binance_moves_detected_by_symbol'])}"
                 ),
                 (
                     "runtime_markets_selected_by_base_asset="
-                    f"{_format_counter(market_counters['runtime_selected'])}"
+                    f"{_format_counter(_counter_from_markets(self.market_universe.markets))}"
+                ),
+                (
+                    "current_signal_markets_by_base_asset="
+                    f"{_format_counter(payload['current_signal_markets_by_base_asset'])}"
                 ),
                 (
                     "signal_enabled_markets_by_base_asset="
-                    f"{_format_counter(market_counters['signal_enabled'])}"
+                    f"{_format_counter(payload['signal_enabled_markets_by_base_asset'])}"
+                ),
+                (
+                    "next_warmup_markets_by_base_asset="
+                    f"{_format_counter(payload['next_warmup_markets_by_base_asset'])}"
                 ),
                 (
                     "warmup_only_markets_by_base_asset="
-                    f"{_format_counter(market_counters['warmup_only'])}"
+                    f"{_format_counter(payload['next_warmup_markets_by_base_asset'])}"
+                ),
+                (
+                    "future_tracked_markets_by_base_asset="
+                    f"{_format_counter(payload['future_tracked_markets_by_base_asset'])}"
+                ),
+                (
+                    "expired_selected_markets_by_base_asset="
+                    f"{_format_counter(payload['expired_selected_markets_by_base_asset'])}"
+                ),
+                (
+                    "active_ws_token_subscription_count="
+                    f"{payload['active_ws_token_subscription_count']}"
+                ),
+                (
+                    "tracked_market_count="
+                    f"{payload['tracked_market_count']}"
+                ),
+                (
+                    "current_market_slugs_by_base_asset="
+                    f"{_format_slug_map(payload['current_market_slugs_by_base_asset'])}"
+                ),
+                (
+                    "next_market_slugs_by_base_asset="
+                    f"{_format_slug_map(payload['next_market_slugs_by_base_asset'])}"
                 ),
                 (
                     "book_ready_tokens_by_base_asset="
-                    f"{_format_ready_tokens(market_counters['book_ready'], market_counters['book_total'])}"
+                    f"{_format_ready_tokens(Counter(payload['book_ready_tokens_by_base_asset']), _book_total_from_payload(payload))}"
                 ),
                 (
                     "candidates_created_by_symbol="
-                    f"{_format_counter(stats.candidates_created_by_symbol)}"
+                    f"{_format_counter(payload['candidates_created_by_symbol'])}"
                 ),
                 (
                     "gap_events_written_by_symbol="
-                    f"{_format_counter(self.gap_events_written_by_symbol)}"
+                    f"{_format_counter(payload['gap_events_written_by_symbol'])}"
                 ),
                 (
                     "pre_entry_rejects_by_symbol="
-                    f"{_format_counter(stats.pre_entry_rejects_by_symbol)}"
+                    f"{_format_counter(payload['pre_entry_rejects_by_symbol'])}"
                 ),
                 (
                     "window_rejects_by_symbol="
-                    f"{_format_counter(stats.window_rejects_by_symbol)}"
+                    f"{_format_counter(payload['window_rejects_by_symbol'])}"
                 ),
                 (
                     "timeout_rejects_by_symbol="
-                    f"{_format_counter(stats.timeout_rejects_by_symbol)}"
+                    f"{_format_counter(payload['timeout_rejects_by_symbol'])}"
                 ),
                 (
                     "top_reject_reasons_by_symbol="
-                    f"{_format_nested_counter(stats.top_reject_reasons_by_symbol)}"
+                    f"{_format_nested_counter(payload['top_reject_reasons_by_symbol'])}"
                 ),
+                f"market_refresh_count={payload['market_refresh_count']}",
+                f"forced_market_refresh_count={payload['forced_market_refresh_count']}",
+                f"market_refresh_error_count={payload['market_refresh_error_count']}",
+                f"runtime_status={payload['runtime_status']}",
+                f"no_event_warnings={','.join(payload['no_event_warnings']) or '-'}",
             ]
         )
 
@@ -746,6 +1057,8 @@ class GapRuntimeSummary:
         warmup_only: Counter[str] = Counter()
         book_ready: Counter[str] = Counter()
         book_total: Counter[str] = Counter()
+        signal_book_ready: Counter[str] = Counter()
+        signal_book_total: Counter[str] = Counter()
 
         for market in self.markets:
             base_asset = _base_asset(market)
@@ -754,22 +1067,32 @@ class GapRuntimeSummary:
 
         readiness_rows = _readiness_market_rows(readiness)
         if not readiness_rows:
+            now_ts = utc_now_ns() // 1_000_000_000
             for market in self.markets:
                 base_asset = _base_asset(market)
-                if market.signal_enabled:
+                classification = classify_market_window(market, now_ts=now_ts)
+                signal_market = (
+                    is_runtime_tradable_market(market, now_ts=now_ts)
+                    and classification == "current"
+                )
+                if signal_market:
                     signal_enabled[base_asset] += 1
-                elif market.selected_for_runtime:
+                elif market.selected_for_runtime and classification == "next":
                     warmup_only[base_asset] += 1
                 token_count = int(market.up_token_id is not None) + int(
                     market.down_token_id is not None
                 )
                 book_total[base_asset] += token_count
+                if signal_market:
+                    signal_book_total[base_asset] += token_count
             return {
                 "runtime_selected": runtime_selected,
                 "signal_enabled": signal_enabled,
                 "warmup_only": warmup_only,
                 "book_ready": book_ready,
                 "book_total": book_total,
+                "signal_book_ready": signal_book_ready,
+                "signal_book_total": signal_book_total,
             }
 
         for row in readiness_rows:
@@ -778,9 +1101,14 @@ class GapRuntimeSummary:
             if market is None:
                 continue
             base_asset = _base_asset(market)
-            if row.get("signal_enabled_at_now") is True:
+            classification = classify_market_window(
+                market,
+                now_ts=utc_now_ns() // 1_000_000_000,
+            )
+            signal_market = row.get("signal_enabled_at_now") is True and classification == "current"
+            if signal_market:
                 signal_enabled[base_asset] += 1
-            elif market.selected_for_runtime:
+            elif market.selected_for_runtime and classification == "next":
                 warmup_only[base_asset] += 1
             for token_field, complete_field in (
                 ("up_token_id", "up_token_book_complete"),
@@ -788,8 +1116,12 @@ class GapRuntimeSummary:
             ):
                 if row.get(token_field) is not None:
                     book_total[base_asset] += 1
+                    if signal_market:
+                        signal_book_total[base_asset] += 1
                     if row.get(complete_field) is True:
                         book_ready[base_asset] += 1
+                        if signal_market:
+                            signal_book_ready[base_asset] += 1
 
         return {
             "runtime_selected": runtime_selected,
@@ -797,7 +1129,65 @@ class GapRuntimeSummary:
             "warmup_only": warmup_only,
             "book_ready": book_ready,
             "book_total": book_total,
+            "signal_book_ready": signal_book_ready,
+            "signal_book_total": signal_book_total,
         }
+
+    def _no_event_warnings(
+        self,
+        payload: dict[str, Any],
+        stats: GapMonitorStats,
+        ws_diagnostics: dict[str, Any],
+        *,
+        now_ns: int,
+    ) -> list[str]:
+        warnings: list[str] = []
+        gap_quiet_ms = (now_ns - self._last_gap_event_change_ts_ns) / 1_000_000.0
+        moves_seen = sum(payload["binance_moves_detected_by_symbol"].values())
+        binance_events_seen = sum(payload["binance_events_seen_by_symbol"].values())
+        if binance_events_seen > 0 and moves_seen == 0:
+            warnings.append("no_binance_moves_detected")
+        if gap_quiet_ms < 600_000 or moves_seen <= 0:
+            return warnings
+        if not payload["signal_enabled_markets_by_base_asset"]:
+            warnings.append("no_signal_enabled_markets_while_binance_moves_continue")
+        ready_total = sum(payload["book_ready_tokens_by_base_asset"].values())
+        signal_not_ready_total = sum(
+            payload["signal_book_not_ready_tokens_by_base_asset"].values()
+        )
+        if payload["signal_enabled_markets_by_base_asset"] and signal_not_ready_total > 0:
+            warnings.append("books_not_ready_while_binance_moves_continue")
+        if (
+            sum(payload["candidates_created_by_symbol"].values()) > sum(payload["gap_events_written_by_symbol"].values())
+            and (
+                sum(payload["pre_entry_rejects_by_symbol"].values())
+                + sum(payload["window_rejects_by_symbol"].values())
+                + sum(payload["timeout_rejects_by_symbol"].values())
+                + sum(payload["suppressed_candidates_by_symbol"].values())
+            )
+            > 0
+        ):
+            warnings.append("candidates_rejected_or_suppressed_while_binance_moves_continue")
+        runtime_tokens = int(ws_diagnostics.get("runtime_token_count", len(self.market_universe.token_ids)))
+        active_tokens = int(
+            ws_diagnostics.get("active_ws_token_subscription_count", runtime_tokens)
+        )
+        if runtime_tokens != active_tokens:
+            warnings.append("market_subscriptions_stale")
+        if payload["market_refresh_error_count"] > 0:
+            warnings.append("market_refresh_failing")
+        if (
+            ws_diagnostics.get("subscription_out_of_sync") is True
+            and not ws_diagnostics.get("subscription_transition_active")
+        ):
+            warnings.append("websocket_subscription_out_of_sync")
+        if (
+            stats.pending_observation_count > 0
+            and stats.pending_max_age_ms is not None
+            and stats.pending_max_age_ms > stats.max_pending_gap_ms
+        ):
+            warnings.append("pending_observations_stuck")
+        return sorted(set(warnings))
 
 
 def _readiness_market_rows(readiness: dict[str, Any]) -> list[dict[str, Any]]:
@@ -809,6 +1199,134 @@ def _readiness_market_rows(readiness: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _base_asset(market: PolymarketMarketMetadata) -> str:
     return market.base_asset or "unknown"
+
+
+class RuntimeSummaryJsonlWriter:
+    def __init__(self, path: str | None) -> None:
+        self.path = None if path is None else Path(path)
+
+    def write(self, payload: dict[str, Any]) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("ab") as handle:
+            handle.write(orjson.dumps(payload, option=orjson.OPT_APPEND_NEWLINE))
+
+
+async def _apply_market_universe_refresh(
+    *,
+    detector: GapDetector,
+    polymarket: PolymarketWSClient,
+    logger: AsyncJsonlEventLogger,
+    runtime_summary: GapRuntimeSummary,
+    snapshot: MarketUniverseSnapshot,
+    diff: MarketUniverseDiff,
+) -> None:
+    detector.update_markets(snapshot.markets)
+    for observation in detector.drain_market_update_observations():
+        await logger.log(observation)
+        runtime_summary.record_gap_event_written(observation)
+    polymarket.update_markets(snapshot.markets, token_ids=snapshot.token_ids)
+    runtime_summary.update_market_universe(snapshot, diff)
+
+
+def _format_market_universe_diff(diff: MarketUniverseDiff) -> str:
+    return " ".join(
+        [
+            "market_universe_refresh",
+            f"forced={str(diff.forced).lower()}",
+            f"added_markets={_format_market_payloads(diff.added_markets)}",
+            f"removed_markets={_format_market_payloads(diff.removed_markets)}",
+            f"expired_markets={_format_market_payloads(diff.expired_markets)}",
+            f"closed_markets={_format_market_payloads(diff.closed_markets)}",
+            f"new_token_ids={len(diff.new_token_ids)}",
+            f"removed_token_ids={len(diff.removed_token_ids)}",
+            f"error={diff.error or '-'}",
+        ]
+    )
+
+
+def _format_market_payloads(markets: Sequence[dict[str, Any]]) -> str:
+    if not markets:
+        return "-"
+    return ",".join(str(market.get("market_slug") or market.get("market_id")) for market in markets)
+
+
+def _counter_from_markets(markets: Sequence[PolymarketMarketMetadata]) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for market in markets:
+        counter[_base_asset(market)] += 1
+    return dict(sorted(counter.items()))
+
+
+def _slugs_by_base(markets: Sequence[PolymarketMarketMetadata]) -> dict[str, list[str]]:
+    slugs: dict[str, list[str]] = {}
+    for market in markets:
+        slugs.setdefault(_base_asset(market), []).append(market.market_slug)
+    return {base: sorted(values) for base, values in sorted(slugs.items())}
+
+
+def _validation_errors_by_type(readiness: dict[str, Any]) -> dict[str, int]:
+    summary = readiness.get("summary")
+    if not isinstance(summary, dict):
+        return {}
+    errors = summary.get("top_validation_errors")
+    if isinstance(errors, dict):
+        return {
+            str(reason): int(count)
+            for reason, count in sorted(errors.items())
+            if isinstance(count, int)
+        }
+    return {}
+
+
+def _runtime_status(
+    payload: dict[str, Any],
+    stats: GapMonitorStats,
+    ws_diagnostics: dict[str, Any],
+) -> str:
+    if payload["market_refresh_error_count"] > 0 and not payload["signal_enabled_markets_by_base_asset"]:
+        return "market_refresh_failing"
+    if not payload["signal_enabled_markets_by_base_asset"]:
+        if payload["next_warmup_markets_by_base_asset"]:
+            return "only_warming_next_markets"
+        if payload["expired_selected_markets_by_base_asset"]:
+            return "stale_expired"
+        return "missing_signal_markets"
+    if ws_diagnostics.get("subscription_out_of_sync") is True:
+        return "blocked_by_subscriptions"
+    if sum(payload.get("signal_book_not_ready_tokens_by_base_asset", {}).values()) > 0:
+        return "waiting_for_book_readiness"
+    if (
+        sum(payload["candidates_created_by_symbol"].values())
+        > sum(payload["gap_events_written_by_symbol"].values())
+        and (
+            sum(payload["pre_entry_rejects_by_symbol"].values())
+            + sum(payload["window_rejects_by_symbol"].values())
+            + sum(payload["timeout_rejects_by_symbol"].values())
+            + sum(payload["suppressed_candidates_by_symbol"].values())
+        )
+        > 0
+    ):
+        return "blocked_by_rejects_or_suppression"
+    return "actively_measuring_current_markets"
+
+
+def _book_total_from_payload(payload: dict[str, Any]) -> Counter[str]:
+    ready = Counter(payload["book_ready_tokens_by_base_asset"])
+    not_ready = Counter(payload["book_not_ready_tokens_by_base_asset"])
+    total = Counter()
+    for base in set(ready) | set(not_ready):
+        total[base] = ready.get(base, 0) + not_ready.get(base, 0)
+    return total
+
+
+def _format_slug_map(slugs: dict[str, list[str]]) -> str:
+    if not slugs:
+        return "-"
+    return ";".join(
+        f"{base}[{','.join(values) or '-'}]" for base, values in sorted(slugs.items())
+    )
 
 
 def _format_counter(counter: Counter[str] | dict[str, int]) -> str:
@@ -849,10 +1367,16 @@ def _parse_symbols(value: str) -> tuple[str, ...]:
 
 async def _discover_polymarket_markets(
     discovery: PolymarketDiscoveryClient,
+    *,
+    lookahead_windows: int = 1,
 ) -> tuple[PolymarketMarketMetadata, ...]:
     now_ts = utc_now_ns() // 1_000_000_000
     try:
-        discovered = await discovery.discover(write_cache=True, now_ts=now_ts)
+        discovered = await discovery.discover(
+            write_cache=True,
+            now_ts=now_ts,
+            rolling_lookahead_windows=lookahead_windows,
+        )
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         print(
             "live Polymarket discovery failed "
@@ -863,7 +1387,14 @@ async def _discover_polymarket_markets(
 
     if discovered:
         _print_runtime_selection_diagnostics(discovered)
-        runtime_markets = select_runtime_markets(discovered, now_ts=now_ts)
+        if lookahead_windows > 1:
+            runtime_markets = select_runtime_market_universe(
+                discovered,
+                now_ts=now_ts,
+                lookahead_windows=lookahead_windows,
+            )
+        else:
+            runtime_markets = select_runtime_markets(discovered, now_ts=now_ts)
         if runtime_markets:
             return runtime_markets
         print(
@@ -876,6 +1407,12 @@ async def _discover_polymarket_markets(
         cached_markets = annotate_runtime_market_roles(cached.markets, now_ts=now_ts)
         print(f"using cached Polymarket markets ({len(cached_markets)})", flush=True)
         _print_runtime_selection_diagnostics(cached_markets)
+        if lookahead_windows > 1:
+            return select_runtime_market_universe(
+                cached_markets,
+                now_ts=now_ts,
+                lookahead_windows=lookahead_windows,
+            )
         return select_runtime_markets(cached_markets, now_ts=now_ts)
     return ()
 
@@ -918,12 +1455,21 @@ def _print_polymarket_markets(markets: tuple[PolymarketMarketMetadata, ...]) -> 
 def _print_runtime_selection_diagnostics(
     markets: Sequence[PolymarketMarketMetadata],
 ) -> None:
+    now_ts = utc_now_ns() // 1_000_000_000
     selected_count = sum(1 for market in markets if market.selected_for_runtime)
     signal_count = sum(1 for market in markets if market.signal_enabled)
     warmup_count = sum(
         1
         for market in markets
         if market.selected_for_runtime and not market.signal_enabled
+        and classify_market_window(market, now_ts=now_ts) == "next"
+    )
+    future_count = sum(
+        1
+        for market in markets
+        if market.selected_for_runtime
+        and not market.signal_enabled
+        and classify_market_window(market, now_ts=now_ts) == "future"
     )
     skipped_by_classification: dict[str, int] = {}
     for market in markets:
@@ -945,6 +1491,7 @@ def _print_runtime_selection_diagnostics(
                 f"selected_for_runtime={selected_count}",
                 f"signal_enabled={signal_count}",
                 f"warmup_only={warmup_count}",
+                f"future_tracked={future_count}",
                 f"skipped_by_classification={skipped or '-'}",
             ]
         ),

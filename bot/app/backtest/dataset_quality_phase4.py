@@ -145,6 +145,8 @@ REJECT_TAXONOMY = {
         "closed",
         "resolved",
         "lifecycle",
+        "market_expired",
+        "market_closed",
     },
     "timeout": {
         "max_observation_lifetime_reached",
@@ -533,6 +535,12 @@ def render_phase4_markdown_report(report: dict[str, Any]) -> str:
         f"- Tick size distribution: `{json.dumps(report['tick_calibration_analysis']['tick_size_distribution'], sort_keys=True)}`",
         f"- Tolerated mismatch row count: {report['tick_calibration_analysis']['tolerated_mismatch_row_count']}",
         f"- Mismatch sample status: {report['tick_calibration_analysis']['mismatch_sample_status']}",
+        f"- Mismatch sample total: {report['tick_calibration_analysis'].get('mismatch_total', 0)}",
+        f"- Mismatch by error type: `{json.dumps(report['tick_calibration_analysis'].get('mismatch_by_error_type', {}), sort_keys=True)}`",
+        f"- Top affected markets: `{json.dumps(report['tick_calibration_analysis'].get('top_affected_markets', {}), sort_keys=True)}`",
+        f"- Top affected tokens: `{json.dumps(report['tick_calibration_analysis'].get('top_affected_tokens', {}), sort_keys=True)}`",
+        f"- Pct within 1 tick: {_format_rate(report['tick_calibration_analysis'].get('pct_within_1_tick'))}",
+        f"- Pct above 2 ticks: {_format_rate(report['tick_calibration_analysis'].get('pct_above_2_ticks'))}",
         f"- Warnings: {', '.join(report['tick_calibration_analysis'].get('warning_flags', [])) or '-'}",
         "",
         "## 12. Empirical Bucket Analysis",
@@ -1260,7 +1268,11 @@ def _build_cohort_sensitivity(
         primary_summary["median_exit_edge_ticks"],
         all_summary["median_exit_edge_ticks"],
     )
-    if len(primary_rows) < MIN_BUCKET_ROWS or len(rows) < MIN_BUCKET_ROWS:
+    if (
+        len(primary_rows) < MIN_PRIMARY_ROWS
+        or cohort_summaries["A only"]["row_count"] < MIN_BUCKET_ROWS
+        or len(rows) < MIN_BUCKET_ROWS
+    ):
         conclusion = "insufficient_data"
     elif success_delta is not None and abs(success_delta) > 0.10:
         conclusion = "unstable"
@@ -1635,8 +1647,14 @@ def _analyze_mismatch_samples(path: Path) -> dict[str, Any]:
     bid_mismatch_count = 0
     ask_mismatch_count = 0
     error_types: Counter[str] = Counter()
+    markets: Counter[str] = Counter()
+    tokens: Counter[str] = Counter()
     for sample in samples:
         error_types[str(sample.get("error_type") or sample.get("validation_error") or sample.get("reason") or "unknown")] += 1
+        if sample.get("market_id") is not None:
+            markets[str(sample.get("market_id"))] += 1
+        if sample.get("token_id") is not None:
+            tokens[str(sample.get("token_id"))] += 1
         side = str(sample.get("side") or sample.get("book_side") or "").lower()
         if "bid" in side:
             bid_mismatch_count += 1
@@ -1675,6 +1693,8 @@ def _analyze_mismatch_samples(path: Path) -> dict[str, Any]:
         "mismatch_total": len(samples),
         "mismatch_malformed_json_lines": len(audit.malformed_rows),
         "mismatch_by_error_type": dict(sorted(error_types.items())),
+        "top_affected_markets": dict(markets.most_common(10)),
+        "top_affected_tokens": dict(tokens.most_common(10)),
         "abs_price_diff": _summary_values(abs_price_diffs, len(samples)),
         "tick_diff": _summary_values(tick_diffs, len(samples)),
         "tick_diff_distribution": dict(sorted(Counter(_tick_diff_bucket(value) for value in tick_diffs).items())),

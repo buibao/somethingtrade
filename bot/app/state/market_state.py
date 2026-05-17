@@ -84,7 +84,13 @@ class MarketState:
             now_ts=state_updated_ts,
             now_monotonic_ns=state_updated_monotonic_ns,
         ):
-            return None
+            event = event.model_copy(
+                update={
+                    "book_complete": False,
+                    "book_stale": True,
+                    "validation_error": event.validation_error or "quote_stale",
+                }
+            )
 
         updated_event = self._with_state_latency(
             event,
@@ -127,7 +133,12 @@ class MarketState:
         elif isinstance(updated_event, MarketLifecycleEvent):
             self.market_lifecycle_events.append(updated_event)
             self.lifecycle_events_by_market[updated_event.market_id] = updated_event
-            if updated_event.lifecycle_type in {"market_resolved", "tick_size_change"}:
+            if updated_event.lifecycle_type in {
+                "market_resolved",
+                "tick_size_change",
+                "closed",
+                "expired",
+            }:
                 self.market_invalid.add(updated_event.market_id)
                 self._invalidate_polymarket_quotes(updated_event.market_id)
 

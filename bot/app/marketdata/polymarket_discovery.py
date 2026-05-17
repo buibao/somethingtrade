@@ -161,10 +161,14 @@ class PolymarketDiscoveryClient:
         *,
         write_cache: bool = True,
         now_ts: int | None = None,
+        rolling_lookahead_windows: int = 2,
     ) -> tuple[PolymarketMarketMetadata, ...]:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
         if self.enable_direct_slug_lookup:
-            rolling_markets = await self.discover_rolling_markets(now_ts=current_ts)
+            rolling_markets = await self.discover_rolling_markets(
+                now_ts=current_ts,
+                lookahead_windows=rolling_lookahead_windows,
+            )
             if rolling_markets:
                 rolling_markets = annotate_runtime_market_roles(
                     rolling_markets,
@@ -188,11 +192,13 @@ class PolymarketDiscoveryClient:
         self,
         *,
         now_ts: int | None = None,
+        lookahead_windows: int = 2,
     ) -> tuple[PolymarketMarketMetadata, ...]:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
         markets, _ = await self._discover_rolling_slug_candidates(
             now_ts=current_ts,
             include_raw=False,
+            lookahead_windows=lookahead_windows,
         )
         return annotate_runtime_market_roles(markets, now_ts=current_ts)
 
@@ -205,6 +211,7 @@ class PolymarketDiscoveryClient:
         markets, results = await self._discover_rolling_slug_candidates(
             now_ts=current_ts,
             include_raw=True,
+            lookahead_windows=2,
         )
         selected_keys = _market_keys(select_runtime_markets(markets, now_ts=current_ts))
         slugs = [str(result["slug"]) for result in results]
@@ -239,9 +246,13 @@ class PolymarketDiscoveryClient:
         *,
         now_ts: int | None,
         include_raw: bool,
+        lookahead_windows: int = 2,
     ) -> tuple[list[PolymarketMarketMetadata], list[dict[str, Any]]]:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
-        slugs = generate_crypto_updown_slugs(current_ts)
+        slugs = generate_crypto_updown_slugs(
+            current_ts,
+            lookahead_windows=max(1, lookahead_windows),
+        )
         markets: list[PolymarketMarketMetadata] = []
         results: list[dict[str, Any]] = []
         seen_market_keys: set[tuple[str, tuple[str, ...]]] = set()

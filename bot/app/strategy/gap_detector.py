@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Literal
 
-from app.core.clock import utc_now_ns
+from app.core.clock import monotonic_now_ns, utc_now_ns
 from app.core.events import (
     DataQualityTier,
     DepthUpdate,
@@ -83,6 +83,11 @@ class StaleDiagnostics:
     now_monotonic_ns: int | None = None
     last_binance_update_monotonic_ns: int | None = None
     last_polymarket_update_monotonic_ns: int | None = None
+    binance_local_received_ts_ns: int | None = None
+    polymarket_event_ts_ns: int | None = None
+    polymarket_local_received_ts_ns: int | None = None
+    state_updated_monotonic_ns: int | None = None
+    detector_processed_monotonic_ns: int | None = None
 
 
 @dataclass(slots=True)
@@ -175,7 +180,14 @@ class GapMonitorStats:
     pre_entry_rejects_by_symbol: dict[str, int] = field(default_factory=dict)
     window_rejects_by_symbol: dict[str, int] = field(default_factory=dict)
     timeout_rejects_by_symbol: dict[str, int] = field(default_factory=dict)
+    suppressed_candidates_by_symbol: dict[str, int] = field(default_factory=dict)
+    non_fillable_by_symbol: dict[str, int] = field(default_factory=dict)
     top_reject_reasons_by_symbol: dict[str, dict[str, int]] = field(default_factory=dict)
+    pending_observation_count: int = 0
+    pending_max_age_ms: float | None = None
+    max_pending_gap_ms: float = 0.0
+    candidate_duplicate_suppressed_count: int = 0
+    candidates_per_symbol_direction_per_minute: dict[str, int] = field(default_factory=dict)
 
     @property
     def detected_count(self) -> int:
@@ -257,7 +269,12 @@ class GapDetector:
         self._pre_entry_rejects_by_symbol: dict[str, int] = {}
         self._window_rejects_by_symbol: dict[str, int] = {}
         self._timeout_rejects_by_symbol: dict[str, int] = {}
+        self._suppressed_candidates_by_symbol: dict[str, int] = {}
+        self._non_fillable_by_symbol: dict[str, int] = {}
         self._reject_reasons_by_symbol: dict[str, dict[str, int]] = {}
+        self._market_update_observations: list[TradableGapObservation] = []
+        self._candidate_duplicate_suppressed_count = 0
+        self._candidates_per_symbol_direction_per_minute: dict[str, int] = {}
         self.detected_gaps = 0
         self.fillable_at_detection_count = 0
         self.non_fillable_at_detection_count = 0
@@ -404,13 +421,72 @@ class GapDetector:
             pre_entry_rejects_by_symbol=dict(self._pre_entry_rejects_by_symbol),
             window_rejects_by_symbol=dict(self._window_rejects_by_symbol),
             timeout_rejects_by_symbol=dict(self._timeout_rejects_by_symbol),
+            suppressed_candidates_by_symbol=dict(self._suppressed_candidates_by_symbol),
+            non_fillable_by_symbol=dict(self._non_fillable_by_symbol),
             top_reject_reasons_by_symbol={
                 symbol: dict(
                     sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:5]
                 )
                 for symbol, reasons in sorted(self._reject_reasons_by_symbol.items())
             },
+            pending_observation_count=len(self._pending),
+            pending_max_age_ms=self.pending_max_age_ms(now_monotonic_ns=monotonic_now_ns()),
+            max_pending_gap_ms=self.max_pending_gap_ms,
+            candidate_duplicate_suppressed_count=self._candidate_duplicate_suppressed_count,
+            candidates_per_symbol_direction_per_minute=dict(
+                self._candidates_per_symbol_direction_per_minute
+            ),
         )
+
+    def update_markets(self, markets: tuple[PolymarketMarketMetadata, ...]) -> None:
+        """Replace runtime markets while preserving still-active pending observations."""
+
+        now_ts = utc_now_ns()
+        now_mono = monotonic_now_ns()
+        active_by_id = {market.market_id: market for market in markets}
+        for key, pending in list(self._pending.items()):
+            replacement = active_by_id.get(pending.market.market_id)
+            if replacement is not None:
+                pending.market = replacement
+                continue
+            pending.first_non_tradable_ts_ns = pending.first_non_tradable_ts_ns or now_ts
+            pending.first_non_tradable_monotonic_ns = (
+                pending.first_non_tradable_monotonic_ns or now_mono
+            )
+            pending.window_end_reason = "market_expired"
+            pending.lifecycle_reason = "market_expired"
+            pending.close_reason = "market_expired"
+            pending.reject_stage = "lifecycle"
+            pending.stale_diagnostics = StaleDiagnostics(
+                stale_source="unknown",
+                now_monotonic_ns=now_mono,
+                detector_processed_monotonic_ns=now_mono,
+            )
+            self._market_update_observations.append(self._close_pending(key, pending))
+
+        self.markets = markets
+        self._markets_by_symbol = _markets_by_symbol(markets)
+        self._markets_by_token = _markets_by_token(markets)
+        self._tick_size_by_market = {
+            market.market_id: market.tick_size
+            for market in markets
+            if market.tick_size > 0.0
+        }
+        active_ids = set(active_by_id)
+        self._invalid_markets = {market_id for market_id in self._invalid_markets if market_id in active_ids}
+
+    def drain_market_update_observations(self) -> tuple[TradableGapObservation, ...]:
+        observations = tuple(self._market_update_observations)
+        self._market_update_observations.clear()
+        return observations
+
+    def pending_max_age_ms(self, *, now_monotonic_ns: int) -> float | None:
+        ages = [
+            _duration_ms(pending.first_detected_monotonic_ns, now_monotonic_ns)
+            for pending in self._pending.values()
+        ]
+        known = [age for age in ages if age is not None]
+        return max(known) if known else None
 
     def stale_feed_count(self, state: MarketState, *, now_ts: int | None = None) -> int:
         current_ts = now_ts or utc_now_ns()
@@ -497,6 +573,8 @@ class GapDetector:
                         token_id=token_id or "",
                         move_pct=move_pct,
                         now_ts=now_ts,
+                        now_monotonic_ns=now_monotonic_ns,
+                        state=state,
                         binance_event_ts=binance_event_ts,
                         quote=None,
                         reason="market_invalidated",
@@ -515,6 +593,8 @@ class GapDetector:
                         token_id="",
                         move_pct=move_pct,
                         now_ts=now_ts,
+                        now_monotonic_ns=now_monotonic_ns,
+                        state=state,
                         binance_event_ts=binance_event_ts,
                         quote=None,
                         reason="direction_token_unmapped",
@@ -525,6 +605,8 @@ class GapDetector:
 
             pending_key = (symbol, market.market_id, direction)
             if pending_key in self._pending:
+                self._candidate_duplicate_suppressed_count += 1
+                self._increment(self._suppressed_candidates_by_symbol, symbol)
                 continue
 
             quote = state.polymarket_quotes.get(token_id)
@@ -538,6 +620,8 @@ class GapDetector:
                         token_id=token_id,
                         move_pct=move_pct,
                         now_ts=now_ts,
+                        now_monotonic_ns=now_monotonic_ns,
+                        state=state,
                         binance_event_ts=binance_event_ts,
                         quote=None,
                         reason="missing_quote",
@@ -567,6 +651,8 @@ class GapDetector:
                         token_id=token_id,
                         move_pct=move_pct,
                         now_ts=now_ts,
+                        now_monotonic_ns=now_monotonic_ns,
+                        state=state,
                         binance_event_ts=binance_event_ts,
                         quote=quote,
                         reason="quote_stale",
@@ -587,6 +673,8 @@ class GapDetector:
                         token_id=token_id,
                         move_pct=move_pct,
                         now_ts=now_ts,
+                        now_monotonic_ns=now_monotonic_ns,
+                        state=state,
                         binance_event_ts=binance_event_ts,
                         quote=quote,
                         reason=reject_reason or "quote_not_fillable",
@@ -599,8 +687,19 @@ class GapDetector:
 
             quote_ts = _quote_timestamp(quote)
             quote_mono = _quote_monotonic(quote) or now_monotonic_ns
+            stale_diagnostics = self._stale_diagnostics(
+                symbol,
+                quote,
+                state,
+                now_ts=now_ts,
+                now_monotonic_ns=now_monotonic_ns,
+            )
             tick_size_at_detection = self._tick_size_for_market(market)
             spread_at_detection = _spread(quote.best_bid, quote.best_ask)
+            self._increment(
+                self._candidates_per_symbol_direction_per_minute,
+                f"{symbol}:{direction}:{now_ts // 60_000_000_000}",
+            )
             self._pending[pending_key] = PendingTradableGap(
                 symbol=symbol,
                 market=market,
@@ -656,6 +755,7 @@ class GapDetector:
                     quote.token_quote_complete_rate
                     or book_gate.token_quote_complete_rate
                 ),
+                stale_diagnostics=stale_diagnostics,
             )
             self.fillable_at_detection_count += 1
 
@@ -677,6 +777,13 @@ class GapDetector:
             quote_ts = _quote_timestamp(quote) or now_ts
             quote_mono = _quote_monotonic(quote) or now_monotonic_ns
             self._copy_current_quote(pending, quote, quote_ts=quote_ts, quote_mono=quote_mono)
+            pending.stale_diagnostics = self._stale_diagnostics(
+                pending.symbol,
+                quote,
+                state,
+                now_ts=now_ts,
+                now_monotonic_ns=now_monotonic_ns,
+            )
             self._mark_mid_repricing(pending, quote, quote_ts=quote_ts, quote_mono=quote_mono)
 
             timeout_reason = self._timeout_reason(pending, now_monotonic_ns=quote_mono)
@@ -770,6 +877,13 @@ class GapDetector:
                     quote_ts=_quote_timestamp(quote) or close_ts,
                     quote_mono=_quote_monotonic(quote) or close_mono,
                 )
+                pending.stale_diagnostics = self._stale_diagnostics(
+                    pending.symbol,
+                    quote,
+                    state,
+                    now_ts=now_ts,
+                    now_monotonic_ns=now_monotonic_ns,
+                )
             pending.first_non_tradable_ts_ns = pending.first_non_tradable_ts_ns or close_ts
             pending.first_non_tradable_monotonic_ns = (
                 pending.first_non_tradable_monotonic_ns or close_mono
@@ -801,6 +915,13 @@ class GapDetector:
                     quote_ts=_quote_timestamp(quote) or now_ts,
                     quote_mono=_quote_monotonic(quote) or now_monotonic_ns,
                 )
+            pending.stale_diagnostics = self._stale_diagnostics(
+                pending.symbol,
+                quote,
+                state,
+                now_ts=now_ts,
+                now_monotonic_ns=now_monotonic_ns,
+            )
             pending.timeout_reason = timeout_reason
             pending.close_reason = timeout_reason
             pending.reject_stage = "timeout"
@@ -1050,6 +1171,19 @@ class GapDetector:
             last_polymarket_update_monotonic_ns=(
                 pending.stale_diagnostics.last_polymarket_update_monotonic_ns
             ),
+            binance_local_received_ts_ns=(
+                pending.stale_diagnostics.binance_local_received_ts_ns
+            ),
+            polymarket_event_ts_ns=pending.stale_diagnostics.polymarket_event_ts_ns,
+            polymarket_local_received_ts_ns=(
+                pending.stale_diagnostics.polymarket_local_received_ts_ns
+            ),
+            state_updated_monotonic_ns=(
+                pending.stale_diagnostics.state_updated_monotonic_ns
+            ),
+            detector_processed_monotonic_ns=(
+                pending.stale_diagnostics.detector_processed_monotonic_ns
+            ),
             validation_mode=pending.validation_mode,
             validation_tolerance_ticks=pending.validation_tolerance_ticks,
             market_mismatch_rate_at_detection=pending.market_mismatch_rate_at_detection,
@@ -1118,6 +1252,8 @@ class GapDetector:
         token_id: str,
         move_pct: float,
         now_ts: int,
+        now_monotonic_ns: int,
+        state: MarketState,
         binance_event_ts: int | None,
         quote: PolymarketQuote | None,
         reason: str,
@@ -1187,7 +1323,13 @@ class GapDetector:
             best_bid_size=quote.best_bid_size if quote is not None else None,
             tick_size=tick_size,
         )
-        stale = stale_diagnostics or StaleDiagnostics()
+        stale = stale_diagnostics or self._stale_diagnostics(
+            symbol,
+            quote,
+            state,
+            now_ts=now_ts,
+            now_monotonic_ns=now_monotonic_ns,
+        )
         return TradableGapObservation(
             symbol=symbol,
             market_id=market.market_id,
@@ -1242,6 +1384,11 @@ class GapDetector:
             now_monotonic_ns=stale.now_monotonic_ns,
             last_binance_update_monotonic_ns=stale.last_binance_update_monotonic_ns,
             last_polymarket_update_monotonic_ns=stale.last_polymarket_update_monotonic_ns,
+            binance_local_received_ts_ns=stale.binance_local_received_ts_ns,
+            polymarket_event_ts_ns=stale.polymarket_event_ts_ns,
+            polymarket_local_received_ts_ns=stale.polymarket_local_received_ts_ns,
+            state_updated_monotonic_ns=stale.state_updated_monotonic_ns,
+            detector_processed_monotonic_ns=stale.detector_processed_monotonic_ns,
             validation_mode=self.validation_mode,
             validation_tolerance_ticks=self.validation_tolerance_ticks,
             market_mismatch_rate_at_detection=market_mismatch_rate,
@@ -1269,6 +1416,7 @@ class GapDetector:
         observation: TradableGapObservation,
     ) -> TradableGapObservation | None:
         self.non_fillable_at_detection_count += 1
+        self._increment(self._non_fillable_by_symbol, observation.symbol)
         cooldown_key = (
             observation.symbol,
             observation.market_id,
@@ -1280,6 +1428,7 @@ class GapDetector:
             elapsed_ms = _duration_ms(last_logged_ns, observation.detected_ts_ns)
             if elapsed_ms is not None and elapsed_ms < self.pre_entry_log_cooldown_ms:
                 self.pre_entry_observations_suppressed += 1
+                self._increment(self._suppressed_candidates_by_symbol, observation.symbol)
                 return None
 
         self._last_pre_entry_log_ns[cooldown_key] = observation.detected_ts_ns
@@ -1433,35 +1582,55 @@ class GapDetector:
     def _stale_diagnostics(
         self,
         symbol: str,
-        quote: PolymarketQuote,
+        quote: PolymarketQuote | None,
         state: MarketState,
         *,
         now_ts: int,
         now_monotonic_ns: int,
     ) -> StaleDiagnostics:
-        if now_monotonic_ns == now_ts:
-            return StaleDiagnostics(
-                stale_source="unknown",
-                now_monotonic_ns=None,
-            )
         symbol_state = state.symbols.get(symbol)
         last_binance_mono = None if symbol_state is None else (
             symbol_state.recv_monotonic_ns
             or symbol_state.parse_done_monotonic_ns
-            or symbol_state.state_updated_monotonic_ns
         )
-        last_poly_mono = (
+        last_poly_mono = None if quote is None else (
             quote.recv_monotonic_ns
             or quote.parse_done_monotonic_ns
-            or quote.state_updated_monotonic_ns
         )
-        binance_age_ms = _duration_ms(last_binance_mono, now_monotonic_ns)
-        poly_age_ms = _duration_ms(last_poly_mono, now_monotonic_ns)
-        if binance_age_ms is None or poly_age_ms is None:
+        binance_age_ms = (
+            _duration_ms(last_binance_mono, now_monotonic_ns)
+            if last_binance_mono is not None
+            else _duration_ms(
+                None if symbol_state is None else symbol_state.local_receive_timestamp,
+                now_ts,
+            )
+        )
+        poly_age_ms = (
+            _duration_ms(last_poly_mono, now_monotonic_ns)
+            if last_poly_mono is not None
+            else _duration_ms(_quote_timestamp(quote), now_ts)
+            if quote is not None
+            else None
+        )
+        has_quote_monotonic = quote is not None and (
+            quote.recv_monotonic_ns is not None
+            or quote.parse_done_monotonic_ns is not None
+        )
+        has_binance_monotonic = last_binance_mono is not None
+        if (
+            quote is not None
+            and quote.book_stale
+            and not has_quote_monotonic
+            and not has_binance_monotonic
+        ):
+            source = "unknown"
+        elif binance_age_ms is None or poly_age_ms is None:
             source: StaleSource = "unknown"
         else:
             binance_stale = binance_age_ms > self.binance_stale_ms
-            poly_stale = poly_age_ms > self.polymarket_stale_ms or quote.book_stale
+            poly_stale = poly_age_ms > self.polymarket_stale_ms or (
+                quote.book_stale if quote is not None else False
+            )
             if binance_stale and poly_stale:
                 source = "both"
             elif binance_stale:
@@ -1477,6 +1646,19 @@ class GapDetector:
             now_monotonic_ns=now_monotonic_ns,
             last_binance_update_monotonic_ns=last_binance_mono,
             last_polymarket_update_monotonic_ns=last_poly_mono,
+            binance_local_received_ts_ns=(
+                None if symbol_state is None else symbol_state.local_receive_timestamp
+            ),
+            polymarket_event_ts_ns=None if quote is None else quote.exchange_event_ts or quote.event_ts,
+            polymarket_local_received_ts_ns=None if quote is None else quote.local_received_ts,
+            state_updated_monotonic_ns=(
+                None
+                if quote is None
+                else quote.state_updated_monotonic_ns
+                or quote.parse_done_monotonic_ns
+                or quote.recv_monotonic_ns
+            ),
+            detector_processed_monotonic_ns=now_monotonic_ns,
         )
 
     def _record_reject(self, reason: str, stage: RejectStage) -> None:

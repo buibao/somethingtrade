@@ -367,7 +367,7 @@ def test_polymarket_market_resolved_lifecycle_invalidates_book() -> None:
     assert quote.book_complete is False
 
 
-def test_market_state_rejects_stale_polymarket_quote() -> None:
+def test_market_state_marks_stale_polymarket_quote_observable() -> None:
     state = MarketState(max_polymarket_quote_age_ms=1.0)
     stale = PolymarketQuote(
         market_id="0xmarket",
@@ -390,8 +390,12 @@ def test_market_state_rejects_stale_polymarket_quote() -> None:
         }
     )
 
-    assert state.apply(stale) is None
-    assert "yes-token" not in state.polymarket_quotes
+    updated_stale = state.apply(stale)
+    assert isinstance(updated_stale, PolymarketQuote)
+    assert updated_stale.book_stale is True
+    assert updated_stale.book_complete is False
+    assert updated_stale.validation_error == "quote_stale"
+    assert state.polymarket_quotes["yes-token"].book_stale is True
 
     updated = state.apply(fresh)
     assert isinstance(updated, PolymarketQuote)

@@ -71,7 +71,13 @@ type PolymarketSideLabel = Literal[
     "UNKNOWN",
 ]
 type GapDirection = Literal["UP", "DOWN"]
-type MarketLifecycleType = Literal["tick_size_change", "market_resolved", "new_market"]
+type MarketLifecycleType = Literal[
+    "tick_size_change",
+    "market_resolved",
+    "new_market",
+    "closed",
+    "expired",
+]
 type RejectStage = Literal["pre_entry", "window", "exit", "lifecycle", "timeout", "none"]
 type StaleSource = Literal["binance", "polymarket", "both", "unknown"]
 type ValidationMode = Literal["strict", "tolerant", "diagnostic"]
@@ -322,6 +328,11 @@ class TradableGapObservation(EventModel):
     now_monotonic_ns: int | None = None
     last_binance_update_monotonic_ns: int | None = None
     last_polymarket_update_monotonic_ns: int | None = None
+    binance_local_received_ts_ns: int | None = None
+    polymarket_event_ts_ns: int | None = None
+    polymarket_local_received_ts_ns: int | None = None
+    state_updated_monotonic_ns: int | None = None
+    detector_processed_monotonic_ns: int | None = None
     validation_mode: ValidationMode | None = None
     validation_tolerance_ticks: int | None = None
     market_mismatch_rate_at_detection: float | None = None

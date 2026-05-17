@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -21,6 +22,11 @@ SAMPLE_VALIDATION_ERRORS = {
     "best_bid_size_unknown",
     "best_ask_size_unknown",
     "missing_snapshot",
+    "price_change_before_snapshot",
+    "best_bid_ask_before_snapshot",
+    "book_structurally_incomplete",
+    "crossed_book",
+    "empty_book",
 }
 
 
@@ -67,6 +73,7 @@ class _TokenBookReadiness:
     book_complete_true_count: int = 0
     book_complete_false_count: int = 0
     validation_error_count_by_reason: dict[str, int] = field(default_factory=dict)
+    validation_error_count_by_update_type: dict[str, int] = field(default_factory=dict)
     quote_stale_count: int = 0
     price_change_before_snapshot_count: int = 0
     best_bid_ask_before_snapshot_count: int = 0
@@ -85,6 +92,9 @@ class _TokenBookReadiness:
             "book_complete_true_count": self.book_complete_true_count,
             "book_complete_false_count": self.book_complete_false_count,
             "validation_error_count_by_reason": dict(self.validation_error_count_by_reason),
+            "validation_error_count_by_update_type": dict(
+                self.validation_error_count_by_update_type
+            ),
             "quote_stale_count": self.quote_stale_count,
             "price_change_before_snapshot_count": self.price_change_before_snapshot_count,
             "best_bid_ask_before_snapshot_count": self.best_bid_ask_before_snapshot_count,
@@ -107,6 +117,7 @@ class PolymarketLocalOrderBook:
         best_validation_tolerance_ticks: int = 1,
         mismatch_sample_path: Path | str | None = "data/debug/polymarket_orderbook_mismatch_samples.jsonl",
         mismatch_sample_per_token_per_min: int = 20,
+        mismatch_degraded_threshold: float = 0.05,
     ) -> None:
         self.token_metadata = token_metadata
         self.stale_after_ms = stale_after_ms
@@ -114,8 +125,11 @@ class PolymarketLocalOrderBook:
         self.best_validation_tolerance_ticks = best_validation_tolerance_ticks
         self.mismatch_sample_path = None if mismatch_sample_path is None else Path(mismatch_sample_path)
         self.mismatch_sample_per_token_per_min = mismatch_sample_per_token_per_min
+        self.mismatch_degraded_threshold = mismatch_degraded_threshold
         self._sample_counts: dict[tuple[str, int], int] = {}
         self._books: dict[str, _TokenBook] = {}
+        self._mismatch_tick_diffs: list[float] = []
+        self._mismatch_by_update_type: dict[str, int] = {}
         self._readiness: dict[str, _TokenBookReadiness] = {
             token_id: _TokenBookReadiness(
                 token_id=token_id,
@@ -124,6 +138,27 @@ class PolymarketLocalOrderBook:
             for token_id, metadata in token_metadata.items()
         }
         self._market_invalid: set[str] = set()
+
+    def update_token_metadata(
+        self,
+        token_metadata: dict[str, TokenBookMetadata],
+        *,
+        active_token_ids: Iterable[str],
+    ) -> None:
+        active = set(active_token_ids)
+        self.token_metadata = {
+            token_id: metadata
+            for token_id, metadata in token_metadata.items()
+            if token_id in active
+        }
+        for token_id, metadata in self.token_metadata.items():
+            self._readiness.setdefault(
+                token_id,
+                _TokenBookReadiness(token_id=token_id, market_id=metadata.market_id),
+            )
+            book = self._books.get(token_id)
+            if book is not None:
+                book.metadata = metadata
 
     def apply_book(
         self,
@@ -332,6 +367,7 @@ class PolymarketLocalOrderBook:
         market_rows: list[dict[str, Any]] = []
         validation_errors: dict[str, int] = {}
         validation_error_count_by_token: dict[str, dict[str, int]] = {}
+        validation_error_count_by_update_type: dict[str, int] = {}
         quote_stale_count_by_token: dict[str, int] = {}
         mismatch_rate_by_token: dict[str, float] = {}
         quote_complete_rate_by_token: dict[str, float] = {}
@@ -359,6 +395,13 @@ class PolymarketLocalOrderBook:
             )
             for reason, count in reason_counts.items():
                 validation_errors[reason] = validation_errors.get(reason, 0) + int(count)
+            update_counts = readiness.get("validation_error_count_by_update_type", {})
+            if isinstance(update_counts, dict):
+                for update_type, count in update_counts.items():
+                    if isinstance(update_type, str) and isinstance(count, int):
+                        validation_error_count_by_update_type[update_type] = (
+                            validation_error_count_by_update_type.get(update_type, 0) + count
+                        )
 
         validation_error_count_by_market: dict[str, dict[str, int]] = {}
         quote_stale_count_by_market: dict[str, int] = {}
@@ -447,6 +490,31 @@ class PolymarketLocalOrderBook:
             for row in market_rows
             if row["time_to_first_complete_quote_ms"] is not None
         ]
+        tick_diff_distribution = dict(
+            sorted(Counter(_tick_diff_bucket(value) for value in self._mismatch_tick_diffs).items())
+        )
+        pct_within_1_tick = _rate(
+            sum(1 for value in self._mismatch_tick_diffs if value <= 1),
+            len(self._mismatch_tick_diffs),
+        )
+        pct_above_2_ticks = _rate(
+            sum(1 for value in self._mismatch_tick_diffs if value > 2),
+            len(self._mismatch_tick_diffs),
+        )
+        degraded_tokens = tuple(
+            sorted(
+                token_id
+                for token_id, rate in mismatch_rate_by_token.items()
+                if rate > self.mismatch_degraded_threshold
+            )
+        )
+        degraded_markets = tuple(
+            sorted(
+                market_id
+                for market_id, rate in mismatch_rate_by_market.items()
+                if rate > self.mismatch_degraded_threshold
+            )
+        )
         return {
             "generated_ts_ns": now_ts,
             "tokens": token_stats,
@@ -461,7 +529,9 @@ class PolymarketLocalOrderBook:
                 "warmup_only_markets": sum(
                     1
                     for market, row in zip(markets, market_rows, strict=True)
-                    if market.selected_for_runtime and not row["signal_enabled_at_now"]
+                    if market.selected_for_runtime
+                    and not row["signal_enabled_at_now"]
+                    and row["classification_at_now"] == "next"
                 ),
                 "complete_markets": sum(1 for row in market_rows if row["both_tokens_complete"]),
                 "incomplete_markets": sum(
@@ -477,6 +547,33 @@ class PolymarketLocalOrderBook:
                 ),
                 "validation_error_count_by_market": validation_error_count_by_market,
                 "validation_error_count_by_token": validation_error_count_by_token,
+                "validation_error_count_by_update_type": validation_error_count_by_update_type,
+                "reported_best_bid_mismatch": int(validation_errors.get("reported_best_bid_mismatch", 0)),
+                "reported_best_ask_mismatch": int(validation_errors.get("reported_best_ask_mismatch", 0)),
+                "best_bid_size_unknown": int(validation_errors.get("best_bid_size_unknown", 0)),
+                "best_ask_size_unknown": int(validation_errors.get("best_ask_size_unknown", 0)),
+                "missing_snapshot": int(validation_errors.get("missing_snapshot", 0)),
+                "price_change_before_snapshot": sum(
+                    int(stats.get("price_change_before_snapshot_count", 0))
+                    for stats in token_stats.values()
+                ),
+                "best_bid_ask_before_snapshot": sum(
+                    int(stats.get("best_bid_ask_before_snapshot_count", 0))
+                    for stats in token_stats.values()
+                ),
+                "book_structurally_incomplete": int(
+                    validation_errors.get("book_structurally_incomplete", 0)
+                ),
+                "crossed_book": int(validation_errors.get("crossed_book", 0)),
+                "empty_book": int(validation_errors.get("empty_book", 0)),
+                "mismatch_by_token": mismatch_rate_by_token,
+                "mismatch_by_market": mismatch_rate_by_market,
+                "mismatch_by_update_type": dict(sorted(self._mismatch_by_update_type.items())),
+                "tick_diff_distribution": tick_diff_distribution,
+                "pct_within_1_tick": pct_within_1_tick,
+                "pct_above_2_ticks": pct_above_2_ticks,
+                "degraded_tokens": degraded_tokens,
+                "degraded_markets": degraded_markets,
                 "mismatch_rate_by_market": mismatch_rate_by_market,
                 "mismatch_rate_by_token": mismatch_rate_by_token,
                 "quote_complete_rate_by_market": quote_complete_rate_by_market,
@@ -538,6 +635,14 @@ class PolymarketLocalOrderBook:
         best_ask = book.best_ask_override if book.best_ask_override is not None else local_ask
         best_bid_size = None if book.best_bid_override is not None else local_bid_size
         best_ask_size = None if book.best_ask_override is not None else local_ask_size
+        structural_error = _structural_validation_error(
+            has_snapshot=book.has_snapshot,
+            local_bid=local_bid,
+            local_ask=local_ask,
+            local_bid_size=local_bid_size,
+            local_ask_size=local_ask_size,
+        )
+        validation_error = book.validation_error or structural_error
         mid = None if best_bid is None or best_ask is None else (best_bid + best_ask) / 2.0
         spread = None if best_bid is None or best_ask is None else max(0.0, best_ask - best_bid)
         stale = self._is_stale(book, now_ts=received_ts)
@@ -552,6 +657,7 @@ class PolymarketLocalOrderBook:
             and local_ask is not None
             and local_bid_size is not None
             and local_ask_size is not None
+            and local_bid < local_ask
         )
         incomplete = book.incomplete or book.invalid or not structurally_complete
 
@@ -579,7 +685,7 @@ class PolymarketLocalOrderBook:
             book_complete=not incomplete,
             book_stale=stale,
             book_hash=book.last_hash,
-            validation_error=book.validation_error,
+            validation_error=validation_error,
             book_update_type=update_type,  # type: ignore[arg-type]
             book_has_snapshot=book.has_snapshot,
             book_structurally_complete=structurally_complete,
@@ -612,8 +718,18 @@ class PolymarketLocalOrderBook:
             readiness.delta_count += 1
             if before_snapshot:
                 readiness.price_change_before_snapshot_count += 1
+                self._increment_readiness_error(
+                    readiness,
+                    "price_change_before_snapshot",
+                    update_type,
+                )
         elif update_type == "best_bid_ask" and before_snapshot:
             readiness.best_bid_ask_before_snapshot_count += 1
+            self._increment_readiness_error(
+                readiness,
+                "best_bid_ask_before_snapshot",
+                update_type,
+            )
 
         if quote.book_complete:
             readiness.book_complete_true_count += 1
@@ -626,9 +742,20 @@ class PolymarketLocalOrderBook:
 
         if quote.validation_error is not None:
             readiness.last_validation_error = quote.validation_error
-            readiness.validation_error_count_by_reason[quote.validation_error] = (
-                readiness.validation_error_count_by_reason.get(quote.validation_error, 0) + 1
-            )
+            self._increment_readiness_error(readiness, quote.validation_error, update_type)
+
+    def _increment_readiness_error(
+        self,
+        readiness: _TokenBookReadiness,
+        reason: str,
+        update_type: str,
+    ) -> None:
+        readiness.validation_error_count_by_reason[reason] = (
+            readiness.validation_error_count_by_reason.get(reason, 0) + 1
+        )
+        readiness.validation_error_count_by_update_type[update_type] = (
+            readiness.validation_error_count_by_update_type.get(update_type, 0) + 1
+        )
 
     def _readiness_for(self, token_id: str, market_id: str) -> _TokenBookReadiness:
         if token_id not in self._readiness:
@@ -746,6 +873,10 @@ class PolymarketLocalOrderBook:
 
         reason = f"reported_best_{side}_mismatch"
         book.validation_error = reason
+        tick_diff = abs(local - reported) / book.metadata.tick_size if book.metadata.tick_size > 0 else None
+        if tick_diff is not None:
+            self._mismatch_tick_diffs.append(tick_diff)
+        self._mismatch_by_update_type[update_type] = self._mismatch_by_update_type.get(update_type, 0) + 1
         within_tolerance = self._within_best_tolerance(local, reported, book.metadata.tick_size)
         if self.best_validation_mode == "diagnostic":
             book.reported_best_validation_ok = False
@@ -790,6 +921,23 @@ class PolymarketLocalOrderBook:
 
         local_bid, local_bid_size = _best_bid(book.bids)
         local_ask, local_ask_size = _best_ask(book.asks)
+        reported_bid = _optional_float(payload.get("best_bid"))
+        reported_ask = _optional_float(payload.get("best_ask"))
+        bid_tick_diff = (
+            abs(local_bid - reported_bid) / book.metadata.tick_size
+            if local_bid is not None
+            and reported_bid is not None
+            and book.metadata.tick_size > 0
+            else None
+        )
+        ask_tick_diff = (
+            abs(local_ask - reported_ask) / book.metadata.tick_size
+            if local_ask is not None
+            and reported_ask is not None
+            and book.metadata.tick_size > 0
+            else None
+        )
+        tick_diffs = [value for value in (bid_tick_diff, ask_tick_diff) if value is not None]
         sample = {
             "market_id": book.metadata.market_id,
             "market_slug": book.metadata.market_slug,
@@ -802,10 +950,15 @@ class PolymarketLocalOrderBook:
             "local_best_ask": local_ask,
             "local_best_bid_size": local_bid_size,
             "local_best_ask_size": local_ask_size,
-            "reported_best_bid": _optional_float(payload.get("best_bid")),
-            "reported_best_ask": _optional_float(payload.get("best_ask")),
+            "reported_best_bid": reported_bid,
+            "reported_best_ask": reported_ask,
             "reported_best_bid_size": _optional_float(payload.get("best_bid_size")),
             "reported_best_ask_size": _optional_float(payload.get("best_ask_size")),
+            "tick_size": book.metadata.tick_size,
+            "bid_tick_diff": bid_tick_diff,
+            "ask_tick_diff": ask_tick_diff,
+            "tick_diff": max(tick_diffs) if tick_diffs else None,
+            "error_type": book.validation_error,
             "payload_hash": payload.get("hash"),
             "last_snapshot_hash": book.last_snapshot_hash,
             "last_book_hash": book.last_book_hash,
@@ -986,3 +1139,39 @@ def _last_validation_error(
     if isinstance(down_error, str):
         return down_error
     return up_error if isinstance(up_error, str) else None
+
+
+def _structural_validation_error(
+    *,
+    has_snapshot: bool,
+    local_bid: float | None,
+    local_ask: float | None,
+    local_bid_size: float | None,
+    local_ask_size: float | None,
+) -> str | None:
+    if not has_snapshot:
+        return None
+    if local_bid is None and local_ask is None:
+        return "empty_book"
+    if local_bid is not None and local_ask is not None and local_bid >= local_ask:
+        return "crossed_book"
+    if (
+        local_bid is None
+        or local_ask is None
+        or local_bid_size is None
+        or local_ask_size is None
+    ):
+        return "book_structurally_incomplete"
+    return None
+
+
+def _tick_diff_bucket(value: float) -> str:
+    if value <= 1:
+        return "<=1"
+    if value <= 2:
+        return "<=2"
+    return ">2"
+
+
+def _rate(numerator: int, denominator: int) -> float:
+    return 0.0 if denominator <= 0 else numerator / denominator
