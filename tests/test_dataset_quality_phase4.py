@@ -289,6 +289,65 @@ def test_phase4_markdown_contains_non_goals(tmp_path: Path) -> None:
     assert "no wallet copy trading or on-chain wallet logic was added" in markdown
 
 
+def test_phase4_staleness_unknown_when_quote_age_fields_missing(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    row = _base_row(1)
+    row.pop("stale_source")
+    row.pop("binance_quote_age_ms")
+    row.pop("polymarket_quote_age_ms")
+    _write_rows(path, [row])
+
+    report = build_phase4_dataset_quality_report(path)
+    stale = report["stale_feed_analysis"]
+
+    assert stale["staleness_status"] == "unknown_missing_quote_age_fields"
+    assert stale["quote_stale_rate"] is None
+    assert "quote_age_fields_missing" in report["warnings"]
+
+
+def test_phase4_readiness_warns_when_quote_age_fields_missing(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    row = _base_row(1)
+    row.pop("stale_source")
+    row.pop("binance_quote_age_ms")
+    row.pop("polymarket_quote_age_ms")
+    _write_rows(path, [row])
+
+    report = build_phase4_dataset_quality_report(path)
+    checks = {
+        check["check_name"]: check
+        for check in report["readiness_assessment"]["checks"]
+    }
+
+    assert checks["quote_stale_rate"]["status"] == "WARN"
+    assert checks["quote_age_fields_missing"]["status"] == "WARN"
+    assert "quote_age_fields_missing" in report["readiness_assessment"]["non_blocking_warnings"]
+
+
+def test_phase4_markdown_says_empirical_buckets_use_primary_rows(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write_rows(path, [_base_row(1, tier="A"), _base_row(2, tier="B"), _base_row(3, tier="C")])
+
+    report = build_phase4_dataset_quality_report(path, primary_min_tier="B")
+    markdown = render_phase4_markdown_report(report)
+
+    assert "empirical buckets are computed on primary rows only" in markdown
+    assert "For `--primary-min-tier B`, primary rows are A/B" in markdown
+
+
+def test_phase4_warns_when_tolerated_rows_need_mismatch_samples(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    _write_rows(path, [_base_row(1, tier="B", mode="tolerant")])
+
+    report = build_phase4_dataset_quality_report(path)
+    tick = report["tick_calibration_analysis"]
+
+    assert tick["tolerated_mismatch_row_count"] == 1
+    assert tick["mismatch_sample_status"] == "skipped_missing_mismatch_sample_input"
+    assert "tolerated_mismatch_rows_without_mismatch_samples" in tick["warning_flags"]
+    assert "tolerated_mismatch_rows_without_mismatch_samples" in report["warnings"]
+
+
 def test_phase4_csv_outputs_are_written(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     csv_dir = tmp_path / "csv"

@@ -239,6 +239,7 @@ def build_phase4_dataset_quality_report(
         dataset_health=dataset_health,
         timing_analysis=timing_analysis,
         stale_feed_analysis=stale_feed_analysis,
+        tick_calibration_analysis=tick_calibration_analysis,
         empirical_bucket_analysis=empirical_bucket_analysis,
         cohort_sensitivity=cohort_sensitivity,
     )
@@ -520,6 +521,7 @@ def render_phase4_markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 10. Stale Feed Analysis",
         "",
+        f"- Staleness status: {report['stale_feed_analysis']['staleness_status']}",
         f"- Stale source distribution: `{json.dumps(report['stale_feed_analysis']['stale_source_distribution'], sort_keys=True)}`",
         f"- Quote stale rate: {_format_rate(report['stale_feed_analysis']['quote_stale_rate'])}",
         f"- Binance stale rate: {_format_rate(report['stale_feed_analysis']['binance_stale_rate'])}",
@@ -531,9 +533,11 @@ def render_phase4_markdown_report(report: dict[str, Any]) -> str:
         f"- Tick size distribution: `{json.dumps(report['tick_calibration_analysis']['tick_size_distribution'], sort_keys=True)}`",
         f"- Tolerated mismatch row count: {report['tick_calibration_analysis']['tolerated_mismatch_row_count']}",
         f"- Mismatch sample status: {report['tick_calibration_analysis']['mismatch_sample_status']}",
+        f"- Warnings: {', '.join(report['tick_calibration_analysis'].get('warning_flags', [])) or '-'}",
         "",
         "## 12. Empirical Bucket Analysis",
         "",
+        _primary_bucket_markdown_note(report),
         "These buckets are descriptive historical measurements only; they are not forecasts, model outputs, or execution signals.",
         "",
         _markdown_empirical_bucket_table(report),
@@ -1056,13 +1060,40 @@ def _build_stale_feed_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         or _is_number(row.get("polymarket_quote_age_ms"))
         for row in rows
     )
+    stale_source_unknown_for_all_rows = total > 0 and all(
+        _stale_source_is_unknown(row.get("stale_source")) for row in rows
+    )
+    quote_age_fields_missing = not has_quote_age_fields
+    staleness_status = (
+        "unknown_missing_quote_age_fields"
+        if stale_source_unknown_for_all_rows and quote_age_fields_missing
+        else "measured_from_stale_source_or_reject_reason"
+    )
+    quote_stale_rate: float | None = (
+        None if staleness_status == "unknown_missing_quote_age_fields" else _rate(quote_stale_count, total)
+    )
+    binance_stale_rate: float | None = (
+        None if staleness_status == "unknown_missing_quote_age_fields" else _rate(binance_stale_count, total)
+    )
+    polymarket_stale_rate: float | None = (
+        None if staleness_status == "unknown_missing_quote_age_fields" else _rate(polymarket_stale_count, total)
+    )
+    both_stale_rate: float | None = (
+        None if staleness_status == "unknown_missing_quote_age_fields" else _rate(both_stale_count, total)
+    )
+    unknown_stale_rate: float | None = (
+        None if staleness_status == "unknown_missing_quote_age_fields" else _rate(unknown_stale_count, total)
+    )
     return {
+        "staleness_status": staleness_status,
+        "quote_age_fields_missing": quote_age_fields_missing,
+        "stale_source_unknown_for_all_rows": stale_source_unknown_for_all_rows,
         "stale_source_distribution": stale_source_distribution,
-        "quote_stale_rate": _rate(quote_stale_count, total),
-        "binance_stale_rate": _rate(binance_stale_count, total),
-        "polymarket_stale_rate": _rate(polymarket_stale_count, total),
-        "both_stale_rate": _rate(both_stale_count, total),
-        "unknown_stale_rate": _rate(unknown_stale_count, total),
+        "quote_stale_rate": quote_stale_rate,
+        "binance_stale_rate": binance_stale_rate,
+        "polymarket_stale_rate": polymarket_stale_rate,
+        "both_stale_rate": both_stale_rate,
+        "unknown_stale_rate": unknown_stale_rate,
         "quote_stale_count": quote_stale_count,
         "binance_stale_count": binance_stale_count,
         "polymarket_stale_count": polymarket_stale_count,
@@ -1072,7 +1103,7 @@ def _build_stale_feed_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "binance_quote_age_ms": _metric_summary(rows, "binance_quote_age_ms"),
             "polymarket_quote_age_ms": _metric_summary(rows, "polymarket_quote_age_ms"),
         },
-        "timestamp_basis": "quote_age_fields" if has_quote_age_fields else "unknown_missing_monotonic_timestamp_fields",
+        "timestamp_basis": "quote_age_fields" if has_quote_age_fields else "unknown_missing_quote_age_fields",
     }
 
 
@@ -1104,15 +1135,18 @@ def _build_tick_calibration_analysis(
     }
     if mismatch_samples_path is None:
         analysis["mismatch_sample_status"] = "skipped_missing_mismatch_sample_input"
+        _add_missing_mismatch_sample_warning(analysis)
         return analysis
 
     sample_path = Path(mismatch_samples_path)
     if not sample_path.exists():
         analysis["mismatch_sample_status"] = "skipped_missing_mismatch_sample_input"
         analysis["mismatch_sample_path"] = str(sample_path)
+        _add_missing_mismatch_sample_warning(analysis)
         return analysis
 
     analysis.update(_analyze_mismatch_samples(sample_path))
+    analysis["warning_flags"] = []
     return analysis
 
 
@@ -1254,6 +1288,7 @@ def _build_warnings(
     dataset_health: dict[str, Any],
     timing_analysis: dict[str, Any],
     stale_feed_analysis: dict[str, Any],
+    tick_calibration_analysis: dict[str, Any],
     empirical_bucket_analysis: dict[str, Any],
     cohort_sensitivity: dict[str, Any],
 ) -> list[str]:
@@ -1270,8 +1305,12 @@ def _build_warnings(
     tier_d_rate = _rate(int(tier_counts.get("D", 0)), dataset_health["included_rows"])
     if tier_d_rate > MAX_TIER_D_RATE:
         warnings.append("tier_d_rate_above_threshold")
-    if stale_feed_analysis["quote_stale_rate"] > MAX_QUOTE_STALE_RATE:
+    quote_stale_rate = stale_feed_analysis["quote_stale_rate"]
+    if _is_number(quote_stale_rate) and quote_stale_rate > MAX_QUOTE_STALE_RATE:
         warnings.append("quote_stale_rate_above_threshold")
+    if stale_feed_analysis["quote_age_fields_missing"]:
+        warnings.append("quote_age_fields_missing")
+    warnings.extend(str(flag) for flag in tick_calibration_analysis.get("warning_flags", []))
     book_incomplete_rate = _rate(
         int(dataset_health["rows_by_reject_reason"].get("book_incomplete", 0)),
         dataset_health["included_rows"],
@@ -1366,7 +1405,7 @@ def _build_readiness_assessment(
         reasons.append("measured executable repricing success rows are below threshold")
     elif (
         tier_d_rate > MAX_TIER_D_RATE
-        or stale_feed_analysis["quote_stale_rate"] > MAX_QUOTE_STALE_RATE
+        or _rate_exceeds(stale_feed_analysis["quote_stale_rate"], MAX_QUOTE_STALE_RATE)
         or book_incomplete_rate > MAX_BOOK_INCOMPLETE_RATE
         or cohort_sensitivity["conclusion"] == "unstable"
     ):
@@ -1379,7 +1418,7 @@ def _build_readiness_assessment(
         primary_rows >= STRONG_PRIMARY_ROWS_FOR_BASELINE_MODEL_RESEARCH
         and success_count >= STRONG_SUCCESS_ROWS_FOR_BASELINE_MODEL_RESEARCH
         and tier_d_rate <= 0.05
-        and stale_feed_analysis["quote_stale_rate"] <= 0.02
+        and _rate_at_or_below(stale_feed_analysis["quote_stale_rate"], 0.02)
         and sparse_primary_bucket_count == 0
         and not warnings
     ):
@@ -1428,7 +1467,29 @@ def _readiness_checks(
         for bucket in empirical_bucket_analysis["buckets"]
         if bucket["row_count"] >= MIN_BUCKET_ROWS
     )
-    return [
+    quote_stale_check = (
+        {
+            "check_name": "quote_stale_rate",
+            "status": "WARN",
+            "value": stale_feed_analysis["staleness_status"],
+            "threshold": MAX_QUOTE_STALE_RATE,
+            "severity": "warning",
+            "message": (
+                "quote stale rate cannot be confidently assessed because quote-age "
+                "fields are missing"
+            ),
+        }
+        if stale_feed_analysis["quote_age_fields_missing"]
+        else _check(
+            "quote_stale_rate",
+            stale_feed_analysis["quote_stale_rate"] <= MAX_QUOTE_STALE_RATE,
+            stale_feed_analysis["quote_stale_rate"],
+            MAX_QUOTE_STALE_RATE,
+            "blocking",
+            "quote stale rate should be below threshold",
+        )
+    )
+    checks = [
         _check(
             "parsed_rows_nonzero",
             input_audit["parsed_json_rows"] > 0,
@@ -1469,13 +1530,14 @@ def _readiness_checks(
             "blocking",
             "D-tier diagnostic row share should be below threshold",
         ),
+        quote_stale_check,
         _check(
-            "quote_stale_rate",
-            stale_feed_analysis["quote_stale_rate"] <= MAX_QUOTE_STALE_RATE,
-            stale_feed_analysis["quote_stale_rate"],
-            MAX_QUOTE_STALE_RATE,
-            "blocking",
-            "quote stale rate should be below threshold",
+            "quote_age_fields_missing",
+            not stale_feed_analysis["quote_age_fields_missing"],
+            stale_feed_analysis["quote_age_fields_missing"],
+            False,
+            "warning",
+            "quote_age_fields_missing",
         ),
         _check(
             "book_incomplete_rate",
@@ -1526,6 +1588,7 @@ def _readiness_checks(
             "at least one empirical bucket should have enough rows",
         ),
     ]
+    return checks
 
 
 def _check(
@@ -1622,6 +1685,17 @@ def _analyze_mismatch_samples(path: Path) -> dict[str, Any]:
         "ask_mismatch_count": ask_mismatch_count,
         "recommendation_for_tolerance_ticks": recommendation,
     }
+
+
+def _add_missing_mismatch_sample_warning(analysis: dict[str, Any]) -> None:
+    if int(analysis.get("tolerated_mismatch_row_count", 0)) <= 0:
+        analysis["warning_flags"] = []
+        return
+    analysis["warning_flags"] = ["tolerated_mismatch_rows_without_mismatch_samples"]
+    analysis["mismatch_sample_recommendation"] = (
+        "Rerun with --mismatch-samples when Polymarket orderbook mismatch samples "
+        "are available to calibrate tolerated one-tick rows."
+    )
 
 
 def _metric_summary(rows: list[dict[str, Any]], field: str) -> dict[str, Any]:
@@ -1892,6 +1966,14 @@ def _lt(value: Any, threshold: float) -> bool:
     return _is_number(value) and float(value) < threshold
 
 
+def _rate_exceeds(value: Any, threshold: float) -> bool:
+    return _is_number(value) and float(value) > threshold
+
+
+def _rate_at_or_below(value: Any, threshold: float) -> bool:
+    return _is_number(value) and float(value) <= threshold
+
+
 def _value_key(value: Any) -> str:
     if value is None:
         return "unknown"
@@ -2057,6 +2139,10 @@ def _row_has_tolerated_mismatch(row: dict[str, Any]) -> bool:
     if "one_tick" in reason or "1_tick" in reason or "one-tick" in reason:
         return True
     return _validation_mode_key(row) == "tolerant" and _tier_key(row) == "B"
+
+
+def _stale_source_is_unknown(value: Any) -> bool:
+    return value is None or str(value).strip().lower() in {"", "unknown"}
 
 
 def _time_bucket_specs() -> tuple[tuple[str, str, Callable[[float], bool]], ...]:
@@ -2432,6 +2518,15 @@ def _markdown_empirical_bucket_table(report: dict[str, Any]) -> str:
             + " |"
         )
     return "\n".join(lines)
+
+
+def _primary_bucket_markdown_note(report: dict[str, Any]) -> str:
+    primary_min_tier = str(report["metadata"]["primary_min_tier"])
+    primary_description = "A/B" if primary_min_tier == "B" else "A only"
+    return (
+        "By default, empirical buckets are computed on primary rows only. "
+        f"For `--primary-min-tier {primary_min_tier}`, primary rows are {primary_description}."
+    )
 
 
 def _markdown_cohort_table(report: dict[str, Any]) -> str:

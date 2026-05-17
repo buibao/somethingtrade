@@ -59,9 +59,15 @@ Edge fields such as `exit_edge_after_spread` and `exit_edge_ticks` are measured 
 
 ## Empirical Buckets Are Not Predictions
 
-Empirical buckets group historical rows by features such as Binance move size, spread ticks, tradable window, executable repricing delay, validation tier, and symbol/direction cohort. Their rates are historical measured rates in this dataset.
+Empirical buckets group historical primary rows by features such as Binance move size, spread ticks, tradable window, executable repricing delay, validation tier, and symbol/direction cohort. With the default `--primary-min-tier B`, primary rows are A/B rows.
 
 They are not probability forecasts, model outputs, trading signals, or execution recommendations.
+
+## Staleness Interpretation
+
+If `stale_source`, `binance_quote_age_ms`, and `polymarket_quote_age_ms` are missing or unknown across the dataset, the report marks staleness as `unknown_missing_quote_age_fields`. In that case, a missing stale count is not evidence that quote staleness was 0%.
+
+When tolerated mismatch rows exist but no mismatch sample input is provided, rerun with `--mismatch-samples data/debug/polymarket_orderbook_mismatch_samples.jsonl` when available to calibrate whether one-tick tolerance is harmless enough for research.
 
 ## Readiness Classifications
 

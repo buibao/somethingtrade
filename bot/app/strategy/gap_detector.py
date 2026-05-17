@@ -170,6 +170,12 @@ class GapMonitorStats:
     signal_enabled_markets: int = 0
     warmup_only_markets: int = 0
     book_warmup_suppressed: int = 0
+    binance_moves_detected_by_symbol: dict[str, int] = field(default_factory=dict)
+    candidates_created_by_symbol: dict[str, int] = field(default_factory=dict)
+    pre_entry_rejects_by_symbol: dict[str, int] = field(default_factory=dict)
+    window_rejects_by_symbol: dict[str, int] = field(default_factory=dict)
+    timeout_rejects_by_symbol: dict[str, int] = field(default_factory=dict)
+    top_reject_reasons_by_symbol: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def detected_count(self) -> int:
@@ -246,6 +252,12 @@ class GapDetector:
         self._last_pre_entry_log_ns: dict[tuple[str, str, GapDirection, str], int] = {}
         self._reject_count_by_reason: dict[str, int] = {}
         self._reject_count_by_stage: dict[str, int] = {}
+        self._binance_moves_detected_by_symbol: dict[str, int] = {}
+        self._candidates_created_by_symbol: dict[str, int] = {}
+        self._pre_entry_rejects_by_symbol: dict[str, int] = {}
+        self._window_rejects_by_symbol: dict[str, int] = {}
+        self._timeout_rejects_by_symbol: dict[str, int] = {}
+        self._reject_reasons_by_symbol: dict[str, dict[str, int]] = {}
         self.detected_gaps = 0
         self.fillable_at_detection_count = 0
         self.non_fillable_at_detection_count = 0
@@ -387,6 +399,17 @@ class GapDetector:
             signal_enabled_markets=signal_enabled_markets,
             warmup_only_markets=warmup_only_markets,
             book_warmup_suppressed=self.book_warmup_suppressed,
+            binance_moves_detected_by_symbol=dict(self._binance_moves_detected_by_symbol),
+            candidates_created_by_symbol=dict(self._candidates_created_by_symbol),
+            pre_entry_rejects_by_symbol=dict(self._pre_entry_rejects_by_symbol),
+            window_rejects_by_symbol=dict(self._window_rejects_by_symbol),
+            timeout_rejects_by_symbol=dict(self._timeout_rejects_by_symbol),
+            top_reject_reasons_by_symbol={
+                symbol: dict(
+                    sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:5]
+                )
+                for symbol, reasons in sorted(self._reject_reasons_by_symbol.items())
+            },
         )
 
     def stale_feed_count(self, state: MarketState, *, now_ts: int | None = None) -> int:
@@ -425,10 +448,6 @@ class GapDetector:
         binance_event_ts: int | None,
     ) -> tuple[TradableGapObservation, ...]:
         observations: list[TradableGapObservation] = []
-        markets = self._markets_by_symbol.get(symbol, ())
-        if not markets:
-            return ()
-
         symbol_state = state.symbols.get(symbol)
         if symbol_state is None or _is_stale_wall(
             symbol_state.local_receive_timestamp or symbol_state.last_event_timestamp,
@@ -447,6 +466,11 @@ class GapDetector:
         if abs(move_pct) < self.min_move_pct:
             return ()
 
+        self._increment(self._binance_moves_detected_by_symbol, symbol)
+        markets = self._markets_by_symbol.get(symbol, ())
+        if not markets:
+            return ()
+
         direction: GapDirection = "UP" if move_pct > 0.0 else "DOWN"
         for market in markets:
             if not self._market_signal_enabled(market, now_ts):
@@ -458,6 +482,7 @@ class GapDetector:
                 continue
 
             self.detected_gaps += 1
+            self._increment(self._candidates_created_by_symbol, symbol)
             token_id = market.token_for_direction(direction)
 
             if market.market_id in self._invalid_markets or state.is_market_invalid(
@@ -790,6 +815,7 @@ class GapDetector:
         observation = self._observation_from_pending(pending)
         if observation.reject_reason is not None:
             self._record_reject(observation.reject_reason, observation.reject_stage)
+        self._record_observation_diagnostics(observation)
         self._completed.append(observation)
         del self._pending[key]
         return observation
@@ -1260,6 +1286,7 @@ class GapDetector:
         self.pre_entry_observations_written += 1
         if observation.reject_reason is not None:
             self._record_reject(observation.reject_reason, "pre_entry")
+        self._record_observation_diagnostics(observation)
         self._completed.append(observation)
         return observation
 
@@ -1455,6 +1482,21 @@ class GapDetector:
     def _record_reject(self, reason: str, stage: RejectStage) -> None:
         self._reject_count_by_reason[reason] = self._reject_count_by_reason.get(reason, 0) + 1
         self._reject_count_by_stage[stage] = self._reject_count_by_stage.get(stage, 0) + 1
+
+    def _record_observation_diagnostics(self, observation: TradableGapObservation) -> None:
+        if observation.reject_stage == "pre_entry":
+            self._increment(self._pre_entry_rejects_by_symbol, observation.symbol)
+        elif observation.reject_stage == "window":
+            self._increment(self._window_rejects_by_symbol, observation.symbol)
+        elif observation.reject_stage == "timeout":
+            self._increment(self._timeout_rejects_by_symbol, observation.symbol)
+        if observation.reject_reason is not None:
+            reasons = self._reject_reasons_by_symbol.setdefault(observation.symbol, {})
+            self._increment(reasons, observation.reject_reason)
+
+    @staticmethod
+    def _increment(counter: dict[str, int], key: str) -> None:
+        counter[key] = counter.get(key, 0) + 1
 
 
 def build_move_snapshot(symbol_state: SymbolState) -> BinanceMoveSnapshot:
