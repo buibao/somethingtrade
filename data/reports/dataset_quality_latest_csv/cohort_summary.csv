@@ -1,0 +1,5 @@
+cohort,row_count,success_count,success_rate,median_executable_repricing_delay_ms,median_tradable_window_ms,median_exit_edge_ticks,warnings
+A only,0,0,0.0,,,,"[""row_count_below_bucket_minimum"", ""executable_delay_missing""]"
+A/B,14,0,0.0,,0.0,,"[""row_count_below_bucket_minimum"", ""executable_delay_missing""]"
+A/B/C,25,0,0.0,,0.0,,"[""row_count_below_bucket_minimum"", ""executable_delay_missing""]"
+all rows,25,0,0.0,,0.0,,"[""row_count_below_bucket_minimum"", ""executable_delay_missing""]"

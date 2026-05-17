@@ -1,0 +1,36 @@
+feature,bucket,row_count,success_count,success_rate,median_executable_repricing_delay_ms,median_tradable_window_ms,median_exit_edge_ticks,insufficient_sample_warning
+binance_move_pct,<= -0.20,0,0,0.0,,,,true
+binance_move_pct,-0.20 to -0.10,0,0,0.0,,,,true
+binance_move_pct,-0.10 to -0.05,13,0,0.0,,0.0,,true
+binance_move_pct,-0.05 to 0,0,0,0.0,,,,true
+binance_move_pct,0 to 0.05,0,0,0.0,,,,true
+binance_move_pct,0.05 to 0.10,1,0,0.0,,4969.3454,,true
+binance_move_pct,0.10 to 0.20,0,0,0.0,,,,true
+binance_move_pct,> 0.20,0,0,0.0,,,,true
+spread_ticks_at_detection,0,0,0,0.0,,,,true
+spread_ticks_at_detection,1,0,0,0.0,,,,true
+spread_ticks_at_detection,2,0,0,0.0,,,,true
+spread_ticks_at_detection,3-5,3,0,0.0,,0.0,,true
+spread_ticks_at_detection,6-10,1,0,0.0,,0.0,,true
+spread_ticks_at_detection,>10,1,0,0.0,,0.0,,true
+tradable_window_ms,0-50ms,9,0,0.0,,0.0,,true
+tradable_window_ms,50-100ms,0,0,0.0,,,,true
+tradable_window_ms,100-250ms,2,0,0.0,,216.0385,,true
+tradable_window_ms,250-500ms,1,0,0.0,,338.2772,,true
+tradable_window_ms,500-1000ms,0,0,0.0,,,,true
+tradable_window_ms,>1000ms,2,0,0.0,,3482.7054,,true
+executable_repricing_delay_ms,0-50ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,50-100ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,100-250ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,250-500ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,500-1000ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,>1000ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,missing,14,0,0.0,,0.0,,true
+validation_quality,A,0,0,0.0,,,,true
+validation_quality,B,14,0,0.0,,0.0,,true
+validation_quality,C,0,0,0.0,,,,true
+validation_quality,D,0,0,0.0,,,,true
+symbol_direction_cohort,BTCUSDT:UP,0,0,0.0,,,,true
+symbol_direction_cohort,BTCUSDT:DOWN,0,0,0.0,,,,true
+symbol_direction_cohort,ETHUSDT:UP,1,0,0.0,,4969.3454,,true
+symbol_direction_cohort,ETHUSDT:DOWN,13,0,0.0,,0.0,,true

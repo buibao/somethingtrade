@@ -1,0 +1,5 @@
+tier,row_count,row_rate,success_count,success_rate,top_reject_reason,median_delay,median_window,median_edge_ticks
+A,0,0.0,0,0.0,,,,
+B,14,0.56,0,0.0,book_incomplete,,0.0,
+C,11,0.44,0,0.0,insufficient_best_ask_size,,30.2337,
+D,0,0.0,0,0.0,,,,
