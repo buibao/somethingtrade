@@ -1,0 +1,5 @@
+tier,row_count,row_rate,success_count,success_rate,top_reject_reason,median_delay,median_window,median_edge_ticks
+A,2,0.037037037037037035,0,0.0,spread_too_wide,,506.8536,
+B,30,0.5555555555555556,2,0.06666666666666667,book_incomplete,1040.4615,484.3259,0.9999999999999994
+C,0,0.0,0,0.0,,,,
+D,22,0.4074074074074074,0,0.0,book_incomplete,,0.0,

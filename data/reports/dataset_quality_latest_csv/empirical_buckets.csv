@@ -1,0 +1,36 @@
+feature,bucket,row_count,success_count,success_rate,median_executable_repricing_delay_ms,median_tradable_window_ms,median_exit_edge_ticks,insufficient_sample_warning
+binance_move_pct,<= -0.20,0,0,0.0,,,,true
+binance_move_pct,-0.20 to -0.10,0,0,0.0,,,,true
+binance_move_pct,-0.10 to -0.05,17,1,0.058823529411764705,1278.2604,133.5042,0.9999999999999994,true
+binance_move_pct,-0.05 to 0,0,0,0.0,,,,true
+binance_move_pct,0 to 0.05,0,0,0.0,,,,true
+binance_move_pct,0.05 to 0.10,15,1,0.06666666666666667,802.6626,802.6626,0.9999999999999994,true
+binance_move_pct,0.10 to 0.20,0,0,0.0,,,,true
+binance_move_pct,> 0.20,0,0,0.0,,,,true
+spread_ticks_at_detection,0,0,0,0.0,,,,true
+spread_ticks_at_detection,1,0,0,0.0,,,,true
+spread_ticks_at_detection,2,0,0,0.0,,,,true
+spread_ticks_at_detection,3-5,6,0,0.0,,0.0,,true
+spread_ticks_at_detection,6-10,0,0,0.0,,,,true
+spread_ticks_at_detection,>10,0,0,0.0,,,,true
+tradable_window_ms,0-50ms,13,0,0.0,,0.0,,true
+tradable_window_ms,50-100ms,1,0,0.0,,69.3079,,true
+tradable_window_ms,100-250ms,2,0,0.0,,149.7467,,true
+tradable_window_ms,250-500ms,0,0,0.0,,,,true
+tradable_window_ms,500-1000ms,2,1,0.5,802.6626,874.9422,0.9999999999999994,true
+tradable_window_ms,>1000ms,14,1,0.07142857142857142,1278.2604,4313.3508,0.9999999999999994,true
+executable_repricing_delay_ms,0-50ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,50-100ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,100-250ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,250-500ms,0,0,0.0,,,,true
+executable_repricing_delay_ms,500-1000ms,1,1,1.0,802.6626,802.6626,0.9999999999999994,true
+executable_repricing_delay_ms,>1000ms,1,1,1.0,1278.2604,1278.2604,0.9999999999999994,true
+executable_repricing_delay_ms,missing,30,0,0.0,,149.7467,,false
+validation_quality,A,2,0,0.0,,506.8536,,true
+validation_quality,B,30,2,0.06666666666666667,1040.4615,484.3259,0.9999999999999994,false
+validation_quality,C,0,0,0.0,,,,true
+validation_quality,D,0,0,0.0,,,,true
+symbol_direction_cohort,BTCUSDT:UP,3,0,0.0,,8.0385,,true
+symbol_direction_cohort,BTCUSDT:DOWN,7,1,0.14285714285714285,1278.2604,133.5042,0.9999999999999994,true
+symbol_direction_cohort,ETHUSDT:UP,12,1,0.08333333333333333,802.6626,874.9422,0.9999999999999994,true
+symbol_direction_cohort,ETHUSDT:DOWN,10,0,0.0,,524.2918999999999,,true

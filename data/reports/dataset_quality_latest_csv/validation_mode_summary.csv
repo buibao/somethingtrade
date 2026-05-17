@@ -1,0 +1,5 @@
+validation_mode,row_count,row_rate,success_count,success_rate,tier_distribution,median_delay,median_edge_ticks
+strict,0,0.0,0,0.0,"{""A"": 0, ""B"": 0, ""C"": 0, ""D"": 0}",,
+tolerant,54,1.0,2,0.037037037037037035,"{""A"": 2, ""B"": 30, ""C"": 0, ""D"": 22}",1040.4615,0.9999999999999994
+diagnostic,0,0.0,0,0.0,"{""A"": 0, ""B"": 0, ""C"": 0, ""D"": 0}",,
+unknown,0,0.0,0,0.0,"{""A"": 0, ""B"": 0, ""C"": 0, ""D"": 0}",,
