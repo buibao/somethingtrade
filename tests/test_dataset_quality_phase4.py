@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -77,6 +78,52 @@ def _base_row(
 
 def _write_rows(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _read_csv_dicts(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _write_quote_stale_runtime_consistency_inputs(
+    tmp_path: Path,
+) -> tuple[Path, Path]:
+    events_path = tmp_path / "events.jsonl"
+    runtime_path = tmp_path / "runtime_summary.jsonl"
+    total = 2_457
+    gap_start_ns = 1_700_000_000_000_000_000
+    gap_duration_ns = 1_068_000_000_000
+    runtime_duration_ns = 1_000_000_000_000
+    rows: list[dict[str, object]] = []
+    for index in range(total):
+        row = _base_row(index)
+        row["detected_ts_ns"] = gap_start_ns + round(
+            index * gap_duration_ns / (total - 1)
+        )
+        if index < 25:
+            row["stale_source"] = "binance"
+        elif index < 169:
+            row["stale_source"] = "polymarket"
+        else:
+            row["stale_source"] = "unknown"
+        if index < 166:
+            row["reject_stage"] = "pre_entry"
+            row["reject_reason"] = "quote_stale"
+            row["quote_was_fillable"] = False
+        rows.append(row)
+    runtime_rows: list[dict[str, object]] = []
+    for index in range(25):
+        runtime_rows.append(
+            {
+                "event_type": "runtime_summary",
+                "generated_ts_ns": gap_start_ns
+                + round(index * runtime_duration_ns / 24),
+                "no_event_warnings": [],
+            }
+        )
+    _write_rows(events_path, rows)
+    _write_rows(runtime_path, runtime_rows)
+    return events_path, runtime_path
 
 
 def test_phase4_reads_jsonl_with_blank_lines(tmp_path: Path) -> None:
@@ -324,6 +371,180 @@ def test_phase4_readiness_warns_when_quote_age_fields_missing(tmp_path: Path) ->
     assert "quote_age_fields_missing" in report["readiness_assessment"]["non_blocking_warnings"]
 
 
+def test_phase4_quote_stale_rate_does_not_count_unknown_stale_source_as_stale(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    rows: list[dict[str, object]] = []
+    total = 2_457
+    for index in range(total):
+        row = _base_row(index)
+        if index < 25:
+            row["stale_source"] = "binance"
+        elif index < 169:
+            row["stale_source"] = "polymarket"
+        else:
+            row["stale_source"] = "unknown"
+        if index < 166:
+            row["reject_stage"] = "window"
+            row["reject_reason"] = "quote_stale"
+            row["quote_was_fillable"] = False
+        rows.append(row)
+    _write_rows(path, rows)
+
+    report = build_phase4_dataset_quality_report(path)
+    stale = report["stale_feed_analysis"]
+    checks = {check["check_name"]: check for check in report["readiness_assessment"]["checks"]}
+    markdown = render_phase4_markdown_report(report)
+
+    assert stale["stale_source_distribution"] == {
+        "binance": 25,
+        "polymarket": 144,
+        "unknown": 2_288,
+    }
+    assert stale["quote_stale_rate_basis"] == "reject_reason_quote_stale"
+    assert stale["quote_stale_count"] == 166
+    assert abs(stale["quote_stale_rate"] - 166 / total) < 1e-12
+    assert stale["quote_stale_rate"] != 1.0
+    assert abs(stale["binance_stale_rate"] - 25 / total) < 1e-12
+    assert abs(stale["polymarket_stale_rate"] - 144 / total) < 1e-12
+    assert stale["both_stale_rate"] == 0.0
+    assert stale["unknown_quote_age_or_not_stale_source_count"] == 2_288
+    assert checks["quote_stale_rate"]["value"] == stale["quote_stale_rate"]
+    assert checks["quote_stale_rate"]["status"] == "PASS"
+    assert "`unknown` stale_source is reported separately and is not counted as stale" in markdown
+
+
+def test_dataset_quality_report_outputs_corrected_quote_stale_and_runtime_coverage(
+    tmp_path: Path,
+) -> None:
+    events_path, runtime_path = _write_quote_stale_runtime_consistency_inputs(tmp_path)
+    output_path = tmp_path / "dataset_quality_latest.json"
+    markdown_path = tmp_path / "dataset_quality_latest.md"
+    csv_dir = tmp_path / "dataset_quality_latest_csv"
+
+    args = parse_args(
+        [
+            "dataset-quality-report",
+            "--input",
+            str(events_path),
+            "--output",
+            str(output_path),
+            "--markdown-output",
+            str(markdown_path),
+            "--csv-dir",
+            str(csv_dir),
+            "--runtime-summary-jsonl",
+            str(runtime_path),
+        ]
+    )
+    run_dataset_quality_report(args)
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    markdown = markdown_path.read_text(encoding="utf-8")
+    readiness_rows = {
+        row["check_name"]: row for row in _read_csv_dicts(csv_dir / "readiness_checks.csv")
+    }
+    runtime_coverage_row = _read_csv_dicts(csv_dir / "runtime_coverage.csv")[0]
+    expected_quote_stale_rate = 166 / 2_457
+    expected_runtime_coverage_ratio = 1.068
+
+    stale = report["stale_feed_analysis"]
+    assert abs(stale["quote_stale_rate"] - expected_quote_stale_rate) < 1e-12
+    assert stale["quote_stale_rate_basis"] == "reject_reason_quote_stale"
+    assert stale["stale_source_distribution"] == {
+        "binance": 25,
+        "polymarket": 144,
+        "unknown": 2_288,
+    }
+    assert stale["unknown_quote_age_or_not_stale_source_count"] == 2_288
+    assert "Quote stale rate: 6.76%" in markdown
+    assert "Quote stale rate: 100.00%" not in markdown
+    assert "basis: reject_reason_quote_stale" in markdown
+    assert "Unknown/not-stale-source count: 2288" in markdown
+
+    quote_stale_check = readiness_rows["quote_stale_rate"]
+    assert quote_stale_check["status"] == "PASS"
+    assert abs(float(quote_stale_check["value"]) - expected_quote_stale_rate) < 1e-12
+
+    coverage = report["runtime_coverage_analysis"]
+    assert coverage["status"] == "analyzed"
+    assert coverage["runtime_summary_rows"] == 25
+    assert abs(coverage["gap_event_time_coverage_ratio"] - expected_runtime_coverage_ratio) < 1e-12
+    assert "Runtime coverage status: analyzed" in markdown
+    assert "Runtime summary rows: 25" in markdown
+    assert "Gap-event/runtime coverage ratio: 106.80%" in markdown
+    assert runtime_coverage_row["status"] == "analyzed"
+    assert runtime_coverage_row["runtime_summary_rows"] == "25"
+    assert abs(
+        float(runtime_coverage_row["gap_event_time_coverage_ratio"])
+        - expected_runtime_coverage_ratio
+    ) < 1e-12
+
+    runtime_check = readiness_rows["runtime_gap_event_coverage"]
+    assert runtime_check["status"] == "PASS"
+    assert abs(float(runtime_check["value"]) - expected_runtime_coverage_ratio) < 1e-12
+
+
+def test_dataset_quality_json_markdown_and_csv_consistency(
+    tmp_path: Path,
+) -> None:
+    events_path, runtime_path = _write_quote_stale_runtime_consistency_inputs(tmp_path)
+    output_path = tmp_path / "report.json"
+    markdown_path = tmp_path / "report.md"
+    csv_dir = tmp_path / "csv"
+
+    args = parse_args(
+        [
+            "dataset-quality-report",
+            "--input",
+            str(events_path),
+            "--output",
+            str(output_path),
+            "--markdown-output",
+            str(markdown_path),
+            "--csv-dir",
+            str(csv_dir),
+            "--runtime-summary-jsonl",
+            str(runtime_path),
+        ]
+    )
+    run_dataset_quality_report(args)
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    markdown = markdown_path.read_text(encoding="utf-8")
+    readiness_rows = {
+        row["check_name"]: row for row in _read_csv_dicts(csv_dir / "readiness_checks.csv")
+    }
+    runtime_coverage_row = _read_csv_dicts(csv_dir / "runtime_coverage.csv")[0]
+    report_checks = {
+        check["check_name"]: check for check in report["readiness_assessment"]["checks"]
+    }
+
+    quote_stale_rate = report["stale_feed_analysis"]["quote_stale_rate"]
+    assert quote_stale_rate is not None
+    assert readiness_rows["quote_stale_rate"]["status"] == report_checks["quote_stale_rate"]["status"]
+    assert abs(float(readiness_rows["quote_stale_rate"]["value"]) - quote_stale_rate) < 1e-12
+    assert f"Quote stale rate: {quote_stale_rate * 100:.2f}%" in markdown
+
+    coverage = report["runtime_coverage_analysis"]
+    coverage_ratio = coverage["gap_event_time_coverage_ratio"]
+    assert coverage_ratio is not None
+    assert readiness_rows["runtime_gap_event_coverage"]["status"] == (
+        report_checks["runtime_gap_event_coverage"]["status"]
+    )
+    assert abs(
+        float(readiness_rows["runtime_gap_event_coverage"]["value"]) - coverage_ratio
+    ) < 1e-12
+    assert runtime_coverage_row["status"] == coverage["status"]
+    assert int(runtime_coverage_row["runtime_summary_rows"]) == coverage["runtime_summary_rows"]
+    assert abs(
+        float(runtime_coverage_row["gap_event_time_coverage_ratio"]) - coverage_ratio
+    ) < 1e-12
+    assert f"Runtime summary rows: {coverage['runtime_summary_rows']}" in markdown
+    assert f"Gap-event/runtime coverage ratio: {coverage_ratio * 100:.2f}%" in markdown
+
+
 def test_phase4_markdown_says_empirical_buckets_use_primary_rows(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     _write_rows(path, [_base_row(1, tier="A"), _base_row(2, tier="B"), _base_row(3, tier="C")])
@@ -402,6 +623,7 @@ def test_phase4_csv_outputs_are_written(tmp_path: Path) -> None:
         "edge_summary.csv",
         "empirical_buckets.csv",
         "readiness_checks.csv",
+        "runtime_coverage.csv",
     }
     assert expected <= {path.name for path in csv_dir.iterdir()}
     for filename in expected:

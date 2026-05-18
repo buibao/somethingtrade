@@ -446,6 +446,20 @@ def write_phase4_csv_outputs(report: dict[str, Any], csv_dir: str | Path) -> Non
         ],
         _readiness_csv_rows(report),
     )
+    _write_csv(
+        directory / "runtime_coverage.csv",
+        [
+            "status",
+            "runtime_summary_path",
+            "runtime_summary_rows",
+            "runtime_duration_minutes",
+            "gap_event_rows",
+            "gap_event_duration_minutes",
+            "gap_event_time_coverage_ratio",
+            "warning_flags",
+        ],
+        _runtime_coverage_csv_rows(report),
+    )
     malformed = report["input_audit"].get("malformed_rows", [])
     if malformed:
         _write_csv(
@@ -536,10 +550,23 @@ def render_phase4_markdown_report(report: dict[str, Any]) -> str:
         "",
         f"- Staleness status: {report['stale_feed_analysis']['staleness_status']}",
         f"- Stale source distribution: `{json.dumps(report['stale_feed_analysis']['stale_source_distribution'], sort_keys=True)}`",
-        f"- Quote stale rate: {_format_rate(report['stale_feed_analysis']['quote_stale_rate'])}",
+        (
+            "- Quote stale rate: "
+            f"{_format_rate(report['stale_feed_analysis']['quote_stale_rate'])} "
+            f"(basis: {report['stale_feed_analysis'].get('quote_stale_rate_basis')}; "
+            "`unknown` stale_source is reported separately and is not counted as stale)"
+        ),
         f"- Binance stale rate: {_format_rate(report['stale_feed_analysis']['binance_stale_rate'])}",
         f"- Polymarket stale rate: {_format_rate(report['stale_feed_analysis']['polymarket_stale_rate'])}",
         f"- Both stale rate: {_format_rate(report['stale_feed_analysis']['both_stale_rate'])}",
+        (
+            "- Unknown/not-stale-source count: "
+            f"{report['stale_feed_analysis'].get('unknown_quote_age_or_not_stale_source_count', 0)}"
+        ),
+        (
+            "- Unknown/not-stale-source rate: "
+            f"{_format_rate(report['stale_feed_analysis'].get('unknown_quote_age_or_not_stale_source_rate'))}"
+        ),
         "",
         "## 10.5 Runtime Coverage Analysis",
         "",
@@ -1062,27 +1089,27 @@ def _build_liquidity_and_spread_analysis(rows: list[dict[str, Any]]) -> dict[str
 def _build_stale_feed_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(rows)
     stale_source_distribution = _field_counter(rows, "stale_source")
-    quote_stale_count = 0
+    quote_stale_reject_count = 0
+    quote_stale_source_count = 0
     binance_stale_count = 0
     polymarket_stale_count = 0
     both_stale_count = 0
-    unknown_stale_count = 0
+    unknown_quote_age_or_not_stale_source_count = 0
     for row in rows:
         reason = str(row.get("reject_reason") or "")
-        source = str(row.get("stale_source") or "").lower()
-        stale = reason in {"quote_stale", "binance_stale", "polymarket_stale", "both_stale"} or source not in {"", "none", "false"}
-        if stale:
-            quote_stale_count += 1
-        if reason == "both_stale" or source == "both":
+        source = str(row.get("stale_source") or "").strip().lower()
+        if reason == "quote_stale":
+            quote_stale_reject_count += 1
+        if source in {"binance", "polymarket", "both"}:
+            quote_stale_source_count += 1
+        if source == "both":
             both_stale_count += 1
-        if reason == "binance_stale" or source in {"binance", "both"}:
+        if source == "binance":
             binance_stale_count += 1
-        if reason == "polymarket_stale" or source in {"polymarket", "both"}:
+        if source == "polymarket":
             polymarket_stale_count += 1
-        if stale and not source:
-            unknown_stale_count += 1
-        if reason == "stale_source_unknown" or source == "unknown":
-            unknown_stale_count += 1
+        if source not in {"binance", "polymarket", "both"}:
+            unknown_quote_age_or_not_stale_source_count += 1
 
     has_quote_age_fields = any(
         _is_number(row.get("binance_quote_age_ms"))
@@ -1098,6 +1125,16 @@ def _build_stale_feed_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if stale_source_unknown_for_all_rows and quote_age_fields_missing
         else "measured_from_stale_source_or_reject_reason"
     )
+    quote_stale_basis = (
+        "reject_reason_quote_stale"
+        if quote_stale_reject_count > 0
+        else "stale_source_binance_polymarket_both"
+    )
+    quote_stale_count = (
+        quote_stale_reject_count
+        if quote_stale_reject_count > 0
+        else quote_stale_source_count
+    )
     quote_stale_rate: float | None = (
         None if staleness_status == "unknown_missing_quote_age_fields" else _rate(quote_stale_count, total)
     )
@@ -1110,29 +1147,36 @@ def _build_stale_feed_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     both_stale_rate: float | None = (
         None if staleness_status == "unknown_missing_quote_age_fields" else _rate(both_stale_count, total)
     )
-    unknown_stale_rate: float | None = (
-        None if staleness_status == "unknown_missing_quote_age_fields" else _rate(unknown_stale_count, total)
+    unknown_quote_age_or_not_stale_source_rate: float | None = (
+        None
+        if staleness_status == "unknown_missing_quote_age_fields"
+        else _rate(unknown_quote_age_or_not_stale_source_count, total)
     )
     return {
         "staleness_status": staleness_status,
         "quote_age_fields_missing": quote_age_fields_missing,
         "stale_source_unknown_for_all_rows": stale_source_unknown_for_all_rows,
         "stale_source_distribution": stale_source_distribution,
+        "quote_stale_rate_basis": quote_stale_basis,
         "quote_stale_rate": quote_stale_rate,
         "binance_stale_rate": binance_stale_rate,
         "polymarket_stale_rate": polymarket_stale_rate,
         "both_stale_rate": both_stale_rate,
-        "unknown_stale_rate": unknown_stale_rate,
+        "unknown_quote_age_or_not_stale_source_rate": unknown_quote_age_or_not_stale_source_rate,
         "quote_stale_count": quote_stale_count,
+        "quote_stale_reject_count": quote_stale_reject_count,
+        "quote_stale_source_count": quote_stale_source_count,
         "binance_stale_count": binance_stale_count,
         "polymarket_stale_count": polymarket_stale_count,
         "both_stale_count": both_stale_count,
-        "unknown_stale_count": unknown_stale_count,
+        "unknown_quote_age_or_not_stale_source_count": (
+            unknown_quote_age_or_not_stale_source_count
+        ),
         "quote_age_summary": {
             "binance_quote_age_ms": _metric_summary(rows, "binance_quote_age_ms"),
             "polymarket_quote_age_ms": _metric_summary(rows, "polymarket_quote_age_ms"),
         },
-        "timestamp_basis": "quote_age_fields" if has_quote_age_fields else "unknown_missing_quote_age_fields",
+        "timestamp_basis": "quote_age_fields_for_age_distribution_only" if has_quote_age_fields else "unknown_missing_quote_age_fields",
     }
 
 
@@ -2548,6 +2592,22 @@ def _empirical_bucket_csv_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _readiness_csv_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
     return list(report["readiness_assessment"]["checks"])
+
+
+def _runtime_coverage_csv_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+    coverage = report["runtime_coverage_analysis"]
+    return [
+        {
+            "status": coverage.get("status"),
+            "runtime_summary_path": coverage.get("runtime_summary_path"),
+            "runtime_summary_rows": coverage.get("runtime_summary_rows"),
+            "runtime_duration_minutes": coverage.get("runtime_duration_minutes"),
+            "gap_event_rows": coverage.get("gap_event_rows"),
+            "gap_event_duration_minutes": coverage.get("gap_event_duration_minutes"),
+            "gap_event_time_coverage_ratio": coverage.get("gap_event_time_coverage_ratio"),
+            "warning_flags": coverage.get("warning_flags", []),
+        }
+    ]
 
 
 def _top_key(counts: dict[str, int]) -> str:

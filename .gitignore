@@ -8,3 +8,4 @@ data/logs/*.jsonl
 data/logs/**/*.jsonl
 data/debug/**/*samples*.jsonl
 data/reports/*.json
+phase4_final_report_artifacts.zip
