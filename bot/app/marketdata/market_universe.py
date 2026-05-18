@@ -9,12 +9,14 @@ import aiohttp
 
 from app.core.clock import utc_now_ns
 from app.marketdata.polymarket_discovery import (
+    DEFAULT_MARKET_CACHE_TTL_MS,
     PolymarketDiscoveryClient,
     PolymarketMarketMetadata,
     annotate_runtime_market_roles,
     classify_market_window,
     flatten_token_ids,
     is_runtime_tradable_market,
+    write_discovery_attempt_jsonl,
 )
 
 
@@ -58,6 +60,10 @@ class MarketUniverseSnapshot:
     market_refresh_count: int = 0
     forced_market_refresh_count: int = 0
     market_refresh_error_count: int = 0
+    discovery_failure_reason: str | None = None
+    last_discovery_attempt_summary: dict[str, Any] = field(default_factory=dict)
+    last_successful_discovery_ts: int | None = None
+    last_successful_current_signal_slugs: tuple[str, ...] = ()
     last_diff: MarketUniverseDiff = field(default_factory=MarketUniverseDiff)
 
     @property
@@ -75,15 +81,21 @@ class RuntimeMarketUniverseManager:
         *,
         refresh_interval_ms: int = 60_000,
         lookahead_windows: int = 3,
-        market_cache_ttl_ms: int = 60_000,
+        market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+        discovery_debug_jsonl: str | None = None,
     ) -> None:
         self.discovery = discovery
         self.refresh_interval_ms = max(1, refresh_interval_ms)
         self.lookahead_windows = max(1, lookahead_windows)
         self.market_cache_ttl_ms = max(1, market_cache_ttl_ms)
+        self.discovery_debug_jsonl = discovery_debug_jsonl
         self.market_refresh_count = 0
         self.forced_market_refresh_count = 0
         self.market_refresh_error_count = 0
+        self.discovery_failure_reason: str | None = None
+        self.last_discovery_attempt_summary: dict[str, Any] = {}
+        self.last_successful_discovery_ts: int | None = None
+        self.last_successful_current_signal_slugs: tuple[str, ...] = ()
         self._last_discovery_ts: int | None = None
         self._next_discovery_ts: int | None = None
         self._last_diff = MarketUniverseDiff()
@@ -94,6 +106,12 @@ class RuntimeMarketUniverseManager:
             lookahead_windows=self.lookahead_windows,
         )
         self._markets = selected
+        if selected:
+            self.last_successful_discovery_ts = now_ts
+            self.last_successful_current_signal_slugs = _current_signal_slugs(
+                selected,
+                now_ts=now_ts,
+            )
         self._last_diff = build_market_universe_diff((), selected, now_ts=now_ts)
 
     @property
@@ -118,6 +136,10 @@ class RuntimeMarketUniverseManager:
             market_refresh_count=self.market_refresh_count,
             forced_market_refresh_count=self.forced_market_refresh_count,
             market_refresh_error_count=self.market_refresh_error_count,
+            discovery_failure_reason=self.discovery_failure_reason,
+            last_discovery_attempt_summary=self.last_discovery_attempt_summary,
+            last_successful_discovery_ts=self.last_successful_discovery_ts,
+            last_successful_current_signal_slugs=self.last_successful_current_signal_slugs,
             last_diff=self._last_diff,
         )
 
@@ -125,53 +147,118 @@ class RuntimeMarketUniverseManager:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
         return self._next_discovery_ts is None or current_ts >= self._next_discovery_ts
 
-    async def refresh(self, *, now_ts: int | None = None, forced: bool = False) -> MarketUniverseDiff:
+    async def refresh(
+        self,
+        *,
+        now_ts: int | None = None,
+        forced: bool = False,
+        refresh_reason: str | None = None,
+    ) -> MarketUniverseDiff:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
         previous = self._markets
+        reason = refresh_reason or ("forced_no_signal" if forced else "scheduled")
+        if forced:
+            self.forced_market_refresh_count += 1
         try:
-            discovered = await self.discovery.discover(
-                write_cache=True,
-                now_ts=current_ts,
-                rolling_lookahead_windows=self.lookahead_windows,
-                market_cache_ttl_ms=self.market_cache_ttl_ms,
-            )
+            if self.discovery.enable_direct_slug_lookup:
+                rolling_result = await self.discovery.discover_rolling_markets_robust(
+                    write_cache=True,
+                    now_ts=current_ts,
+                    lookahead_windows=self.lookahead_windows,
+                    market_cache_ttl_ms=self.market_cache_ttl_ms,
+                    discovery_debug_jsonl=self.discovery_debug_jsonl,
+                    refresh_reason=reason,
+                )
+                discovered = rolling_result.markets
+                attempt = rolling_result.attempt
+            else:
+                discovered = await self.discovery.discover(
+                    write_cache=True,
+                    now_ts=current_ts,
+                    rolling_lookahead_windows=self.lookahead_windows,
+                    market_cache_ttl_ms=self.market_cache_ttl_ms,
+                    discovery_debug_jsonl=self.discovery_debug_jsonl,
+                    refresh_reason=reason,
+                )
+                selected_for_attempt = select_runtime_market_universe(
+                    discovered,
+                    now_ts=current_ts,
+                    lookahead_windows=self.lookahead_windows,
+                )
+                attempt = _legacy_discovery_attempt(
+                    discovered=discovered,
+                    selected=selected_for_attempt,
+                    now_ts=current_ts,
+                    refresh_reason=reason,
+                )
+                if self.discovery_debug_jsonl is not None:
+                    write_discovery_attempt_jsonl(self.discovery_debug_jsonl, attempt)
         except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
             self.market_refresh_error_count += 1
-            diff = MarketUniverseDiff(forced=forced, error=f"{type(exc).__name__}: {exc}")
+            self.discovery_failure_reason = "market_discovery_exception"
+            preserved = annotate_runtime_market_roles(
+                previous,
+                now_ts=current_ts,
+                lookahead_windows=self.lookahead_windows,
+            )
+            self._markets = preserved
+            self.last_discovery_attempt_summary = {
+                "refresh_reason": reason,
+                "failure_reason": self.discovery_failure_reason,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            diff = MarketUniverseDiff(
+                forced=forced,
+                error=(
+                    "market_discovery_failed_preserving_previous_universe "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
             self._last_diff = diff
+            self._last_discovery_ts = current_ts
             self._schedule_next(current_ts)
             return diff
 
+        self.last_discovery_attempt_summary = _attempt_summary(attempt)
         selected = select_runtime_market_universe(
             discovered,
             now_ts=current_ts,
             lookahead_windows=self.lookahead_windows,
         )
         if not selected:
-            previous_runtime = select_runtime_market_universe(
+            self.market_refresh_error_count += 1
+            self.discovery_failure_reason = _derive_discovery_failure_reason(attempt)
+            preserved = annotate_runtime_market_roles(
                 previous,
                 now_ts=current_ts,
                 lookahead_windows=self.lookahead_windows,
             )
-            if previous_runtime:
-                self.market_refresh_error_count += 1
-                diff = build_market_universe_diff(
-                    previous,
-                    previous,
-                    now_ts=current_ts,
-                    forced=forced,
-                    error="market_discovery_failed_preserving_previous_universe",
-                )
-                self._last_diff = diff
-                self._last_discovery_ts = current_ts
-                self._schedule_next(current_ts)
-                return diff
+            self._markets = preserved
+            diff = build_market_universe_diff(
+                previous,
+                preserved,
+                now_ts=current_ts,
+                forced=forced,
+                error=(
+                    "market_discovery_failed_preserving_previous_universe "
+                    f"{self.discovery_failure_reason}"
+                ),
+            )
+            self._last_diff = diff
+            self._last_discovery_ts = current_ts
+            self._schedule_next(current_ts)
+            return diff
 
         self.market_refresh_count += 1
-        if forced:
-            self.forced_market_refresh_count += 1
         self._markets = selected
         self._last_discovery_ts = current_ts
+        current_signal_slugs = _current_signal_slugs(selected, now_ts=current_ts)
+        if current_signal_slugs:
+            self.discovery_failure_reason = None
+            self.last_successful_discovery_ts = current_ts
+            self.last_successful_current_signal_slugs = current_signal_slugs
+        else:
+            self.discovery_failure_reason = "no_current_signal_markets_after_full_discovery"
         self._schedule_next(current_ts)
         diff = build_market_universe_diff(previous, selected, now_ts=current_ts, forced=forced)
         self._last_diff = diff
@@ -180,6 +267,130 @@ class RuntimeMarketUniverseManager:
     def _schedule_next(self, current_ts: int) -> None:
         interval_s = max(1, self.refresh_interval_ms // 1000)
         self._next_discovery_ts = current_ts + interval_s
+
+
+def _legacy_discovery_attempt(
+    *,
+    discovered: Sequence[PolymarketMarketMetadata],
+    selected: Sequence[PolymarketMarketMetadata],
+    now_ts: int,
+    refresh_reason: str,
+) -> dict[str, Any]:
+    current_signal_slugs = [
+        market.market_slug
+        for market in selected
+        if classify_market_window(market, now_ts=now_ts) == "current_signal"
+    ]
+    next_warmup_slugs = [
+        market.market_slug
+        for market in selected
+        if classify_market_window(market, now_ts=now_ts) == "next_warmup"
+        or market.runtime_selection_reason == "next_warmup"
+    ]
+    return {
+        "event_type": "polymarket_discovery_attempt",
+        "refresh_reason": refresh_reason,
+        "direct_found_count": 0,
+        "direct_runtime_count": 0,
+        "active_events_found_count": 0,
+        "active_events_runtime_count": 0,
+        "cache_runtime_count": 0,
+        "runtime_tradable_count": len(selected),
+        "current_signal_count": len(current_signal_slugs),
+        "next_warmup_count": len(next_warmup_slugs),
+        "fallback_used": False,
+        "cache_used": False,
+        "cache_rejected": False,
+        "cache_rejected_reason": None,
+        "failure_reason": None if selected else "no_runtime_tradable_markets",
+        "selected_market_slugs": [market.market_slug for market in selected],
+        "current_signal_slugs": current_signal_slugs,
+        "next_warmup_slugs": next_warmup_slugs,
+        "diagnostics": [],
+        "strategy_results": {
+            "legacy_discover": {
+                "attempted": True,
+                "market_count": len(discovered),
+                "runtime_tradable_count": len(selected),
+            }
+        },
+    }
+
+
+def _attempt_summary(attempt: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "refresh_reason",
+        "direct_found_count",
+        "direct_runtime_count",
+        "active_events_found_count",
+        "active_events_runtime_count",
+        "active_events_found_runtime_count",
+        "cache_runtime_count",
+        "fallback_used",
+        "cache_used",
+        "cache_rejected",
+        "cache_rejected_reason",
+        "cache_not_updated_reason",
+        "failure_reason",
+        "selected_market_slugs",
+        "current_signal_slugs",
+        "next_warmup_slugs",
+        "diagnostics",
+    )
+    summary = {key: attempt.get(key) for key in keys if key in attempt}
+    if "active_events_runtime_count" not in summary and "active_events_found_runtime_count" in summary:
+        summary["active_events_runtime_count"] = summary["active_events_found_runtime_count"]
+    summary["failure_reasons"] = _derive_discovery_failure_reasons(attempt)
+    return summary
+
+
+def _derive_discovery_failure_reason(attempt: dict[str, Any]) -> str:
+    reasons = _derive_discovery_failure_reasons(attempt)
+    if reasons:
+        for reason in (
+            "direct_slug_all_closed",
+            "active_events_no_runtime_markets",
+            "cache_rejected_for_runtime",
+            "no_runtime_markets_after_full_discovery",
+        ):
+            if reason in reasons:
+                return reason
+        return reasons[0]
+    return str(attempt.get("failure_reason") or "no_runtime_markets_after_full_discovery")
+
+
+def _derive_discovery_failure_reasons(attempt: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    diagnostics = {str(value) for value in attempt.get("diagnostics") or ()}
+    if attempt.get("failure_reason") == "direct_slug_found_but_all_closed":
+        reasons.append("direct_slug_all_closed")
+    if "direct_slug_found_but_all_closed" in diagnostics:
+        reasons.append("direct_slug_all_closed")
+    if attempt.get("direct_found_count", 0) and attempt.get("direct_runtime_count", 0) == 0:
+        if attempt.get("closed_count", 0) >= attempt.get("direct_found_count", 0):
+            reasons.append("direct_slug_all_closed")
+    if attempt.get("cache_rejected") is True:
+        reasons.append("cache_rejected_for_runtime")
+    if attempt.get("fallback_used") and attempt.get("active_events_runtime_count", 0) == 0:
+        reasons.append("active_events_no_runtime_markets")
+    if not attempt.get("runtime_tradable_count", 0):
+        reasons.append("no_runtime_markets_after_full_discovery")
+    if attempt.get("failure_reason") and not reasons:
+        reasons.append(str(attempt["failure_reason"]))
+    return sorted(set(reasons))
+
+
+def _current_signal_slugs(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+) -> tuple[str, ...]:
+    return tuple(
+        market.market_slug
+        for market in markets
+        if is_runtime_tradable_market(market, now_ts=now_ts)
+        and classify_market_window(market, now_ts=now_ts) == "current_signal"
+    )
 
 
 def select_runtime_market_universe(
@@ -233,6 +444,10 @@ def build_market_universe_snapshot(
     market_refresh_count: int = 0,
     forced_market_refresh_count: int = 0,
     market_refresh_error_count: int = 0,
+    discovery_failure_reason: str | None = None,
+    last_discovery_attempt_summary: dict[str, Any] | None = None,
+    last_successful_discovery_ts: int | None = None,
+    last_successful_current_signal_slugs: Sequence[str] = (),
     last_diff: MarketUniverseDiff | None = None,
 ) -> MarketUniverseSnapshot:
     current: list[PolymarketMarketMetadata] = []
@@ -280,6 +495,10 @@ def build_market_universe_snapshot(
         market_refresh_count=market_refresh_count,
         forced_market_refresh_count=forced_market_refresh_count,
         market_refresh_error_count=market_refresh_error_count,
+        discovery_failure_reason=discovery_failure_reason,
+        last_discovery_attempt_summary=dict(last_discovery_attempt_summary or {}),
+        last_successful_discovery_ts=last_successful_discovery_ts,
+        last_successful_current_signal_slugs=tuple(last_successful_current_signal_slugs),
         last_diff=last_diff or MarketUniverseDiff(),
     )
 

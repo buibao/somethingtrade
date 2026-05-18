@@ -1,9 +1,0 @@
-﻿bot/app/core/events.py
-bot/app/main.py
-bot/app/marketdata/polymarket_orderbook.py
-bot/app/marketdata/polymarket_ws.py
-bot/app/state/market_state.py
-bot/app/strategy/gap_detector.py
-docs/phase4_runtime_correctness.md
-tests/test_gap_detector.py
-tests/test_phase4_runtime_correctness.py

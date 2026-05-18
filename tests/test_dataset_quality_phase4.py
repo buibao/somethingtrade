@@ -348,6 +348,43 @@ def test_phase4_warns_when_tolerated_rows_need_mismatch_samples(tmp_path: Path) 
     assert "tolerated_mismatch_rows_without_mismatch_samples" in report["warnings"]
 
 
+def test_report_warns_when_gap_event_coverage_shorter_than_runtime(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    runtime_path = tmp_path / "runtime_summary.jsonl"
+    rows = [_base_row(1), _base_row(2)]
+    rows[0]["detected_ts_ns"] = 1_000_000_000
+    rows[1]["detected_ts_ns"] = 61_000_000_000
+    _write_rows(events_path, rows)
+    _write_rows(
+        runtime_path,
+        [
+            {
+                "event_type": "runtime_summary",
+                "generated_ts_ns": 0,
+                "no_event_warnings": [],
+            },
+            {
+                "event_type": "runtime_summary",
+                "generated_ts_ns": 7_200_000_000_000,
+                "no_event_warnings": ["no_signal_enabled_markets_while_binance_moves_continue"],
+            },
+        ],
+    )
+
+    report = build_phase4_dataset_quality_report(
+        events_path,
+        runtime_summary_jsonl_path=runtime_path,
+    )
+
+    coverage = report["runtime_coverage_analysis"]
+    assert coverage["status"] == "analyzed"
+    assert coverage["gap_event_time_coverage_ratio"] < 0.50
+    assert "gap_event_coverage_shorter_than_runtime" in coverage["warning_flags"]
+    assert "gap_event_coverage_shorter_than_runtime" in report["warnings"]
+    checks = {check["check_name"]: check for check in report["readiness_assessment"]["checks"]}
+    assert checks["runtime_gap_event_coverage"]["status"] == "WARN"
+
+
 def test_phase4_csv_outputs_are_written(tmp_path: Path) -> None:
     path = tmp_path / "events.jsonl"
     csv_dir = tmp_path / "csv"

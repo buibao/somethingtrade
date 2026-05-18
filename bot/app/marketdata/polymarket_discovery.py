@@ -221,6 +221,7 @@ class PolymarketDiscoveryClient:
         rolling_lookahead_windows: int = 2,
         market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
         discovery_debug_jsonl: Path | str | None = None,
+        refresh_reason: str | None = None,
     ) -> tuple[PolymarketMarketMetadata, ...]:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
         if self.enable_direct_slug_lookup:
@@ -230,6 +231,7 @@ class PolymarketDiscoveryClient:
                 market_cache_ttl_ms=market_cache_ttl_ms,
                 discovery_debug_jsonl=discovery_debug_jsonl,
                 write_cache=write_cache,
+                refresh_reason=refresh_reason,
             )
             if rolling_result.markets:
                 return rolling_result.markets
@@ -242,7 +244,7 @@ class PolymarketDiscoveryClient:
         )
 
         if write_cache:
-            self.write_cache(markets)
+            self.write_runtime_cache_if_usable(markets, now_ts=current_ts)
         return tuple(markets)
 
     async def discover_rolling_markets(
@@ -274,6 +276,7 @@ class PolymarketDiscoveryClient:
         force_active_events: bool = False,
         use_cache: bool = True,
         include_raw: bool = False,
+        refresh_reason: str | None = None,
     ) -> RollingDiscoveryResult:
         """Discover rolling markets from direct slugs, active events, and safe cache."""
 
@@ -297,7 +300,22 @@ class PolymarketDiscoveryClient:
             now_ts=current_ts,
             lookahead_windows=lookahead_windows,
         )
-        fallback_used = force_active_events or not direct_runtime
+        cache_validation = self.validate_cache_for_runtime(
+            now_ts=current_ts,
+            ttl_ms=market_cache_ttl_ms,
+            lookahead_windows=lookahead_windows,
+        )
+        direct_classifications = [
+            classify_market_window(market, now_ts=current_ts) for market in direct_markets
+        ]
+        fallback_used = (
+            force_active_events
+            or not direct_runtime
+            or not any(market.signal_enabled for market in direct_runtime)
+            or (bool(direct_markets) and all(value == "closed" for value in direct_classifications))
+            or (bool(direct_markets) and all(market.accepting_orders is False for market in direct_markets))
+            or cache_validation.rejected
+        )
         active_markets: tuple[PolymarketMarketMetadata, ...] = ()
         active_result: dict[str, Any] = _empty_active_events_result(attempted=False)
         if fallback_used:
@@ -321,11 +339,6 @@ class PolymarketDiscoveryClient:
             lookahead_windows=lookahead_windows,
         )
 
-        cache_validation = self.validate_cache_for_runtime(
-            now_ts=current_ts,
-            ttl_ms=market_cache_ttl_ms,
-            lookahead_windows=lookahead_windows,
-        )
         cache_used = False
         final_markets = merged_markets
         if use_cache and not runtime_markets and cache_validation.valid:
@@ -333,9 +346,13 @@ class PolymarketDiscoveryClient:
             runtime_markets = cache_validation.runtime_markets
             cache_used = True
 
-        if write_cache and final_markets and not cache_used:
-            self.write_cache(final_markets)
-
+        cache_not_updated_reason = None
+        if write_cache and not cache_used:
+            cache_not_updated_reason = self.write_runtime_cache_if_usable(
+                final_markets,
+                runtime_markets=runtime_markets,
+                now_ts=current_ts,
+            )
         attempt = _build_discovery_attempt(
             now_ts=current_ts,
             final_markets=final_markets,
@@ -347,6 +364,8 @@ class PolymarketDiscoveryClient:
             cache_validation=cache_validation,
             cache_used=cache_used,
             fallback_used=fallback_used,
+            refresh_reason=refresh_reason,
+            cache_not_updated_reason=cache_not_updated_reason,
         )
         if discovery_debug_jsonl is not None:
             write_discovery_attempt_jsonl(discovery_debug_jsonl, attempt)
@@ -485,8 +504,19 @@ class PolymarketDiscoveryClient:
             now_ts=current_ts,
             lookahead_windows=lookahead_windows,
         )
-        result["runtime_tradable_count"] = sum(
-            1 for market in annotated if is_runtime_tradable_market(market, now_ts=current_ts)
+        active_runtime = select_runtime_markets(
+            annotated,
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+        current_signal_count = sum(1 for market in active_runtime if market.signal_enabled)
+        result["runtime_candidate_count"] = len(active_runtime)
+        result["runtime_tradable_count"] = current_signal_count
+        result["current_signal_count"] = current_signal_count
+        result["next_warmup_count"] = sum(
+            1
+            for market in active_runtime
+            if market.runtime_selection_reason == "next_warmup"
         )
         result["reject_reasons"] = [
             {"reason": reason, "count": count}
@@ -850,6 +880,35 @@ class PolymarketDiscoveryClient:
             )
         )
 
+    def write_runtime_cache_if_usable(
+        self,
+        markets: Sequence[PolymarketMarketMetadata],
+        *,
+        runtime_markets: Sequence[PolymarketMarketMetadata] | None = None,
+        now_ts: int | None = None,
+    ) -> str | None:
+        current_ts = now_ts or utc_now_ns() // 1_000_000_000
+        annotated = annotate_runtime_market_roles(markets, now_ts=current_ts)
+        selected = (
+            tuple(runtime_markets)
+            if runtime_markets is not None
+            else select_runtime_markets(annotated, now_ts=current_ts)
+        )
+        if annotated and all(market.closed is True for market in annotated):
+            return "cache_not_updated_all_closed"
+        if annotated and all(market.accepting_orders is False for market in annotated):
+            return "cache_not_updated_all_accepting_orders_false"
+        if not selected:
+            return "cache_not_updated_runtime_count_zero"
+        if not any(
+            market.classification in {"current_signal", "next_warmup"}
+            or market.runtime_selection_reason in {"current_signal", "next_warmup"}
+            for market in selected
+        ):
+            return "cache_not_updated_no_current_or_warmup"
+        self.write_cache(annotated)
+        return None
+
     def read_cache(self) -> PolymarketMarketCache:
         if not self.cache_path.exists():
             return PolymarketMarketCache()
@@ -893,6 +952,9 @@ def _empty_active_events_result(*, attempted: bool) -> dict[str, Any]:
         "candidate_count": 0,
         "parsed_count": 0,
         "runtime_tradable_count": 0,
+        "runtime_candidate_count": 0,
+        "current_signal_count": 0,
+        "next_warmup_count": 0,
         "reject_reasons": [],
         "rejected_candidates": [],
         "markets": [],
@@ -939,6 +1001,8 @@ def _build_discovery_attempt(
     cache_validation: CacheRuntimeValidation,
     cache_used: bool,
     fallback_used: bool,
+    refresh_reason: str | None = None,
+    cache_not_updated_reason: str | None = None,
 ) -> dict[str, Any]:
     time_diagnostics = _time_sanity_diagnostics(now_ts, direct_markets, direct_results)
     classifications = Counter(
@@ -958,6 +1022,8 @@ def _build_discovery_attempt(
     direct_runtime_count = sum(
         1 for market in direct_markets if is_runtime_tradable_market(market, now_ts=now_ts)
     )
+    active_events_runtime_count = int(active_result.get("runtime_tradable_count", 0))
+    cache_runtime_count = len(cache_validation.runtime_markets)
     if not runtime_markets:
         if direct_found_count and direct_markets and all(
             classify_market_window(market, now_ts=now_ts) == "closed"
@@ -973,6 +1039,7 @@ def _build_discovery_attempt(
 
     attempt = {
         "event_type": "polymarket_discovery_attempt",
+        "refresh_reason": refresh_reason,
         "timestamp": _iso_from_unix_seconds(now_ts),
         "now_utc": _iso_from_unix_seconds(now_ts),
         "now_utc_iso": _iso_from_unix_seconds(now_ts),
@@ -997,8 +1064,11 @@ def _build_discovery_attempt(
         },
         "generated_slug_count": len(direct_results),
         "direct_found_count": direct_found_count,
+        "direct_runtime_count": direct_runtime_count,
         "active_events_found_count": len(active_markets),
-        "active_events_found_runtime_count": active_result.get("runtime_tradable_count", 0),
+        "active_events_runtime_count": active_events_runtime_count,
+        "active_events_found_runtime_count": active_events_runtime_count,
+        "cache_runtime_count": cache_runtime_count,
         "runtime_tradable_count": len(runtime_markets),
         "current_signal_count": len(current_signal_slugs),
         "next_warmup_count": len(next_warmup_slugs),
@@ -1013,6 +1083,8 @@ def _build_discovery_attempt(
         "cache_used": cache_used,
         "cache_rejected": cache_validation.rejected,
         "cache_rejected_reason": cache_validation.rejected_reason,
+        "cache_not_updated": cache_not_updated_reason is not None,
+        "cache_not_updated_reason": cache_not_updated_reason,
         "selected_market_slugs": selected_market_slugs,
         "current_signal_slugs": current_signal_slugs,
         "next_warmup_slugs": next_warmup_slugs,
@@ -1867,6 +1939,14 @@ def _merge_event_market_payload(
         "minimum_order_size",
         "min_order_size",
         "rewardsMinSize",
+        "clobTokenIds",
+        "clob_token_ids",
+        "outcomes",
+        "groupItemTitle",
+        "subtitle",
+        "description",
+        "conditionId",
+        "condition_id",
     ):
         if key not in merged and event.get(key) is not None:
             merged[key] = event[key]

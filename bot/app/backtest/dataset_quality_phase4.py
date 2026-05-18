@@ -191,6 +191,7 @@ def build_phase4_dataset_quality_report(
     include_diagnostic: bool = False,
     print_top: int = 20,
     mismatch_samples_path: str | Path | None = None,
+    runtime_summary_jsonl_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build the Phase 4 offline dataset quality and calibration report."""
 
@@ -225,6 +226,10 @@ def build_phase4_dataset_quality_report(
         included_rows,
         mismatch_samples_path=mismatch_samples_path,
     )
+    runtime_coverage_analysis = _build_runtime_coverage_analysis(
+        included_rows,
+        runtime_summary_jsonl_path=runtime_summary_jsonl_path,
+    )
     empirical_bucket_analysis = _build_empirical_bucket_analysis(
         primary_rows,
         primary_min_tier=normalized_primary_min_tier,
@@ -242,6 +247,7 @@ def build_phase4_dataset_quality_report(
         timing_analysis=timing_analysis,
         stale_feed_analysis=stale_feed_analysis,
         tick_calibration_analysis=tick_calibration_analysis,
+        runtime_coverage_analysis=runtime_coverage_analysis,
         empirical_bucket_analysis=empirical_bucket_analysis,
         cohort_sensitivity=cohort_sensitivity,
     )
@@ -252,6 +258,7 @@ def build_phase4_dataset_quality_report(
         timing_analysis=timing_analysis,
         edge_analysis=edge_analysis,
         stale_feed_analysis=stale_feed_analysis,
+        runtime_coverage_analysis=runtime_coverage_analysis,
         empirical_bucket_analysis=empirical_bucket_analysis,
         cohort_sensitivity=cohort_sensitivity,
         warnings=warnings,
@@ -269,6 +276,9 @@ def build_phase4_dataset_quality_report(
         "primary_min_tier": normalized_primary_min_tier,
         "min_quality_tier": normalized_min_tier,
         "include_diagnostic": include_diagnostic,
+        "runtime_summary_jsonl_path": (
+            None if runtime_summary_jsonl_path is None else str(runtime_summary_jsonl_path)
+        ),
         "code_scope": CODE_SCOPE,
         "realtime_path_modified": False,
         "model_prediction_added": False,
@@ -289,6 +299,7 @@ def build_phase4_dataset_quality_report(
         "liquidity_and_spread_analysis": liquidity_and_spread_analysis,
         "stale_feed_analysis": stale_feed_analysis,
         "tick_calibration_analysis": tick_calibration_analysis,
+        "runtime_coverage_analysis": runtime_coverage_analysis,
         "empirical_bucket_analysis": empirical_bucket_analysis,
         "cohort_sensitivity": cohort_sensitivity,
         "warnings": warnings,
@@ -529,6 +540,16 @@ def render_phase4_markdown_report(report: dict[str, Any]) -> str:
         f"- Binance stale rate: {_format_rate(report['stale_feed_analysis']['binance_stale_rate'])}",
         f"- Polymarket stale rate: {_format_rate(report['stale_feed_analysis']['polymarket_stale_rate'])}",
         f"- Both stale rate: {_format_rate(report['stale_feed_analysis']['both_stale_rate'])}",
+        "",
+        "## 10.5 Runtime Coverage Analysis",
+        "",
+        f"- Runtime coverage status: {report['runtime_coverage_analysis']['status']}",
+        f"- Runtime summary rows: {report['runtime_coverage_analysis'].get('runtime_summary_rows', 0)}",
+        (
+            "- Gap-event/runtime coverage ratio: "
+            f"{_format_rate(report['runtime_coverage_analysis'].get('gap_event_time_coverage_ratio'))}"
+        ),
+        f"- Runtime coverage warnings: {', '.join(report['runtime_coverage_analysis'].get('warning_flags', [])) or '-'}",
         "",
         "## 11. Tick Calibration Analysis",
         "",
@@ -1293,6 +1314,87 @@ def _build_cohort_sensitivity(
     }
 
 
+def _build_runtime_coverage_analysis(
+    gap_rows: list[dict[str, Any]],
+    *,
+    runtime_summary_jsonl_path: str | Path | None,
+) -> dict[str, Any]:
+    if runtime_summary_jsonl_path is None:
+        return {
+            "status": "skipped_no_runtime_summary_input",
+            "runtime_summary_path": None,
+            "runtime_summary_rows": 0,
+            "warning_flags": [],
+        }
+
+    summary_path = Path(runtime_summary_jsonl_path)
+    try:
+        audit = _read_jsonl_with_audit(summary_path)
+    except FileNotFoundError:
+        return {
+            "status": "skipped_missing_runtime_summary_input",
+            "runtime_summary_path": str(summary_path),
+            "runtime_summary_rows": 0,
+            "warning_flags": ["runtime_summary_jsonl_missing"],
+        }
+
+    runtime_rows = [
+        row
+        for row in audit.rows
+        if row.get("event_type") == "runtime_summary" or row.get("generated_ts_ns") is not None
+    ]
+    runtime_timestamps = sorted(_int_values(runtime_rows, "generated_ts_ns"))
+    gap_timestamps = sorted(_int_values(gap_rows, "detected_ts_ns"))
+    runtime_duration_ns = (
+        runtime_timestamps[-1] - runtime_timestamps[0]
+        if len(runtime_timestamps) >= 2
+        else None
+    )
+    gap_event_duration_ns = (
+        gap_timestamps[-1] - gap_timestamps[0] if len(gap_timestamps) >= 2 else 0
+    )
+    coverage_ratio = (
+        gap_event_duration_ns / runtime_duration_ns
+        if runtime_duration_ns is not None and runtime_duration_ns > 0
+        else None
+    )
+    warning_flags: list[str] = []
+    if runtime_duration_ns is not None and runtime_duration_ns > 0:
+        if not gap_timestamps or (coverage_ratio is not None and coverage_ratio < 0.50):
+            warning_flags.append("gap_event_coverage_shorter_than_runtime")
+
+    no_event_warning_counts: Counter[str] = Counter()
+    for row in runtime_rows:
+        warnings = row.get("no_event_warnings")
+        if isinstance(warnings, list):
+            for warning in warnings:
+                no_event_warning_counts[str(warning)] += 1
+        single_warning = row.get("no_event_warning")
+        if single_warning:
+            no_event_warning_counts[str(single_warning)] += 1
+
+    if no_event_warning_counts:
+        warning_flags.append("runtime_summary_contains_no_event_warnings")
+
+    return {
+        "status": "analyzed",
+        "runtime_summary_path": str(summary_path),
+        "runtime_summary_rows": len(runtime_rows),
+        "runtime_duration_ns": runtime_duration_ns,
+        "runtime_duration_minutes": (
+            runtime_duration_ns / 1_000_000_000 / 60
+            if runtime_duration_ns is not None
+            else None
+        ),
+        "gap_event_rows": len(gap_rows),
+        "gap_event_duration_ns": gap_event_duration_ns,
+        "gap_event_duration_minutes": gap_event_duration_ns / 1_000_000_000 / 60,
+        "gap_event_time_coverage_ratio": coverage_ratio,
+        "no_event_warning_counts": dict(sorted(no_event_warning_counts.items())),
+        "warning_flags": sorted(set(warning_flags)),
+    }
+
+
 def _build_warnings(
     *,
     input_audit: dict[str, Any],
@@ -1301,6 +1403,7 @@ def _build_warnings(
     timing_analysis: dict[str, Any],
     stale_feed_analysis: dict[str, Any],
     tick_calibration_analysis: dict[str, Any],
+    runtime_coverage_analysis: dict[str, Any],
     empirical_bucket_analysis: dict[str, Any],
     cohort_sensitivity: dict[str, Any],
 ) -> list[str]:
@@ -1323,6 +1426,7 @@ def _build_warnings(
     if stale_feed_analysis["quote_age_fields_missing"]:
         warnings.append("quote_age_fields_missing")
     warnings.extend(str(flag) for flag in tick_calibration_analysis.get("warning_flags", []))
+    warnings.extend(str(flag) for flag in runtime_coverage_analysis.get("warning_flags", []))
     book_incomplete_rate = _rate(
         int(dataset_health["rows_by_reject_reason"].get("book_incomplete", 0)),
         dataset_health["included_rows"],
@@ -1352,6 +1456,7 @@ def _build_readiness_assessment(
     timing_analysis: dict[str, Any],
     edge_analysis: dict[str, Any],
     stale_feed_analysis: dict[str, Any],
+    runtime_coverage_analysis: dict[str, Any],
     empirical_bucket_analysis: dict[str, Any],
     cohort_sensitivity: dict[str, Any],
     warnings: list[str],
@@ -1363,6 +1468,7 @@ def _build_readiness_assessment(
         timing_analysis=timing_analysis,
         edge_analysis=edge_analysis,
         stale_feed_analysis=stale_feed_analysis,
+        runtime_coverage_analysis=runtime_coverage_analysis,
         empirical_bucket_analysis=empirical_bucket_analysis,
         cohort_sensitivity=cohort_sensitivity,
     )
@@ -1461,6 +1567,7 @@ def _readiness_checks(
     timing_analysis: dict[str, Any],
     edge_analysis: dict[str, Any],
     stale_feed_analysis: dict[str, Any],
+    runtime_coverage_analysis: dict[str, Any],
     empirical_bucket_analysis: dict[str, Any],
     cohort_sensitivity: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -1558,6 +1665,15 @@ def _readiness_checks(
             MAX_BOOK_INCOMPLETE_RATE,
             "blocking",
             "book incomplete reject rate should be below threshold",
+        ),
+        _check(
+            "runtime_gap_event_coverage",
+            "gap_event_coverage_shorter_than_runtime"
+            not in runtime_coverage_analysis.get("warning_flags", []),
+            runtime_coverage_analysis.get("gap_event_time_coverage_ratio"),
+            ">= 0.50 when runtime summary JSONL is provided",
+            "warning",
+            "gap_event_coverage_shorter_than_runtime",
         ),
         _check(
             "success_rows_for_empirical",

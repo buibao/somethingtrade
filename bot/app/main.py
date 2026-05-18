@@ -351,6 +351,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional Polymarket orderbook mismatch sample JSONL path.",
     )
+    quality_report.add_argument(
+        "--runtime-summary-jsonl",
+        default=None,
+        help="Optional runtime summary JSONL path for gap-event coverage diagnostics.",
+    )
 
     return parser.parse_args(argv)
 
@@ -472,6 +477,7 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         refresh_interval_ms=args.market_refresh_interval_ms,
         lookahead_windows=args.market_refresh_lookahead_windows,
         market_cache_ttl_ms=args.market_cache_ttl_ms,
+        discovery_debug_jsonl=args.discovery_debug_jsonl,
     )
     markets = universe_manager.markets
     state = MarketState(max_polymarket_quote_age_ms=settings.polymarket_max_quote_age_ms)
@@ -581,7 +587,17 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
             force_lifecycle_refresh = runtime_summary.consume_lifecycle_refresh_request()
             if universe_manager.refresh_due() or force_no_signal_refresh or force_lifecycle_refresh:
                 forced = force_no_signal_refresh or force_lifecycle_refresh
-                diff = await universe_manager.refresh(forced=forced)
+                refresh_reason = (
+                    "forced_no_signal"
+                    if force_no_signal_refresh
+                    else "lifecycle_new_market"
+                    if force_lifecycle_refresh
+                    else "scheduled"
+                )
+                diff = await universe_manager.refresh(
+                    forced=forced,
+                    refresh_reason=refresh_reason,
+                )
                 if forced:
                     next_forced_refresh_allowed_at = loop.time() + market_refresh_interval_s
                     last_forced_refresh_move_total = move_total
@@ -821,6 +837,7 @@ def run_dataset_quality_report(args: argparse.Namespace) -> None:
             include_diagnostic=args.include_diagnostic,
             print_top=args.print_top,
             mismatch_samples_path=args.mismatch_samples,
+            runtime_summary_jsonl_path=args.runtime_summary_jsonl,
         )
     except FileNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
@@ -947,9 +964,17 @@ class GapRuntimeSummary:
             market_refresh_count=self.market_universe.market_refresh_count,
             forced_market_refresh_count=self.market_universe.forced_market_refresh_count,
             market_refresh_error_count=self.market_universe.market_refresh_error_count,
+            discovery_failure_reason=self.market_universe.discovery_failure_reason,
+            last_discovery_attempt_summary=self.market_universe.last_discovery_attempt_summary,
+            last_successful_discovery_ts=self.market_universe.last_successful_discovery_ts,
+            last_successful_current_signal_slugs=(
+                self.market_universe.last_successful_current_signal_slugs
+            ),
             last_diff=self._last_diff,
         )
         self.market_universe = universe_snapshot
+        last_attempt = universe_snapshot.last_discovery_attempt_summary
+        no_event_duration_ms = (now_ns - self._last_gap_event_change_ts_ns) / 1_000_000.0
         subscription_matches = _subscription_matches(ws_diagnostics)
         if subscription_matches is False:
             if self._subscription_divergence_first_seen_ns is None:
@@ -1027,6 +1052,10 @@ class GapRuntimeSummary:
                     len(universe_snapshot.token_ids),
                 )
             ),
+            "subscription_status": ws_diagnostics.get("subscription_status"),
+            "active_subscription_established": ws_diagnostics.get(
+                "active_subscription_established"
+            ),
             "runtime_token_count": int(
                 ws_diagnostics.get("runtime_token_count", len(universe_snapshot.token_ids))
             ),
@@ -1058,6 +1087,20 @@ class GapRuntimeSummary:
             "tracked_market_count": universe_snapshot.tracked_market_count,
             "last_market_discovery_ts": universe_snapshot.last_market_discovery_ts,
             "next_market_discovery_ts": universe_snapshot.next_market_discovery_ts,
+            "discovery_failure_reason": universe_snapshot.discovery_failure_reason,
+            "last_discovery_attempt_summary": last_attempt,
+            "last_successful_discovery_ts": universe_snapshot.last_successful_discovery_ts,
+            "last_successful_current_signal_slugs": list(
+                universe_snapshot.last_successful_current_signal_slugs
+            ),
+            "direct_runtime_count": int(last_attempt.get("direct_runtime_count") or 0),
+            "active_events_runtime_count": int(
+                last_attempt.get("active_events_runtime_count")
+                or last_attempt.get("active_events_found_runtime_count")
+                or 0
+            ),
+            "cache_runtime_count": int(last_attempt.get("cache_runtime_count") or 0),
+            "no_event_duration_ms": no_event_duration_ms,
             "new_markets_added_count": len(self._last_diff.added_markets),
             "expired_markets_removed_count": len(self._last_diff.expired_markets),
             "current_market_slugs_by_base_asset": _slugs_by_base(
@@ -1098,6 +1141,12 @@ class GapRuntimeSummary:
             stats,
             ws_diagnostics,
             now_ns=now_ns,
+        )
+        payload["no_event_warning"] = (
+            "no_signal_enabled_markets_while_binance_moves_continue"
+            if "no_signal_enabled_markets_while_binance_moves_continue"
+            in payload["no_event_warnings"]
+            else (payload["no_event_warnings"][0] if payload["no_event_warnings"] else None)
         )
         self._last_summary_ts_ns = now_ns
         return payload
@@ -1200,6 +1249,10 @@ class GapRuntimeSummary:
                 f"market_refresh_count={payload['market_refresh_count']}",
                 f"forced_market_refresh_count={payload['forced_market_refresh_count']}",
                 f"market_refresh_error_count={payload['market_refresh_error_count']}",
+                f"discovery_failure_reason={payload['discovery_failure_reason'] or '-'}",
+                f"direct_runtime_count={payload['direct_runtime_count']}",
+                f"active_events_runtime_count={payload['active_events_runtime_count']}",
+                f"cache_runtime_count={payload['cache_runtime_count']}",
                 f"runtime_status={payload['runtime_status']}",
                 f"no_event_warnings={','.join(payload['no_event_warnings']) or '-'}",
             ]
@@ -1328,7 +1381,11 @@ class GapRuntimeSummary:
         active_tokens = int(
             ws_diagnostics.get("active_ws_token_subscription_count", runtime_tokens)
         )
-        if runtime_tokens != active_tokens:
+        if (
+            runtime_tokens != active_tokens
+            and payload["subscription_token_set_matches_runtime_universe"] is not None
+            and not payload["subscription_transition_active"]
+        ):
             warnings.append("market_subscriptions_stale")
         if payload["market_refresh_error_count"] > 0:
             warnings.append("market_refresh_failing")
@@ -1443,6 +1500,8 @@ def _runtime_status(
     stats: GapMonitorStats,
     ws_diagnostics: dict[str, Any],
 ) -> str:
+    if payload.get("discovery_failure_reason") and not payload["signal_enabled_markets_by_base_asset"]:
+        return "discovery_degraded"
     if payload["market_refresh_error_count"] > 0 and not payload["signal_enabled_markets_by_base_asset"]:
         return "market_refresh_failing"
     if not payload["signal_enabled_markets_by_base_asset"]:
@@ -1490,8 +1549,13 @@ def should_force_market_refresh(
 def _subscription_matches(ws_diagnostics: dict[str, Any]) -> bool | None:
     if not ws_diagnostics:
         return None
+    if ws_diagnostics.get("subscription_status") == "pending":
+        return None
     if "subscription_out_of_sync" in ws_diagnostics:
-        return ws_diagnostics.get("subscription_out_of_sync") is False
+        out_of_sync = ws_diagnostics.get("subscription_out_of_sync")
+        if isinstance(out_of_sync, bool):
+            return out_of_sync is False
+        return None
     runtime_count = ws_diagnostics.get("runtime_token_count")
     active_count = ws_diagnostics.get("active_ws_token_subscription_count")
     if isinstance(runtime_count, int) and isinstance(active_count, int):
@@ -1633,6 +1697,7 @@ async def _discover_polymarket_markets_once(
                 lookahead_windows=lookahead_windows,
                 market_cache_ttl_ms=market_cache_ttl_ms,
                 discovery_debug_jsonl=discovery_debug_jsonl,
+                refresh_reason="startup",
             )
         else:
             legacy_discovered = await discovery.discover(
@@ -1641,6 +1706,7 @@ async def _discover_polymarket_markets_once(
                 rolling_lookahead_windows=lookahead_windows,
                 market_cache_ttl_ms=market_cache_ttl_ms,
                 discovery_debug_jsonl=discovery_debug_jsonl,
+                refresh_reason="startup",
             )
             runtime_markets = (
                 select_runtime_market_universe(
@@ -1653,6 +1719,7 @@ async def _discover_polymarket_markets_once(
             )
             attempt = {
                 "event_type": "polymarket_discovery_attempt",
+                "refresh_reason": "startup",
                 "runtime_tradable_count": len(runtime_markets),
                 "current_signal_count": sum(1 for market in runtime_markets if market.signal_enabled),
                 "next_warmup_count": sum(
@@ -1686,6 +1753,7 @@ async def _discover_polymarket_markets_once(
         )
         attempt = {
             "event_type": "polymarket_discovery_attempt",
+            "refresh_reason": "startup",
             "timestamp": None,
             "now_utc": None,
             "strategy_results": {"cache": cache_validation.to_summary()},

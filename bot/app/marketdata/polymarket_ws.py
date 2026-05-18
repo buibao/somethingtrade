@@ -157,7 +157,7 @@ class PolymarketWSClient:
 
     @property
     def active_subscription_token_ids(self) -> tuple[str, ...]:
-        return self._active_subscription_token_ids or self.token_ids
+        return self._active_subscription_token_ids
 
     @property
     def active_ws_token_subscription_count(self) -> int:
@@ -174,15 +174,30 @@ class PolymarketWSClient:
     def subscription_diagnostics(self) -> dict[str, Any]:
         runtime_tokens = set(self.token_ids)
         active_tokens = set(self.active_subscription_token_ids)
+        active_established = self._active_subscription_version >= 0
+        if not active_established:
+            status = "pending"
+            out_of_sync: bool | None = None
+        elif self._subscription_transition_active:
+            status = "transition"
+            out_of_sync = runtime_tokens != active_tokens
+        elif runtime_tokens == active_tokens:
+            status = "active"
+            out_of_sync = False
+        else:
+            status = "out_of_sync"
+            out_of_sync = True
         return {
             "runtime_token_count": len(runtime_tokens),
             "active_ws_token_subscription_count": len(active_tokens),
+            "active_subscription_established": active_established,
+            "subscription_status": status,
             "subscription_transition_active": self._subscription_transition_active,
             "subscription_update_count": self._subscription_update_count,
             "websocket_reconnect_count": self._subscription_reconnect_count,
             "missing_active_tokens": sorted(runtime_tokens - active_tokens),
             "extra_active_tokens": sorted(active_tokens - runtime_tokens),
-            "subscription_out_of_sync": runtime_tokens != active_tokens,
+            "subscription_out_of_sync": out_of_sync,
         }
 
     async def stream(

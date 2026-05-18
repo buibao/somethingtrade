@@ -23,6 +23,7 @@ from app.main import (
 from app.marketdata.market_universe import (
     RuntimeMarketUniverseManager,
     build_market_universe_diff,
+    build_market_universe_snapshot,
     select_runtime_market_universe,
 )
 from app.marketdata.polymarket_discovery import PolymarketDiscoveryClient
@@ -207,8 +208,15 @@ class FakeDiscovery(PolymarketDiscoveryClient):
         rolling_lookahead_windows: int = 2,
         market_cache_ttl_ms: int = 60_000,
         discovery_debug_jsonl: str | None = None,
+        refresh_reason: str | None = None,
     ) -> tuple[PolymarketMarketMetadata, ...]:
-        del write_cache, rolling_lookahead_windows, market_cache_ttl_ms, discovery_debug_jsonl
+        del (
+            write_cache,
+            rolling_lookahead_windows,
+            market_cache_ttl_ms,
+            discovery_debug_jsonl,
+            refresh_reason,
+        )
         self.discover_calls += 1
         current_ts = now_ts or 1_778_833_000
         from app.marketdata.polymarket_discovery import annotate_runtime_market_roles
@@ -496,6 +504,35 @@ def test_rolling_market_rotation_removes_expired_and_promotes_next() -> None:
     assert diff.expired_markets[0]["market_id"] == "current"
 
 
+def test_current_market_expires_and_removed_from_signal_enabled() -> None:
+    current = _market("current-expire", start_ts=900)
+    selected = select_runtime_market_universe((current,), now_ts=1_201, lookahead_windows=1)
+
+    assert selected == ()
+    diff = build_market_universe_diff((current,), selected, now_ts=1_201)
+    assert diff.expired_markets[0]["market_id"] == "current-expire"
+
+
+def test_next_market_becomes_current_signal_when_time_advances() -> None:
+    next_market = _market("next-current", start_ts=1_200)
+
+    selected = select_runtime_market_universe((next_market,), now_ts=1_201, lookahead_windows=1)
+
+    assert selected[0].market_id == "next-current"
+    assert selected[0].runtime_selection_reason == "current_signal"
+    assert selected[0].signal_enabled is True
+
+
+def test_future_market_becomes_next_warmup() -> None:
+    future = _market("future-next", start_ts=1_500)
+
+    selected = select_runtime_market_universe((future,), now_ts=1_201, lookahead_windows=1)
+
+    assert selected[0].market_id == "future-next"
+    assert selected[0].runtime_selection_reason == "next_warmup"
+    assert selected[0].signal_enabled is False
+
+
 def test_closed_market_is_removed_from_runtime_universe() -> None:
     open_market = _market("open", start_ts=900)
     closed_market = _market("closed", start_ts=900, closed=True)
@@ -507,6 +544,41 @@ def test_closed_market_is_removed_from_runtime_universe() -> None:
     )
 
     assert [market.market_id for market in selected] == ["open"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_adds_newly_discovered_market() -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    current = _market("refresh-current", start_ts=now_ts - 60)
+    future = _market("refresh-future", start_ts=now_ts + 300)
+    manager = RuntimeMarketUniverseManager(
+        FakeDiscovery([current, future]),
+        (current,),
+        refresh_interval_ms=60_000,
+        lookahead_windows=1,
+    )
+
+    diff = await manager.refresh(now_ts=now_ts)
+
+    assert any(row["market_id"] == "refresh-future" for row in diff.added_markets)
+    assert set(future.token_ids) <= set(manager.snapshot(now_ts=now_ts).token_ids)
+
+
+def test_current_market_slugs_rotate_over_multiple_windows() -> None:
+    first = _market("rotate-a", start_ts=900)
+    second = _market("rotate-b", start_ts=1_200)
+    third = _market("rotate-c", start_ts=1_500)
+    markets = (first, second, third)
+
+    slugs = [
+        build_market_universe_snapshot(
+            select_runtime_market_universe(markets, now_ts=ts, lookahead_windows=1),
+            now_ts=ts,
+        ).current_signal_markets[0].market_slug
+        for ts in (1_000, 1_201, 1_501)
+    ]
+
+    assert slugs == [first.market_slug, second.market_slug, third.market_slug]
 
 
 def test_gap_detector_update_markets_closes_removed_pending_observation() -> None:
@@ -575,7 +647,10 @@ def test_polymarket_ws_update_markets_preserves_active_book_and_adds_tokens() ->
     client.update_markets((old_market, new_market))
     readiness = client.book_readiness_snapshot(now_ts=1_001_000_000)
 
-    assert client.active_ws_token_subscription_count == 4
+    diagnostics = client.subscription_diagnostics()
+    assert diagnostics["runtime_token_count"] == 4
+    assert diagnostics["active_ws_token_subscription_count"] == 0
+    assert diagnostics["subscription_status"] == "pending"
     assert set(client.token_ids) == {
         old_market.up_token_id,
         old_market.down_token_id,
@@ -584,7 +659,35 @@ def test_polymarket_ws_update_markets_preserves_active_book_and_adds_tokens() ->
     }
     assert readiness["tokens"][old_market.up_token_id]["first_book_snapshot_ts_ns"] == 1_000_000_000
     assert new_market.up_token_id in readiness["tokens"]
-    assert client.subscription_diagnostics()["subscription_update_count"] == 1
+    assert diagnostics["subscription_update_count"] == 1
+
+
+def test_polymarket_ws_initial_subscription_payload_matches_runtime_universe() -> None:
+    first = _current_market("initial-a")
+    second = _current_market("initial-b", base_asset="ETH")
+    client = PolymarketWSClient(markets=(first, second), mismatch_sample_path=None)
+
+    subscription = orjson.loads(client.subscription_message())
+
+    assert set(subscription["assets_ids"]) == set(first.token_ids + second.token_ids)
+    assert subscription["type"] == "market"
+
+
+def test_subscription_match_unknown_before_first_active_subscription() -> None:
+    market = _current_market("pending-subscription")
+    client = PolymarketWSClient(markets=(market,), mismatch_sample_path=None)
+    summary = GapRuntimeSummary((market,))
+
+    diagnostics = client.subscription_diagnostics()
+    payload = summary.snapshot_payload(
+        _stats(),
+        {"markets": []},
+        ws_diagnostics=diagnostics,
+    )
+
+    assert diagnostics["subscription_status"] == "pending"
+    assert payload["subscription_token_set_matches_runtime_universe"] is None
+    assert payload["active_ws_token_subscription_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -717,6 +820,122 @@ def test_no_event_warning_reports_no_signal_while_moves_continue() -> None:
     )
 
     assert "no_signal_enabled_markets_while_binance_moves_continue" in payload["no_event_warnings"]
+
+
+def test_no_signal_warning_and_force_refresh_when_binance_moves_continue() -> None:
+    summary = GapRuntimeSummary(())
+    summary._last_gap_event_change_ts_ns = 1  # noqa: SLF001
+    summary.record_binance_event(
+        MarketTick(source="binance", symbol="BTCUSDT", price=100.0, size=1.0)
+    )
+
+    payload = summary.snapshot_payload(
+        _stats(binance_moves_detected_by_symbol={"BTCUSDT": 2}, signal_enabled_markets=0),
+        {"markets": []},
+        ws_diagnostics={"runtime_token_count": 0, "active_ws_token_subscription_count": 0},
+    )
+
+    assert "no_signal_enabled_markets_while_binance_moves_continue" in payload["no_event_warnings"]
+    assert should_force_market_refresh(
+        enabled=True,
+        signal_enabled_markets=0,
+        binance_move_total=2,
+        last_forced_refresh_move_total=1,
+        now_s=120.0,
+        next_forced_refresh_allowed_at_s=60.0,
+    )
+
+
+def test_no_event_warning_books_not_ready_while_binance_moves_continue() -> None:
+    market = _current_market("book-not-ready")
+    summary = GapRuntimeSummary((market,))
+    summary._last_gap_event_change_ts_ns = 1  # noqa: SLF001
+    summary.record_binance_event(
+        MarketTick(source="binance", symbol="BTCUSDT", price=100.0, size=1.0)
+    )
+    readiness = {
+        "markets": [
+            {
+                "market_id": market.market_id,
+                "signal_enabled_at_now": True,
+                "up_token_id": market.up_token_id,
+                "down_token_id": market.down_token_id,
+                "up_token_book_complete": False,
+                "down_token_book_complete": False,
+            }
+        ]
+    }
+
+    payload = summary.snapshot_payload(
+        _stats(binance_moves_detected_by_symbol={"BTCUSDT": 1}),
+        readiness,
+        ws_diagnostics={"runtime_token_count": 2, "active_ws_token_subscription_count": 2},
+    )
+
+    assert "books_not_ready_while_binance_moves_continue" in payload["no_event_warnings"]
+
+
+def test_no_event_warning_candidates_rejected_or_suppressed() -> None:
+    market = _current_market("rejected-candidates")
+    summary = GapRuntimeSummary((market,))
+    summary._last_gap_event_change_ts_ns = 1  # noqa: SLF001
+    summary.record_binance_event(
+        MarketTick(source="binance", symbol="BTCUSDT", price=100.0, size=1.0)
+    )
+
+    payload = summary.snapshot_payload(
+        _stats(
+            binance_moves_detected_by_symbol={"BTCUSDT": 1},
+            candidates_created_by_symbol={"BTCUSDT": 3},
+            pre_entry_rejects_by_symbol={"BTCUSDT": 2},
+            suppressed_candidates_by_symbol={"BTCUSDT": 1},
+        ),
+        {"markets": []},
+        ws_diagnostics={"runtime_token_count": 2, "active_ws_token_subscription_count": 2},
+    )
+
+    assert (
+        "candidates_rejected_or_suppressed_while_binance_moves_continue"
+        in payload["no_event_warnings"]
+    )
+
+
+def test_no_event_warning_does_not_fire_without_binance_moves() -> None:
+    summary = GapRuntimeSummary(())
+    summary._last_gap_event_change_ts_ns = 1  # noqa: SLF001
+    summary.record_binance_event(
+        MarketTick(source="binance", symbol="BTCUSDT", price=100.0, size=1.0)
+    )
+
+    payload = summary.snapshot_payload(
+        _stats(binance_moves_detected_by_symbol={}),
+        {"markets": []},
+        ws_diagnostics={"runtime_token_count": 0, "active_ws_token_subscription_count": 0},
+    )
+
+    assert "no_signal_enabled_markets_while_binance_moves_continue" not in payload["no_event_warnings"]
+    assert "no_binance_moves_detected" in payload["no_event_warnings"]
+
+
+def test_pending_observations_stuck_warning_or_close() -> None:
+    summary = GapRuntimeSummary(())
+    summary._last_gap_event_change_ts_ns = 1  # noqa: SLF001
+    summary.record_binance_event(
+        MarketTick(source="binance", symbol="BTCUSDT", price=100.0, size=1.0)
+    )
+
+    payload = summary.snapshot_payload(
+        _stats(
+            binance_moves_detected_by_symbol={"BTCUSDT": 1},
+            pending_observation_count=1,
+            pending_max_age_ms=6_000.0,
+            max_pending_gap_ms=5_000.0,
+        ),
+        {"markets": []},
+        ws_diagnostics={"runtime_token_count": 0, "active_ws_token_subscription_count": 0},
+    )
+
+    assert "pending_observations_stuck" in payload["no_event_warnings"]
 
 
 def test_runtime_summary_jsonl_writes_utf8_jsonl(tmp_path) -> None:
@@ -868,7 +1087,130 @@ async def test_runtime_refresh_preserves_previous_universe_on_transient_all_clos
     diff = await manager.refresh(now_ts=now_ts, forced=True)
 
     assert [market.market_id for market in manager.markets] == ["previous"]
-    assert diff.error == "market_discovery_failed_preserving_previous_universe"
+    assert "market_discovery_failed_preserving_previous_universe" in (diff.error or "")
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_reports_missing_signal_when_previous_expired_and_discovery_failed(
+    tmp_path: Path,
+) -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    previous = _market("expired-previous", start_ts=now_ts - 600, duration_s=300)
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _market_payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    manager = RuntimeMarketUniverseManager(
+        Client(cache_path=tmp_path / "cache.json"),
+        (previous,),
+        refresh_interval_ms=60_000,
+        lookahead_windows=1,
+    )
+
+    diff = await manager.refresh(now_ts=now_ts, forced=True)
+    summary = GapRuntimeSummary(manager.snapshot(now_ts=now_ts))
+    payload = summary.snapshot_payload(
+        _stats(binance_moves_detected_by_symbol={"BTCUSDT": 1}),
+        {"markets": []},
+        ws_diagnostics={"runtime_token_count": 0, "active_ws_token_subscription_count": 0},
+    )
+
+    assert "market_discovery_failed_preserving_previous_universe" in (diff.error or "")
+    assert payload["signal_enabled_markets_by_base_asset"] == {}
+    assert payload["runtime_status"] == "discovery_degraded"
+    assert payload["discovery_failure_reason"] in {
+        "direct_slug_all_closed",
+        "active_events_no_runtime_markets",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_writes_discovery_attempt_jsonl(tmp_path: Path) -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    path = tmp_path / "attempts.jsonl"
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _market_payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    manager = RuntimeMarketUniverseManager(
+        Client(cache_path=tmp_path / "cache.json"),
+        (),
+        discovery_debug_jsonl=str(path),
+    )
+
+    await manager.refresh(now_ts=now_ts, refresh_reason="scheduled")
+
+    row = orjson.loads(path.read_bytes().splitlines()[0])
+    assert row["event_type"] == "polymarket_discovery_attempt"
+    assert row["refresh_reason"] == "scheduled"
+
+
+@pytest.mark.asyncio
+async def test_forced_refresh_writes_refresh_reason_forced_no_signal(tmp_path: Path) -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    path = tmp_path / "attempts.jsonl"
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    manager = RuntimeMarketUniverseManager(
+        Client(cache_path=tmp_path / "cache.json"),
+        (),
+        discovery_debug_jsonl=str(path),
+    )
+
+    await manager.refresh(now_ts=now_ts, forced=True, refresh_reason="forced_no_signal")
+
+    row = orjson.loads(path.read_bytes().splitlines()[0])
+    assert row["refresh_reason"] == "forced_no_signal"
+
+
+@pytest.mark.asyncio
+async def test_scheduled_refresh_writes_refresh_reason_scheduled(tmp_path: Path) -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    path = tmp_path / "attempts.jsonl"
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    manager = RuntimeMarketUniverseManager(
+        Client(cache_path=tmp_path / "cache.json"),
+        (),
+        discovery_debug_jsonl=str(path),
+    )
+
+    await manager.refresh(now_ts=now_ts, refresh_reason="scheduled")
+
+    row = orjson.loads(path.read_bytes().splitlines()[0])
+    assert row["refresh_reason"] == "scheduled"
 
 
 @pytest.mark.asyncio
@@ -908,6 +1250,71 @@ async def test_runtime_refresh_replaces_universe_when_active_events_fallback_fin
 
     assert [market.market_id for market in manager.markets] == ["active-events-new"]
     assert diff.error is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_replaces_all_closed_direct_with_active_events_current(
+    tmp_path: Path,
+) -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    start_ts = (now_ts // 300) * 300
+    slug = f"btc-updown-5m-{start_ts}"
+    old = _market("old-refresh", start_ts=now_ts - 60, duration_s=300)
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _market_payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return [{"markets": [_market_payload_for_slug(slug, market_id="active-current")]}]
+
+    manager = RuntimeMarketUniverseManager(
+        Client(cache_path=tmp_path / "cache.json"),
+        (old,),
+        refresh_interval_ms=60_000,
+        lookahead_windows=1,
+    )
+
+    diff = await manager.refresh(now_ts=now_ts, forced=True)
+
+    assert diff.error is None
+    assert [market.market_id for market in manager.markets] == ["active-current"]
+    assert manager.markets[0].discovery_source == "active_events"
+
+
+@pytest.mark.asyncio
+async def test_runtime_summary_current_slugs_from_active_events_after_direct_closed(
+    tmp_path: Path,
+) -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    start_ts = (now_ts // 300) * 300
+    slug = f"btc-updown-5m-{start_ts}"
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _market_payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return [{"markets": [_market_payload_for_slug(slug, market_id="active-summary")]}]
+
+    manager = RuntimeMarketUniverseManager(
+        Client(cache_path=tmp_path / "cache.json"),
+        (),
+        lookahead_windows=1,
+    )
+    await manager.refresh(now_ts=now_ts)
+    summary = GapRuntimeSummary(manager.snapshot(now_ts=now_ts))
+
+    payload = summary.snapshot_payload(_stats(), {"markets": []}, ws_diagnostics={})
+
+    assert payload["current_market_slugs_by_base_asset"] == {"BTC": [slug]}
+    assert payload["last_successful_current_signal_slugs"] == [slug]
 
 
 def test_runtime_summary_detects_subscription_token_divergence() -> None:
@@ -1763,6 +2170,33 @@ def test_runtime_summary_jsonl_contains_symbol_counters(tmp_path: Path) -> None:
     assert "candidates_created_by_symbol" in row
 
 
+def test_runtime_summary_jsonl_contains_discovery_fields(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.jsonl"
+    snapshot = build_market_universe_snapshot(
+        (),
+        now_ts=int(datetime.now(tz=UTC).timestamp()),
+        discovery_failure_reason="active_events_no_runtime_markets",
+        last_discovery_attempt_summary={
+            "direct_runtime_count": 0,
+            "active_events_runtime_count": 0,
+            "cache_runtime_count": 0,
+            "failure_reason": "no_runtime_markets_after_full_discovery",
+        },
+    )
+    summary = GapRuntimeSummary(snapshot)
+    writer = RuntimeSummaryJsonlWriter(str(path))
+    writer.write(summary.snapshot_payload(_stats(), {"markets": []}, ws_diagnostics={}))
+
+    row = orjson.loads(path.read_bytes().splitlines()[0])
+    assert row["discovery_failure_reason"] == "active_events_no_runtime_markets"
+    assert row["direct_runtime_count"] == 0
+    assert row["active_events_runtime_count"] == 0
+    assert row["cache_runtime_count"] == 0
+    assert row["last_discovery_attempt_summary"]["failure_reason"] == (
+        "no_runtime_markets_after_full_discovery"
+    )
+
+
 def test_runtime_summary_jsonl_contains_no_event_warnings(tmp_path: Path) -> None:
     path = tmp_path / "runtime.jsonl"
     summary = GapRuntimeSummary(())
@@ -1781,6 +2215,67 @@ def test_runtime_summary_jsonl_contains_no_event_warnings(tmp_path: Path) -> Non
 
     row = orjson.loads(path.read_bytes().splitlines()[0])
     assert "no_signal_enabled_markets_while_binance_moves_continue" in row["no_event_warnings"]
+
+
+def test_no_event_summary_includes_last_discovery_failure() -> None:
+    snapshot = build_market_universe_snapshot(
+        (),
+        now_ts=int(datetime.now(tz=UTC).timestamp()),
+        discovery_failure_reason="direct_slug_all_closed",
+        last_discovery_attempt_summary={
+            "failure_reason": "direct_slug_found_but_all_closed",
+            "direct_runtime_count": 0,
+            "active_events_runtime_count": 0,
+        },
+        last_successful_current_signal_slugs=("btc-updown-5m-old",),
+    )
+    summary = GapRuntimeSummary(snapshot)
+    summary._last_gap_event_change_ts_ns = 1  # noqa: SLF001
+    summary.record_binance_event(
+        MarketTick(source="binance", symbol="BTCUSDT", price=100.0, size=1.0)
+    )
+
+    payload = summary.snapshot_payload(
+        _stats(binance_moves_detected_by_symbol={"BTCUSDT": 1}),
+        {"markets": []},
+        ws_diagnostics={"runtime_token_count": 0, "active_ws_token_subscription_count": 0},
+    )
+
+    assert payload["runtime_status"] == "discovery_degraded"
+    assert payload["discovery_failure_reason"] == "direct_slug_all_closed"
+    assert payload["last_discovery_attempt_summary"]["failure_reason"] == (
+        "direct_slug_found_but_all_closed"
+    )
+    assert payload["last_successful_current_signal_slugs"] == ["btc-updown-5m-old"]
+    assert payload["no_event_warning"] == "no_signal_enabled_markets_while_binance_moves_continue"
+
+
+def test_no_event_summary_reports_active_events_runtime_count() -> None:
+    snapshot = build_market_universe_snapshot(
+        (),
+        now_ts=int(datetime.now(tz=UTC).timestamp()),
+        discovery_failure_reason="active_events_no_runtime_markets",
+        last_discovery_attempt_summary={
+            "direct_runtime_count": 0,
+            "active_events_runtime_count": 0,
+            "cache_runtime_count": 0,
+        },
+    )
+    summary = GapRuntimeSummary(snapshot)
+    summary._last_gap_event_change_ts_ns = 1  # noqa: SLF001
+    summary.record_binance_event(
+        MarketTick(source="binance", symbol="BTCUSDT", price=100.0, size=1.0)
+    )
+
+    payload = summary.snapshot_payload(
+        _stats(binance_moves_detected_by_symbol={"BTCUSDT": 1}),
+        {"markets": []},
+        ws_diagnostics={"runtime_token_count": 0, "active_ws_token_subscription_count": 0},
+    )
+
+    assert payload["active_events_runtime_count"] == 0
+    assert payload["direct_runtime_count"] == 0
+    assert payload["cache_runtime_count"] == 0
 
 
 def test_final_runtime_summary_is_written_on_shutdown_if_writer_enabled(tmp_path: Path) -> None:

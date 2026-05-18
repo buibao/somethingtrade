@@ -475,6 +475,136 @@ async def test_direct_slug_all_closed_triggers_active_events_fallback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_slug_found_but_all_closed_triggers_fallback(tmp_path: Path) -> None:
+    path = tmp_path / "attempts.jsonl"
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    result = await Client(cache_path=tmp_path / "cache.json").discover_rolling_markets_robust(
+        now_ts=1_778_832_999,
+        discovery_debug_jsonl=path,
+    )
+    row = orjson.loads(path.read_bytes().splitlines()[0])
+
+    assert row["direct_found_count"] > 0
+    assert row["direct_runtime_count"] == 0
+    assert row["fallback_used"] is True
+    assert row["failure_reason"] == "direct_slug_found_but_all_closed"
+    assert result.runtime_markets == ()
+
+
+@pytest.mark.asyncio
+async def test_all_closed_direct_slug_result_does_not_overwrite_valid_cache(tmp_path: Path) -> None:
+    now_ts = 1_778_832_999
+    cache_path = tmp_path / "markets.json"
+    valid = parse_market_metadata(
+        _payload_for_slug("btc-updown-5m-1778832900", market_id="valid-cache")
+    )
+    assert valid is not None
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    client = Client(cache_path=cache_path)
+    client.write_cache([valid])
+    before = cache_path.read_bytes()
+
+    result = await client.discover_rolling_markets_robust(now_ts=now_ts, write_cache=True)
+
+    assert result.cache_used is True
+    assert result.runtime_markets[0].market_id == "valid-cache"
+    assert cache_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_runtime_cache_written_only_when_runtime_markets_exist(tmp_path: Path) -> None:
+    now_ts = 1_778_832_999
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            if slug != "btc-updown-5m-1778832900":
+                return None
+            return _payload_for_slug(slug, market_id="runtime-direct")
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    cache_path = tmp_path / "markets.json"
+    result = await Client(cache_path=cache_path).discover_rolling_markets_robust(
+        now_ts=now_ts,
+        write_cache=True,
+    )
+
+    cache = PolymarketMarketCache.model_validate_json(cache_path.read_bytes())
+    assert result.runtime_markets
+    assert [market.market_id for market in cache.markets] == ["runtime-direct"]
+
+
+@pytest.mark.asyncio
+async def test_cache_not_updated_when_runtime_count_zero(tmp_path: Path) -> None:
+    now_ts = 1_778_832_999
+    cache_path = tmp_path / "markets.json"
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    result = await Client(cache_path=cache_path).discover_rolling_markets_robust(
+        now_ts=now_ts,
+        write_cache=True,
+    )
+
+    assert result.runtime_markets == ()
+    assert cache_path.exists() is False
+    assert result.attempt["cache_not_updated_reason"] == "cache_not_updated_runtime_count_zero"
+
+
+@pytest.mark.asyncio
+async def test_direct_all_closed_mandates_active_events_fallback() -> None:
+    now_ts = 1_778_832_999
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return []
+
+    result = await Client().discover_rolling_markets_robust(now_ts=now_ts)
+
+    assert result.fallback_used is True
+    assert result.active_events_result is not None
+    assert result.active_events_result["attempted"] is True
+
+
+@pytest.mark.asyncio
 async def test_active_events_fallback_selects_current_signal_markets() -> None:
     now_ts = 1_778_832_999
 
@@ -501,6 +631,129 @@ async def test_active_events_fallback_selects_current_signal_markets() -> None:
 
     assert result.runtime_markets[0].classification == "current_signal"
     assert result.runtime_markets[0].signal_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_active_events_payload_with_nested_markets_selects_current() -> None:
+    now_ts = 1_778_832_999
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "eventStartTime": _iso_from_ts(1_778_832_900),
+                    "endDate": _iso_from_ts(1_778_833_200),
+                    "clobTokenIds": '["event-up","event-down"]',
+                    "outcomes": '["Up","Down"]',
+                    "active": True,
+                    "closed": False,
+                    "acceptingOrders": True,
+                    "enableOrderBook": True,
+                    "markets": [
+                        {
+                            "conditionId": "event-condition",
+                            "market": "nested-current",
+                            "slug": "btc-updown-5m-1778832900",
+                            "question": "BTC Up or Down",
+                            "order_price_min_tick_size": "0.01",
+                            "minimum_order_size": "5",
+                        }
+                    ],
+                }
+            ]
+
+    result = await Client().discover_rolling_markets_robust(now_ts=now_ts)
+
+    assert [market.market_id for market in result.runtime_markets] == ["nested-current"]
+    assert result.runtime_markets[0].up_token_id == "event-up"
+
+
+@pytest.mark.asyncio
+async def test_active_events_reject_reasons_are_reported() -> None:
+    now_ts = 1_778_832_999
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "markets": [
+                        _payload_for_slug(
+                            "btc-updown-5m-1778832900",
+                            market_id="not-accepting",
+                            accepting_orders=False,
+                        )
+                    ]
+                }
+            ]
+
+    result = await Client().discover_rolling_markets_robust(now_ts=now_ts)
+    reasons = {item["reason"] for item in result.active_events_result["reject_reasons"]}
+
+    assert "active_but_not_accepting_orders" in reasons
+
+
+@pytest.mark.asyncio
+async def test_active_events_pagination_scans_until_runtime_market_found() -> None:
+    now_ts = 1_778_832_999
+
+    class Client(PolymarketDiscoveryClient):
+        def __init__(self) -> None:
+            super().__init__(limit=1, max_pages=3)
+            self.offsets: list[int] = []
+
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_page(self, endpoint: str, *, limit: int, offset: int) -> list[dict[str, object]]:
+            assert endpoint == "events"
+            self.offsets.append(offset)
+            if offset == 0:
+                return [{"markets": [_market_payload(slug="not-crypto", question="Politics")]}]
+            if offset == 1:
+                return [{"markets": [_payload_for_slug("eth-updown-5m-1778832900", market_id="paged")]}]
+            return []
+
+    client = Client()
+    result = await client.discover_rolling_markets_robust(now_ts=now_ts)
+
+    assert [market.market_id for market in result.runtime_markets] == ["paged"]
+    assert client.offsets == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_active_events_missing_current_reports_runtime_zero_not_success() -> None:
+    now_ts = 1_778_832_999
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return [{"markets": [_payload_for_slug("btc-updown-5m-1778833200", market_id="next-only")]}]
+
+    result = await Client().discover_rolling_markets_robust(now_ts=now_ts)
+
+    assert result.active_events_result["runtime_candidate_count"] == 1
+    assert result.active_events_result["runtime_tradable_count"] == 0
+    assert result.attempt["active_events_runtime_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -630,12 +883,14 @@ async def test_discovery_attempt_jsonl_written_on_failure(tmp_path: Path) -> Non
     result = await Client(cache_path=tmp_path / "cache.json").discover_rolling_markets_robust(
         now_ts=1_778_832_999,
         discovery_debug_jsonl=path,
+        write_cache=True,
     )
 
     assert result.runtime_markets == ()
     row = orjson.loads(path.read_bytes().splitlines()[0])
     assert row["event_type"] == "polymarket_discovery_attempt"
     assert row["failure_reason"] == "direct_slug_found_but_all_closed"
+    assert row["cache_not_updated_reason"] == "cache_not_updated_all_closed"
 
 
 @pytest.mark.asyncio
@@ -674,6 +929,30 @@ async def test_debug_command_reports_active_events_fallback_counts(tmp_path: Pat
     )
 
     assert debug["attempt"]["active_events_found_runtime_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_debug_command_reports_direct_slug_and_active_events_breakdown(tmp_path: Path) -> None:
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return [{"markets": [_payload_for_slug("btc-updown-5m-1778832900")]}]
+
+    debug = await Client(cache_path=tmp_path / "cache.json").debug_rolling_discovery(
+        now_ts=1_778_832_999,
+    )
+    strategy = debug["strategy_results"]
+
+    assert strategy["direct_slug"]["found_count"] > 0
+    assert strategy["direct_slug"]["runtime_tradable_count"] == 0
+    assert strategy["active_events"]["attempted"] is True
+    assert strategy["active_events"]["runtime_tradable_count"] == 1
+    assert "cache" in strategy
 
 
 @pytest.mark.asyncio
