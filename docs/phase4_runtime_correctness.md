@@ -8,6 +8,28 @@ Phase 4 datasets are only valid when the monitor is measuring the current rollin
 
 If Binance moves continue while no signal-enabled markets are active, `--market-refresh-force-when-no-signal` forces an early rediscovery. Lifecycle diffs include added, removed, expired, closed, current, warmup, future, new token, and removed token sets.
 
+## Rolling Discovery Fallbacks
+
+Rolling Polymarket discovery now uses three runtime-safe sources. First, it generates expected `btc/eth-updown-5m/15m-<window>` slugs and queries Gamma slug endpoints. Direct slug results are kept for diagnostics even when they are historical or closed, but they are not enough for startup unless at least one market is runtime-tradable.
+
+If direct slugs produce no runtime-tradable market, discovery falls back to Gamma active events using `active=true`, `closed=false`, limit, and offset pagination. Nested event markets are parsed and accepted only when they are BTC/ETH 5m/15m up/down markets with `active=true`, `closed=false`, `acceptingOrders=true`, `enableOrderBook=true`, UP/DOWN token IDs, and a current or near-future rolling window.
+
+The market cache is only a runtime fallback after validation. `--market-cache-ttl-ms` defaults to `60000`; a cache is rejected when it is expired, all closed, missing required fields, has no runtime markets, or has no current/warmup market. Rejections are logged as `cache_rejected_for_runtime` with reasons such as `cache_all_closed`, `cache_no_runtime_markets`, `cache_expired`, and `cache_missing_required_fields`.
+
+## Startup Waiting
+
+`gap-monitor` defaults to `--wait-for-markets`. When no runtime BTC/ETH 5m/15m markets are found at startup, it prints a discovery summary, writes a JSONL attempt artifact, sleeps for `--market-discovery-retry-ms` (default `30000`), and retries until markets appear or `--market-discovery-startup-timeout-ms` (default `300000`) expires. Timeout exits with `no_active_markets_after_startup_timeout`. Use `--no-wait-for-markets` to keep fail-fast startup semantics with the improved diagnostics.
+
+Discovery attempts are written as UTF-8 JSONL to `data/debug/polymarket_discovery_attempts.jsonl` by default, or to `--discovery-debug-jsonl <path>`. Each row includes direct slug counts, active-events fallback counts, cache validation, selected/current/warmup slugs, time sanity diagnostics, and failure reasons such as `direct_slug_found_but_all_closed`.
+
+For manual diagnosis, run:
+
+```bash
+python -m app.main polymarket-rolling-discovery-debug
+```
+
+The command prints direct slug results, active-events fallback results, cache validation, rejection reasons, and final selected runtime markets.
+
 ## WebSocket Subscription Lifecycle
 
 When the runtime market universe changes, `PolymarketWSClient.update_markets()` rebuilds token metadata, preserves still-active local books, initializes newly added token books, and reconnects the active market websocket so the next subscription payload contains the full current runtime token universe. Runtime summaries expose `runtime_token_count`, `active_ws_token_subscription_count`, missing/extra subscription token samples, transition state, update count, and reconnect count.

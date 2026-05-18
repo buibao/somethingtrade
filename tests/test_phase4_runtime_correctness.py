@@ -26,7 +26,7 @@ from app.marketdata.market_universe import (
     select_runtime_market_universe,
 )
 from app.marketdata.polymarket_discovery import PolymarketDiscoveryClient
-from app.marketdata.polymarket_discovery import PolymarketMarketMetadata
+from app.marketdata.polymarket_discovery import PolymarketMarketMetadata, parse_market_metadata
 from app.marketdata.polymarket_orderbook import PolymarketLocalOrderBook, TokenBookMetadata
 from app.marketdata.polymarket_ws import PolymarketWSClient
 from app.state.market_state import MarketState
@@ -205,8 +205,10 @@ class FakeDiscovery(PolymarketDiscoveryClient):
         write_cache: bool = True,
         now_ts: int | None = None,
         rolling_lookahead_windows: int = 2,
+        market_cache_ttl_ms: int = 60_000,
+        discovery_debug_jsonl: str | None = None,
     ) -> tuple[PolymarketMarketMetadata, ...]:
-        del write_cache, rolling_lookahead_windows
+        del write_cache, rolling_lookahead_windows, market_cache_ttl_ms, discovery_debug_jsonl
         self.discover_calls += 1
         current_ts = now_ts or 1_778_833_000
         from app.marketdata.polymarket_discovery import annotate_runtime_market_roles
@@ -355,6 +357,34 @@ def _orderbook_market() -> PolymarketMarketMetadata:
             "market_slug": "btc-updown-5m-900",
         }
     )
+
+
+def _market_payload_for_slug(
+    slug: str,
+    *,
+    market_id: str,
+    closed: bool = False,
+) -> dict[str, object]:
+    parts = slug.split("-")
+    horizon = parts[2]
+    start_ts = int(parts[3])
+    duration_s = 300 if horizon == "5m" else 900
+    return {
+        "conditionId": f"{market_id}-condition",
+        "market": market_id,
+        "slug": slug,
+        "question": f"{slug} up or down",
+        "endDate": _iso(start_ts + duration_s),
+        "eventStartTime": _iso(start_ts),
+        "clobTokenIds": '["up-token","down-token"]',
+        "outcomes": '["Up","Down"]',
+        "order_price_min_tick_size": "0.01",
+        "minimum_order_size": "5",
+        "active": True,
+        "closed": closed,
+        "acceptingOrders": not closed,
+        "enableOrderBook": True,
+    }
 
 
 def _orderbook_snapshot(orderbook: PolymarketLocalOrderBook, *, bid: str = "0.50", ask: str = "0.52") -> PolymarketQuote:
@@ -820,6 +850,64 @@ async def test_force_refresh_calls_detector_and_ws_market_update() -> None:
     assert detector.markets == snapshot.markets
     assert set(ws.token_ids) == set(snapshot.token_ids)
     assert ws.subscription_diagnostics()["runtime_token_count"] == len(snapshot.token_ids)
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_preserves_previous_universe_on_transient_all_closed_discovery() -> None:
+    now_ts = int(datetime.now(tz=UTC).timestamp())
+    previous = _market("previous", start_ts=now_ts - 60, duration_s=300)
+    closed = _market("closed", start_ts=now_ts - 60, duration_s=300, closed=True)
+    discovery = FakeDiscovery([closed])
+    manager = RuntimeMarketUniverseManager(
+        discovery,
+        (previous,),
+        refresh_interval_ms=60_000,
+        lookahead_windows=1,
+    )
+
+    diff = await manager.refresh(now_ts=now_ts, forced=True)
+
+    assert [market.market_id for market in manager.markets] == ["previous"]
+    assert diff.error == "market_discovery_failed_preserving_previous_universe"
+
+
+@pytest.mark.asyncio
+async def test_runtime_refresh_replaces_universe_when_active_events_fallback_finds_new_current(
+    tmp_path: Path,
+) -> None:
+    now_ts = 1_778_832_999
+    old = _market("old", start_ts=now_ts - 60, duration_s=300)
+
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _market_payload_for_slug(slug, market_id=f"closed-{slug}", closed=True)
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            return None
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "markets": [
+                        _market_payload_for_slug(
+                            "btc-updown-5m-1778832900",
+                            market_id="active-events-new",
+                        )
+                    ]
+                }
+            ]
+
+    manager = RuntimeMarketUniverseManager(
+        Client(cache_path=tmp_path / "cache.json"),
+        (old,),
+        refresh_interval_ms=60_000,
+        lookahead_windows=1,
+    )
+
+    diff = await manager.refresh(now_ts=now_ts, forced=True)
+
+    assert [market.market_id for market in manager.markets] == ["active-events-new"]
+    assert diff.error is None
 
 
 def test_runtime_summary_detects_subscription_token_divergence() -> None:

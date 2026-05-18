@@ -124,7 +124,7 @@ def test_discovery_parses_and_caches_short_duration_markets(tmp_path) -> None:
     ) == parsed.model_dump(
         exclude={"classification", "selected_for_runtime", "signal_enabled", "runtime_selection_reason"}
     )
-    assert markets[0].classification == "current"
+    assert markets[0].classification == "current_signal"
     assert markets[0].selected_for_runtime is True
     assert markets[0].signal_enabled is True
     assert markets[0].up_token_id == "yes-token"
@@ -155,10 +155,11 @@ def test_discovery_uses_cache_when_live_fetch_fails(tmp_path, capsys) -> None:
     assert markets == (
         market.model_copy(
             update={
-                "classification": "current",
+                "classification": "current_signal",
                 "selected_for_runtime": True,
                 "signal_enabled": True,
                 "runtime_selection_reason": "current_signal",
+                "discovery_source": "cache",
             }
         ),
     )

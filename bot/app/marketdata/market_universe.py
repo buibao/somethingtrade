@@ -75,10 +75,12 @@ class RuntimeMarketUniverseManager:
         *,
         refresh_interval_ms: int = 60_000,
         lookahead_windows: int = 3,
+        market_cache_ttl_ms: int = 60_000,
     ) -> None:
         self.discovery = discovery
         self.refresh_interval_ms = max(1, refresh_interval_ms)
         self.lookahead_windows = max(1, lookahead_windows)
+        self.market_cache_ttl_ms = max(1, market_cache_ttl_ms)
         self.market_refresh_count = 0
         self.forced_market_refresh_count = 0
         self.market_refresh_error_count = 0
@@ -131,6 +133,7 @@ class RuntimeMarketUniverseManager:
                 write_cache=True,
                 now_ts=current_ts,
                 rolling_lookahead_windows=self.lookahead_windows,
+                market_cache_ttl_ms=self.market_cache_ttl_ms,
             )
         except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
             self.market_refresh_error_count += 1
@@ -145,11 +148,24 @@ class RuntimeMarketUniverseManager:
             lookahead_windows=self.lookahead_windows,
         )
         if not selected:
-            selected = _cached_runtime_markets(
-                self.discovery,
+            previous_runtime = select_runtime_market_universe(
+                previous,
                 now_ts=current_ts,
                 lookahead_windows=self.lookahead_windows,
             )
+            if previous_runtime:
+                self.market_refresh_error_count += 1
+                diff = build_market_universe_diff(
+                    previous,
+                    previous,
+                    now_ts=current_ts,
+                    forced=forced,
+                    error="market_discovery_failed_preserving_previous_universe",
+                )
+                self._last_diff = diff
+                self._last_discovery_ts = current_ts
+                self._schedule_next(current_ts)
+                return diff
 
         self.market_refresh_count += 1
         if forced:
@@ -189,7 +205,7 @@ def select_runtime_market_universe(
             market
             for market in group
             if is_runtime_tradable_market(market, now_ts=now_ts)
-            and classify_market_window(market, now_ts=now_ts) == "current"
+            and classify_market_window(market, now_ts=now_ts) == "current_signal"
         ]
         current.sort(key=_market_sort_key)
         selected.extend(_annotate_universe_role(current, "current"))
@@ -198,7 +214,7 @@ def select_runtime_market_universe(
             market
             for market in group
             if is_runtime_tradable_market(market, now_ts=now_ts)
-            and classify_market_window(market, now_ts=now_ts) in {"next", "future"}
+            and classify_market_window(market, now_ts=now_ts) in {"next_warmup", "future_tracked"}
         ]
         future_candidates.sort(key=_market_sort_key)
         for index, market in enumerate(future_candidates[:lookahead_windows]):
@@ -235,20 +251,20 @@ def build_market_universe_snapshot(
             closed.append(market)
         elif classification == "expired":
             expired.append(market)
-        elif classification == "current":
+        elif classification == "current_signal":
             current.append(
                 market.model_copy(
                     update={
-                        "classification": "current",
+                        "classification": "current_signal",
                         "selected_for_runtime": True,
                         "signal_enabled": True,
                         "runtime_selection_reason": "current_signal",
                     }
                 )
             )
-        elif reason == "future_tracked" or classification == "future":
+        elif reason == "future_tracked" or classification == "future_tracked":
             future.append(market)
-        elif classification == "next" or reason == "next_warmup":
+        elif classification == "next_warmup" or reason == "next_warmup":
             next_warmup.append(market)
 
     return MarketUniverseSnapshot(
@@ -324,15 +340,13 @@ def _cached_runtime_markets(
     now_ts: int,
     lookahead_windows: int,
 ) -> tuple[PolymarketMarketMetadata, ...]:
-    try:
-        cached = discovery.read_cache()
-    except (OSError, ValueError):
-        return ()
-    return select_runtime_market_universe(
-        cached.markets,
+    cache_validation = discovery.validate_cache_for_runtime(
         now_ts=now_ts,
         lookahead_windows=lookahead_windows,
     )
+    if not cache_validation.valid:
+        return ()
+    return cache_validation.runtime_markets
 
 
 def _annotate_universe_role(
@@ -341,19 +355,19 @@ def _annotate_universe_role(
 ) -> tuple[PolymarketMarketMetadata, ...]:
     updates_by_role = {
         "current": {
-            "classification": "current",
+            "classification": "current_signal",
             "selected_for_runtime": True,
             "signal_enabled": True,
             "runtime_selection_reason": "current_signal",
         },
         "next": {
-            "classification": "next",
+            "classification": "next_warmup",
             "selected_for_runtime": True,
             "signal_enabled": False,
             "runtime_selection_reason": "next_warmup",
         },
         "future": {
-            "classification": "future",
+            "classification": "future_tracked",
             "selected_for_runtime": True,
             "signal_enabled": False,
             "runtime_selection_reason": "future_tracked",

@@ -28,7 +28,7 @@ def _market(
     end_time: str = "2099-05-15T12:15:00Z",
     selected_for_runtime: bool = True,
     signal_enabled: bool = True,
-    classification: str | None = "current",
+    classification: str | None = "current_signal",
     tick_size: float = 0.01,
 ) -> PolymarketMarketMetadata:
     return PolymarketMarketMetadata(
@@ -678,7 +678,7 @@ def test_reversed_outcomes_still_use_token_for_direction() -> None:
         closed=False,
         accepting_orders=True,
         enable_order_book=True,
-        classification="current",
+        classification="current_signal",
         selected_for_runtime=True,
         signal_enabled=True,
         base_asset="BTC",
@@ -710,7 +710,7 @@ def test_next_market_receives_quote_but_does_not_create_candidate() -> None:
         end_time=_iso_from_ns(start_ts + 900_000_000_000),
         selected_for_runtime=True,
         signal_enabled=False,
-        classification="next",
+        classification="next_warmup",
     )
     state = MarketState(max_polymarket_quote_age_ms=10**15)
     detector = GapDetector(
@@ -872,7 +872,7 @@ def test_next_market_becomes_current_after_event_start_time_can_create_candidate
         end_time=_iso_from_ns(start_ts + 900_000_000_000),
         selected_for_runtime=True,
         signal_enabled=False,
-        classification="next",
+        classification="next_warmup",
     )
     state = MarketState(max_polymarket_quote_age_ms=60_000.0)
     detector = GapDetector(
@@ -913,7 +913,7 @@ def test_current_expires_and_next_market_promotes_without_restart() -> None:
         end_time=_iso_from_ns(next_start_ts),
         selected_for_runtime=True,
         signal_enabled=True,
-        classification="current",
+        classification="current_signal",
     )
     next_market = _market(
         market_id="next",
@@ -924,7 +924,7 @@ def test_current_expires_and_next_market_promotes_without_restart() -> None:
         end_time=_iso_from_ns(next_start_ts + 900_000_000_000),
         selected_for_runtime=True,
         signal_enabled=False,
-        classification="next",
+        classification="next_warmup",
     )
     state = MarketState(max_polymarket_quote_age_ms=60_000.0)
     detector = GapDetector(

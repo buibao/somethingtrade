@@ -433,7 +433,7 @@ class PolymarketLocalOrderBook:
             )
             signal_enabled = (
                 is_runtime_tradable_market(market, now_ts=now_ts // 1_000_000_000)
-                and classification == "current"
+                and classification == "current_signal"
             )
             market_rows.append(
                 {
@@ -531,7 +531,7 @@ class PolymarketLocalOrderBook:
                     for market, row in zip(markets, market_rows, strict=True)
                     if market.selected_for_runtime
                     and not row["signal_enabled_at_now"]
-                    and row["classification_at_now"] == "next"
+                    and row["classification_at_now"] == "next_warmup"
                 ),
                 "complete_markets": sum(1 for row in market_rows if row["both_tokens_complete"]),
                 "incomplete_markets": sum(

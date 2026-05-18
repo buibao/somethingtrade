@@ -418,7 +418,7 @@ class GapDetector:
                 market,
                 now_ts=current_ts // 1_000_000_000,
             )
-            == "next"
+            == "next_warmup"
         )
         return GapMonitorStats(
             detected_gaps=self.detected_gaps,
@@ -1511,7 +1511,7 @@ class GapDetector:
         if (
             market.selected_for_runtime
             and not self._market_signal_enabled(market, now_ts)
-            and classify_market_window(market, now_ts=now_ts // 1_000_000_000) == "next"
+            and classify_market_window(market, now_ts=now_ts // 1_000_000_000) == "next_warmup"
         ):
             self.warmup_quotes_received += 1
 
@@ -1522,7 +1522,7 @@ class GapDetector:
     ) -> bool:
         return (
             is_runtime_tradable_market(market, now_ts=now_ts // 1_000_000_000)
-            and classify_market_window(market, now_ts=now_ts // 1_000_000_000) == "current"
+            and classify_market_window(market, now_ts=now_ts // 1_000_000_000) == "current_signal"
         )
 
     def _book_readiness_gate(
@@ -1578,7 +1578,7 @@ class GapDetector:
                 and all(quote.reported_best_validation_ok for quote in known_quotes)
             ),
             validation_error=_first_validation_error(known_quotes),
-            market_classification=classification,
+            market_classification=_gap_event_classification_label(classification),
             signal_enabled=signal_enabled,
             market_mismatch_rate=_first_rate(known_quotes, "market_mismatch_rate"),
             token_mismatch_rate=_first_rate(known_quotes, "token_mismatch_rate"),
@@ -1918,6 +1918,18 @@ def _count_strings(values: Iterable[str | None]) -> dict[str, int]:
             continue
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _gap_event_classification_label(classification: str | None) -> str | None:
+    legacy_labels = {
+        "current_signal": "current",
+        "next_warmup": "next",
+        "future_tracked": "future",
+        "active_but_not_accepting_orders": "not_accepting",
+    }
+    if classification is None:
+        return None
+    return legacy_labels.get(classification, classification)
 
 
 def _move_episode(

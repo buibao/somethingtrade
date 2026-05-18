@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,8 @@ from app.execution.paper_executor import PaperExecutor
 from app.logging.event_logger import AsyncJsonlEventLogger
 from app.marketdata.binance_ws import BinanceWSClient
 from app.marketdata.polymarket_discovery import (
+    DEFAULT_DISCOVERY_DEBUG_JSONL_PATH,
+    DEFAULT_MARKET_CACHE_TTL_MS,
     PolymarketDiscoveryClient,
     PolymarketMarketCache,
     PolymarketMarketMetadata,
@@ -226,6 +228,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Number of future rolling windows to keep in the runtime market universe per asset/duration.",
     )
     gap_monitor.add_argument(
+        "--market-cache-ttl-ms",
+        type=int,
+        default=DEFAULT_MARKET_CACHE_TTL_MS,
+        help="Maximum age in milliseconds for using cached Polymarket markets at runtime.",
+    )
+    gap_monitor.add_argument(
+        "--wait-for-markets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wait and retry at startup until runtime-tradable rolling markets are discovered.",
+    )
+    gap_monitor.add_argument(
+        "--market-discovery-retry-ms",
+        type=int,
+        default=30_000,
+        help="Startup retry interval in milliseconds when no runtime Polymarket markets are available.",
+    )
+    gap_monitor.add_argument(
+        "--market-discovery-startup-timeout-ms",
+        type=int,
+        default=300_000,
+        help="Maximum startup wait in milliseconds before exiting with no active markets.",
+    )
+    gap_monitor.add_argument(
+        "--discovery-debug-jsonl",
+        default=str(DEFAULT_DISCOVERY_DEBUG_JSONL_PATH),
+        help="UTF-8 JSONL path for Polymarket discovery attempt diagnostics.",
+    )
+    gap_monitor.add_argument(
         "--runtime-summary-jsonl",
         default=None,
         help="Optional UTF-8 JSONL path for periodic runtime diagnostics.",
@@ -247,6 +278,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--output",
         default="data/debug/polymarket_rolling_discovery.json",
         help="Path for raw and parsed rolling discovery debug JSON.",
+    )
+    rolling_debug.add_argument(
+        "--market-cache-ttl-ms",
+        type=int,
+        default=DEFAULT_MARKET_CACHE_TTL_MS,
+        help="Maximum age in milliseconds for considering cached markets usable at runtime.",
+    )
+    rolling_debug.add_argument(
+        "--discovery-debug-jsonl",
+        default=str(DEFAULT_DISCOVERY_DEBUG_JSONL_PATH),
+        help="UTF-8 JSONL path for this discovery debug attempt.",
     )
 
     quality_report = subparsers.add_parser(
@@ -406,13 +448,18 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         gamma_url=args.gamma_url or settings.polymarket_gamma_url,
         cache_path=args.cache_path or settings.polymarket_market_cache_path,
     )
-    markets = await _discover_polymarket_markets(
+    markets = await _discover_polymarket_markets_for_startup(
         discovery,
         lookahead_windows=args.market_refresh_lookahead_windows,
+        market_cache_ttl_ms=args.market_cache_ttl_ms,
+        discovery_debug_jsonl=args.discovery_debug_jsonl,
+        wait_for_markets=args.wait_for_markets,
+        retry_ms=args.market_discovery_retry_ms,
+        startup_timeout_ms=args.market_discovery_startup_timeout_ms,
     )
     if not markets:
         print(
-            "No rolling BTC/ETH 5m/15m markets found from direct slugs. Run:\n"
+            "No runtime-tradable BTC/ETH 5m/15m rolling markets discovered. Run:\n"
             " python -m app.main polymarket-rolling-discovery-debug",
             flush=True,
         )
@@ -424,6 +471,7 @@ async def run_gap_monitor(args: argparse.Namespace) -> None:
         markets,
         refresh_interval_ms=args.market_refresh_interval_ms,
         lookahead_windows=args.market_refresh_lookahead_windows,
+        market_cache_ttl_ms=args.market_cache_ttl_ms,
     )
     markets = universe_manager.markets
     state = MarketState(max_polymarket_quote_age_ms=settings.polymarket_max_quote_age_ms)
@@ -592,7 +640,11 @@ async def run_polymarket_rolling_discovery_debug(args: argparse.Namespace) -> No
         gamma_url=args.gamma_url or settings.polymarket_gamma_url,
         cache_path=args.cache_path or settings.polymarket_market_cache_path,
     )
-    debug = await discovery.debug_rolling_discovery(now_ts=args.now_ts)
+    debug = await discovery.debug_rolling_discovery(
+        now_ts=args.now_ts,
+        market_cache_ttl_ms=args.market_cache_ttl_ms,
+        discovery_debug_jsonl=args.discovery_debug_jsonl,
+    )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -608,6 +660,34 @@ async def run_polymarket_rolling_discovery_debug(args: argparse.Namespace) -> No
         print(f"  {slug}", flush=True)
 
     print("rolling discovery results:", flush=True)
+    attempt = debug.get("attempt") or {}
+    strategy_results = debug.get("strategy_results") or {}
+    direct_summary = strategy_results.get("direct_slug") or {}
+    active_summary = strategy_results.get("active_events") or {}
+    cache_summary = strategy_results.get("cache") or {}
+    print(
+        " ".join(
+            [
+                "discovery summary:",
+                f"direct_found_count={direct_summary.get('found_count', 0)}",
+                f"direct_runtime_count={direct_summary.get('runtime_tradable_count', 0)}",
+                f"active_events_found_runtime_count={active_summary.get('runtime_tradable_count', 0)}",
+                f"cache_runtime_count={cache_summary.get('runtime_count', 0)}",
+                f"cache_rejected={cache_summary.get('rejected', False)}",
+                f"cache_rejected_reason={cache_summary.get('rejected_reason') or '-'}",
+                f"fallback_used={attempt.get('fallback_used', False)}",
+                f"failure_reason={attempt.get('failure_reason') or '-'}",
+            ]
+        ),
+        flush=True,
+    )
+    if attempt.get("failure_reason") == "direct_slug_found_but_all_closed":
+        print("direct_slug_found_but_all_closed", flush=True)
+    print(
+        f"active_events_found_runtime_count={active_summary.get('runtime_tradable_count', 0)}",
+        flush=True,
+    )
+    print(f"cache_runtime_count={cache_summary.get('runtime_count', 0)}", flush=True)
     for result in debug["results"]:
         endpoint = result.get("endpoint_used") or "-"
         status = "FOUND" if result.get("parsed_markets") else "missing/rejected"
@@ -635,6 +715,7 @@ async def run_polymarket_rolling_discovery_debug(args: argparse.Namespace) -> No
                         f"selected_for_runtime={market.get('selected_for_runtime')}",
                         f"signal_enabled={market.get('signal_enabled')}",
                         f"runtime_selection_reason={market.get('runtime_selection_reason')}",
+                        f"discovery_source={market.get('discovery_source')}",
                         f"UP={market.get('up_token_id')}",
                         f"DOWN={market.get('down_token_id')}",
                         f"outcomes={token_outcomes}",
@@ -642,6 +723,31 @@ async def run_polymarket_rolling_discovery_debug(args: argparse.Namespace) -> No
                 ),
                 flush=True,
             )
+
+    active_events = debug.get("active_events") or {}
+    print("active events fallback results:", flush=True)
+    print(
+        "  "
+        + " ".join(
+            [
+                f"attempted={active_events.get('attempted', False)}",
+                f"event_count={active_events.get('event_count', 0)}",
+                f"candidate_count={active_events.get('candidate_count', 0)}",
+                f"parsed_count={active_events.get('parsed_count', 0)}",
+                f"runtime_count={active_events.get('runtime_tradable_count', 0)}",
+            ]
+        ),
+        flush=True,
+    )
+    for rejected in active_events.get("rejected_candidates") or []:
+        print(f"    rejected={rejected}", flush=True)
+
+    print("cache validation result:", flush=True)
+    print(f"  {debug.get('cache_validation') or {}}", flush=True)
+
+    print("final selected runtime markets:", flush=True)
+    for slug in debug.get("selected_market_slugs") or []:
+        print(f"  {slug}", flush=True)
 
     print(f"debug output written to {output_path}", flush=True)
 
@@ -1121,11 +1227,11 @@ class GapRuntimeSummary:
                 classification = classify_market_window(market, now_ts=now_ts)
                 signal_market = (
                     is_runtime_tradable_market(market, now_ts=now_ts)
-                    and classification == "current"
+                    and classification == "current_signal"
                 )
                 if signal_market:
                     signal_enabled[base_asset] += 1
-                elif market.selected_for_runtime and classification == "next":
+                elif market.selected_for_runtime and classification == "next_warmup":
                     warmup_only[base_asset] += 1
                 token_count = int(market.up_token_id is not None) + int(
                     market.down_token_id is not None
@@ -1153,10 +1259,13 @@ class GapRuntimeSummary:
                 market,
                 now_ts=utc_now_ns() // 1_000_000_000,
             )
-            signal_market = row.get("signal_enabled_at_now") is True and classification == "current"
+            signal_market = (
+                row.get("signal_enabled_at_now") is True
+                and classification == "current_signal"
+            )
             if signal_market:
                 signal_enabled[base_asset] += 1
-            elif market.selected_for_runtime and classification == "next":
+            elif market.selected_for_runtime and classification == "next_warmup":
                 warmup_only[base_asset] += 1
             for token_field, complete_field in (
                 ("up_token_id", "up_token_book_complete"),
@@ -1447,24 +1556,183 @@ async def _discover_polymarket_markets(
     discovery: PolymarketDiscoveryClient,
     *,
     lookahead_windows: int = 1,
+    market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+    discovery_debug_jsonl: str | None = None,
 ) -> tuple[PolymarketMarketMetadata, ...]:
+    markets, _attempt = await _discover_polymarket_markets_once(
+        discovery,
+        lookahead_windows=lookahead_windows,
+        market_cache_ttl_ms=market_cache_ttl_ms,
+        discovery_debug_jsonl=discovery_debug_jsonl,
+    )
+    return markets
+
+
+async def _discover_polymarket_markets_for_startup(
+    discovery: PolymarketDiscoveryClient,
+    *,
+    lookahead_windows: int = 1,
+    market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+    discovery_debug_jsonl: str | None = None,
+    wait_for_markets: bool = True,
+    retry_ms: int = 30_000,
+    startup_timeout_ms: int = 300_000,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    monotonic: Callable[[], float] | None = None,
+) -> tuple[PolymarketMarketMetadata, ...]:
+    loop = asyncio.get_running_loop()
+    clock = monotonic or loop.time
+    started_at = clock()
+    deadline = started_at + max(0, startup_timeout_ms) / 1000.0
+    attempts: list[dict[str, Any]] = []
+
+    while True:
+        markets, attempt = await _discover_polymarket_markets_once(
+            discovery,
+            lookahead_windows=lookahead_windows,
+            market_cache_ttl_ms=market_cache_ttl_ms,
+            discovery_debug_jsonl=discovery_debug_jsonl,
+        )
+        attempts.append(attempt)
+        if markets:
+            if len(attempts) > 1:
+                print(
+                    f"market_discovery_recovered attempts={len(attempts)} "
+                    f"selected={len(markets)}",
+                    flush=True,
+                )
+            return markets
+
+        _print_discovery_failure_summary(attempt, attempt_index=len(attempts))
+        if not wait_for_markets:
+            return ()
+
+        now = clock()
+        if now >= deadline:
+            _print_startup_timeout_summary(attempts)
+            raise SystemExit("no_active_markets_after_startup_timeout")
+
+        delay_s = max(0.001, retry_ms / 1000.0)
+        remaining_s = max(0.0, deadline - now)
+        await sleep(min(delay_s, remaining_s))
+
+
+async def _discover_polymarket_markets_once(
+    discovery: PolymarketDiscoveryClient,
+    *,
+    lookahead_windows: int = 1,
+    market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+    discovery_debug_jsonl: str | None = None,
+) -> tuple[tuple[PolymarketMarketMetadata, ...], dict[str, Any]]:
     now_ts = utc_now_ns() // 1_000_000_000
     try:
-        discovered = await discovery.discover(
-            write_cache=True,
-            now_ts=now_ts,
-            rolling_lookahead_windows=lookahead_windows,
-        )
+        if discovery.enable_direct_slug_lookup:
+            rolling_result = await discovery.discover_rolling_markets_robust(
+                write_cache=True,
+                now_ts=now_ts,
+                lookahead_windows=lookahead_windows,
+                market_cache_ttl_ms=market_cache_ttl_ms,
+                discovery_debug_jsonl=discovery_debug_jsonl,
+            )
+        else:
+            legacy_discovered = await discovery.discover(
+                write_cache=True,
+                now_ts=now_ts,
+                rolling_lookahead_windows=lookahead_windows,
+                market_cache_ttl_ms=market_cache_ttl_ms,
+                discovery_debug_jsonl=discovery_debug_jsonl,
+            )
+            runtime_markets = (
+                select_runtime_market_universe(
+                    legacy_discovered,
+                    now_ts=now_ts,
+                    lookahead_windows=lookahead_windows,
+                )
+                if lookahead_windows > 1
+                else select_runtime_markets(legacy_discovered, now_ts=now_ts)
+            )
+            attempt = {
+                "event_type": "polymarket_discovery_attempt",
+                "runtime_tradable_count": len(runtime_markets),
+                "current_signal_count": sum(1 for market in runtime_markets if market.signal_enabled),
+                "next_warmup_count": sum(
+                    1
+                    for market in runtime_markets
+                    if market.runtime_selection_reason == "next_warmup"
+                ),
+                "selected_market_slugs": [market.market_slug for market in runtime_markets],
+                "current_signal_slugs": [
+                    market.market_slug for market in runtime_markets if market.signal_enabled
+                ],
+                "next_warmup_slugs": [
+                    market.market_slug
+                    for market in runtime_markets
+                    if market.runtime_selection_reason == "next_warmup"
+                ],
+                "fallback_used": False,
+                "failure_reason": None if runtime_markets else "no_runtime_tradable_markets",
+            }
+            return runtime_markets, attempt
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         print(
             "live Polymarket discovery failed "
-            f"({type(exc).__name__}: {exc}); trying cached market metadata",
+            f"({type(exc).__name__}: {exc}); trying validated cached market metadata",
             flush=True,
         )
-        discovered = ()
+        cache_validation = discovery.validate_cache_for_runtime(
+            now_ts=now_ts,
+            ttl_ms=market_cache_ttl_ms,
+            lookahead_windows=lookahead_windows,
+        )
+        attempt = {
+            "event_type": "polymarket_discovery_attempt",
+            "timestamp": None,
+            "now_utc": None,
+            "strategy_results": {"cache": cache_validation.to_summary()},
+            "runtime_tradable_count": len(cache_validation.runtime_markets),
+            "current_signal_count": sum(
+                1 for market in cache_validation.runtime_markets if market.signal_enabled
+            ),
+            "next_warmup_count": sum(
+                1
+                for market in cache_validation.runtime_markets
+                if market.runtime_selection_reason == "next_warmup"
+            ),
+            "cache_used": cache_validation.valid,
+            "cache_rejected": cache_validation.rejected,
+            "cache_rejected_reason": cache_validation.rejected_reason,
+            "selected_market_slugs": [
+                market.market_slug for market in cache_validation.runtime_markets
+            ],
+            "current_signal_slugs": [
+                market.market_slug
+                for market in cache_validation.runtime_markets
+                if market.signal_enabled
+            ],
+            "next_warmup_slugs": [
+                market.market_slug
+                for market in cache_validation.runtime_markets
+                if market.runtime_selection_reason == "next_warmup"
+            ],
+            "fallback_used": True,
+            "failure_reason": None if cache_validation.valid else "live_discovery_failed",
+        }
+        if discovery_debug_jsonl is not None:
+            from app.marketdata.polymarket_discovery import write_discovery_attempt_jsonl
+
+            write_discovery_attempt_jsonl(discovery_debug_jsonl, attempt)
+        if cache_validation.valid:
+            print(f"using cached Polymarket markets ({len(cache_validation.markets)})", flush=True)
+            _print_runtime_selection_diagnostics(cache_validation.markets)
+            return cache_validation.runtime_markets, attempt
+        return (), attempt
+
+    discovered = rolling_result.markets
 
     if discovered:
         _print_runtime_selection_diagnostics(discovered)
+        if rolling_result.runtime_markets:
+            return rolling_result.runtime_markets, rolling_result.attempt
         if lookahead_windows > 1:
             runtime_markets = select_runtime_market_universe(
                 discovered,
@@ -1474,25 +1742,62 @@ async def _discover_polymarket_markets(
         else:
             runtime_markets = select_runtime_markets(discovered, now_ts=now_ts)
         if runtime_markets:
-            return runtime_markets
+            return runtime_markets, rolling_result.attempt
         print(
-            f"discovered {len(discovered)} rolling markets, but none are runtime-tradable/current-next",
+            f"discovered {len(discovered)} rolling markets, but none are runtime-tradable/current-or-warmup",
             flush=True,
         )
 
-    cached = _read_cached_polymarket_markets(discovery)
-    if cached.markets:
-        cached_markets = annotate_runtime_market_roles(cached.markets, now_ts=now_ts)
-        print(f"using cached Polymarket markets ({len(cached_markets)})", flush=True)
-        _print_runtime_selection_diagnostics(cached_markets)
-        if lookahead_windows > 1:
-            return select_runtime_market_universe(
-                cached_markets,
-                now_ts=now_ts,
-                lookahead_windows=lookahead_windows,
-            )
-        return select_runtime_markets(cached_markets, now_ts=now_ts)
-    return ()
+    if rolling_result.cache_used and rolling_result.runtime_markets:
+        print(f"using cached Polymarket markets ({len(discovered)})", flush=True)
+        return rolling_result.runtime_markets, rolling_result.attempt
+    return (), rolling_result.attempt
+
+
+def _print_discovery_failure_summary(
+    attempt: dict[str, Any],
+    *,
+    attempt_index: int,
+) -> None:
+    strategy_results = attempt.get("strategy_results") or {}
+    direct = strategy_results.get("direct_slug") or {}
+    active = strategy_results.get("active_events") or {}
+    cache = strategy_results.get("cache") or {}
+    print(
+        " ".join(
+            [
+                "market_discovery_no_runtime_markets",
+                f"attempt={attempt_index}",
+                f"failure_reason={attempt.get('failure_reason') or '-'}",
+                f"direct_found_count={direct.get('found_count', attempt.get('direct_found_count', 0))}",
+                f"direct_runtime_count={direct.get('runtime_tradable_count', 0)}",
+                f"active_events_found_runtime_count={active.get('runtime_tradable_count', 0)}",
+                f"cache_runtime_count={cache.get('runtime_count', 0)}",
+                f"cache_rejected={cache.get('rejected', attempt.get('cache_rejected', False))}",
+                f"cache_rejected_reason={cache.get('rejected_reason') or attempt.get('cache_rejected_reason') or '-'}",
+            ]
+        ),
+        flush=True,
+    )
+    for diagnostic in attempt.get("diagnostics") or []:
+        print(f"discovery_diagnostic={diagnostic}", flush=True)
+
+
+def _print_startup_timeout_summary(attempts: Sequence[dict[str, Any]]) -> None:
+    last = attempts[-1] if attempts else {}
+    print(
+        " ".join(
+            [
+                "no_active_markets_after_startup_timeout",
+                f"attempts={len(attempts)}",
+                f"last_failure_reason={last.get('failure_reason') or '-'}",
+                f"last_runtime_tradable_count={last.get('runtime_tradable_count', 0)}",
+                f"last_current_signal_count={last.get('current_signal_count', 0)}",
+                f"last_next_warmup_count={last.get('next_warmup_count', 0)}",
+            ]
+        ),
+        flush=True,
+    )
 
 
 def _read_cached_polymarket_markets(
@@ -1540,14 +1845,14 @@ def _print_runtime_selection_diagnostics(
         1
         for market in markets
         if market.selected_for_runtime and not market.signal_enabled
-        and classify_market_window(market, now_ts=now_ts) == "next"
+        and classify_market_window(market, now_ts=now_ts) == "next_warmup"
     )
     future_count = sum(
         1
         for market in markets
         if market.selected_for_runtime
         and not market.signal_enabled
-        and classify_market_window(market, now_ts=now_ts) == "future"
+        and classify_market_window(market, now_ts=now_ts) == "future_tracked"
     )
     skipped_by_classification: dict[str, int] = {}
     for market in markets:

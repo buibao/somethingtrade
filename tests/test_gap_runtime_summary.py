@@ -31,7 +31,7 @@ def _market(
         closed=False,
         accepting_orders=True,
         enable_order_book=True,
-        classification="current",
+        classification="current_signal",
         selected_for_runtime=True,
         signal_enabled=True,
         base_asset=base_asset,

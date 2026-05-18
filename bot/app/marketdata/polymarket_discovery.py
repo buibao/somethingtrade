@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 import re
@@ -17,17 +19,30 @@ from app.core.events import GapDirection
 
 DEFAULT_GAMMA_URL = "https://gamma-api.polymarket.com"
 DEFAULT_MARKET_CACHE_PATH = Path("data/cache/polymarket_markets.json")
+DEFAULT_DISCOVERY_DEBUG_JSONL_PATH = Path("data/debug/polymarket_discovery_attempts.jsonl")
+DEFAULT_MARKET_CACHE_TTL_MS = 60_000
 
 UP_OUTCOMES = {"up", "above", "higher"}
 DOWN_OUTCOMES = {"down", "below", "lower"}
 ROLLING_HORIZON_SECONDS = {"5m": 300, "15m": 900}
 ROLLING_UPDOWN_SLUG_RE = re.compile(r"\b(btc|eth)-updown-(5m|15m)-(\d+)\b")
+DiscoverySource = Literal["direct_slug", "active_events", "cache"]
 MarketWindowClassification = Literal[
+    "runtime_tradable",
+    "current_signal",
+    "next_warmup",
+    "future_tracked",
     "expired",
+    "closed",
+    "active_but_not_accepting_orders",
+    "missing_orderbook",
+    "missing_tokens",
+    "not_found",
+    "unknown",
+    # Legacy cache/test values are accepted for backward-compatible cache reads.
     "current",
     "next",
     "future",
-    "closed",
     "not_accepting",
 ]
 
@@ -90,6 +105,7 @@ class PolymarketMarketMetadata(BaseModel):
     selected_for_runtime: bool = False
     signal_enabled: bool = False
     runtime_selection_reason: str | None = None
+    discovery_source: DiscoverySource | None = None
     up_token_id: str | None = None
     down_token_id: str | None = None
     yes_token_id: str | None = None
@@ -124,6 +140,47 @@ class PolymarketMarketCache(BaseModel):
 
     discovered_at_ts: int | None = None
     markets: list[PolymarketMarketMetadata] = Field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class CacheRuntimeValidation:
+    exists: bool
+    valid: bool
+    markets: tuple[PolymarketMarketMetadata, ...] = ()
+    runtime_markets: tuple[PolymarketMarketMetadata, ...] = ()
+    cache_age_ms: float | None = None
+    ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS
+    rejected: bool = False
+    rejected_reason: str | None = None
+    error: str | None = None
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "exists": self.exists,
+            "valid": self.valid,
+            "cache_age_ms": self.cache_age_ms,
+            "ttl_ms": self.ttl_ms,
+            "runtime_count": len(self.runtime_markets),
+            "market_count": len(self.markets),
+            "rejected": self.rejected,
+            "rejected_reason": self.rejected_reason,
+            "error": self.error,
+            "selected_market_slugs": [
+                market.market_slug for market in self.runtime_markets
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RollingDiscoveryResult:
+    markets: tuple[PolymarketMarketMetadata, ...]
+    runtime_markets: tuple[PolymarketMarketMetadata, ...]
+    attempt: dict[str, Any]
+    direct_results: tuple[dict[str, Any], ...] = ()
+    active_events_result: dict[str, Any] | None = None
+    cache_validation: CacheRuntimeValidation | None = None
+    cache_used: bool = False
+    fallback_used: bool = False
 
 
 FetchMarkets = Callable[[], Sequence[dict[str, Any]]]
@@ -162,26 +219,26 @@ class PolymarketDiscoveryClient:
         write_cache: bool = True,
         now_ts: int | None = None,
         rolling_lookahead_windows: int = 2,
+        market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+        discovery_debug_jsonl: Path | str | None = None,
     ) -> tuple[PolymarketMarketMetadata, ...]:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
         if self.enable_direct_slug_lookup:
-            rolling_markets = await self.discover_rolling_markets(
+            rolling_result = await self.discover_rolling_markets_robust(
                 now_ts=current_ts,
                 lookahead_windows=rolling_lookahead_windows,
+                market_cache_ttl_ms=market_cache_ttl_ms,
+                discovery_debug_jsonl=discovery_debug_jsonl,
+                write_cache=write_cache,
             )
-            if rolling_markets:
-                rolling_markets = annotate_runtime_market_roles(
-                    rolling_markets,
-                    now_ts=current_ts,
-                )
-                if write_cache:
-                    self.write_cache(rolling_markets)
-                return rolling_markets
+            if rolling_result.markets:
+                return rolling_result.markets
 
         raw_markets = await self._fetch_raw_market_payloads()
         markets = annotate_runtime_market_roles(
             self._parse_market_payloads(raw_markets),
             now_ts=current_ts,
+            lookahead_windows=rolling_lookahead_windows,
         )
 
         if write_cache:
@@ -200,20 +257,131 @@ class PolymarketDiscoveryClient:
             include_raw=False,
             lookahead_windows=lookahead_windows,
         )
-        return annotate_runtime_market_roles(markets, now_ts=current_ts)
+        return annotate_runtime_market_roles(
+            _with_discovery_source(markets, "direct_slug"),
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+
+    async def discover_rolling_markets_robust(
+        self,
+        *,
+        now_ts: int | None = None,
+        lookahead_windows: int = 2,
+        market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+        discovery_debug_jsonl: Path | str | None = None,
+        write_cache: bool = False,
+        force_active_events: bool = False,
+        use_cache: bool = True,
+        include_raw: bool = False,
+    ) -> RollingDiscoveryResult:
+        """Discover rolling markets from direct slugs, active events, and safe cache."""
+
+        current_ts = now_ts or utc_now_ns() // 1_000_000_000
+        direct_markets: tuple[PolymarketMarketMetadata, ...] = ()
+        direct_results: list[dict[str, Any]] = []
+        if self.enable_direct_slug_lookup:
+            raw_direct_markets, direct_results = await self._discover_rolling_slug_candidates(
+                now_ts=current_ts,
+                include_raw=include_raw,
+                lookahead_windows=lookahead_windows,
+            )
+            direct_markets = annotate_runtime_market_roles(
+                _with_discovery_source(raw_direct_markets, "direct_slug"),
+                now_ts=current_ts,
+                lookahead_windows=lookahead_windows,
+            )
+
+        direct_runtime = select_runtime_markets(
+            direct_markets,
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+        fallback_used = force_active_events or not direct_runtime
+        active_markets: tuple[PolymarketMarketMetadata, ...] = ()
+        active_result: dict[str, Any] = _empty_active_events_result(attempted=False)
+        if fallback_used:
+            active_markets, active_result = await self.discover_active_event_rolling_markets(
+                now_ts=current_ts,
+                lookahead_windows=lookahead_windows,
+                include_raw=include_raw,
+            )
+
+        merged_markets = annotate_runtime_market_roles(
+            _dedupe_prefer_runtime(
+                tuple(direct_markets) + tuple(active_markets),
+                now_ts=current_ts,
+            ),
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+        runtime_markets = select_runtime_markets(
+            merged_markets,
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+
+        cache_validation = self.validate_cache_for_runtime(
+            now_ts=current_ts,
+            ttl_ms=market_cache_ttl_ms,
+            lookahead_windows=lookahead_windows,
+        )
+        cache_used = False
+        final_markets = merged_markets
+        if use_cache and not runtime_markets and cache_validation.valid:
+            final_markets = cache_validation.markets
+            runtime_markets = cache_validation.runtime_markets
+            cache_used = True
+
+        if write_cache and final_markets and not cache_used:
+            self.write_cache(final_markets)
+
+        attempt = _build_discovery_attempt(
+            now_ts=current_ts,
+            final_markets=final_markets,
+            runtime_markets=runtime_markets,
+            direct_markets=direct_markets,
+            direct_results=direct_results,
+            active_markets=active_markets,
+            active_result=active_result,
+            cache_validation=cache_validation,
+            cache_used=cache_used,
+            fallback_used=fallback_used,
+        )
+        if discovery_debug_jsonl is not None:
+            write_discovery_attempt_jsonl(discovery_debug_jsonl, attempt)
+
+        return RollingDiscoveryResult(
+            markets=final_markets,
+            runtime_markets=runtime_markets,
+            attempt=attempt,
+            direct_results=tuple(direct_results),
+            active_events_result=active_result,
+            cache_validation=cache_validation,
+            cache_used=cache_used,
+            fallback_used=fallback_used,
+        )
 
     async def debug_rolling_discovery(
         self,
         *,
         now_ts: int | None = None,
+        market_cache_ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+        discovery_debug_jsonl: Path | str | None = None,
     ) -> dict[str, Any]:
         current_ts = now_ts or utc_now_ns() // 1_000_000_000
-        markets, results = await self._discover_rolling_slug_candidates(
+        robust = await self.discover_rolling_markets_robust(
             now_ts=current_ts,
-            include_raw=True,
             lookahead_windows=2,
+            market_cache_ttl_ms=market_cache_ttl_ms,
+            discovery_debug_jsonl=discovery_debug_jsonl,
+            write_cache=False,
+            force_active_events=True,
+            include_raw=True,
         )
-        selected_keys = _market_keys(select_runtime_markets(markets, now_ts=current_ts))
+        markets = list(robust.markets)
+        results = list(robust.direct_results)
+        selected_keys = _market_keys(robust.runtime_markets)
         slugs = [str(result["slug"]) for result in results]
         found_slugs = [str(result["slug"]) for result in results if result["found"]]
         return {
@@ -221,6 +389,17 @@ class PolymarketDiscoveryClient:
             "generated_slugs": slugs,
             "found_slugs": found_slugs,
             "not_found_slugs": [slug for slug in slugs if slug not in set(found_slugs)],
+            "strategy_results": robust.attempt["strategy_results"],
+            "attempt": robust.attempt,
+            "cache_validation": (
+                None
+                if robust.cache_validation is None
+                else robust.cache_validation.to_summary()
+            ),
+            "active_events": robust.active_events_result,
+            "selected_market_slugs": robust.attempt["selected_market_slugs"],
+            "current_signal_slugs": robust.attempt["current_signal_slugs"],
+            "next_warmup_slugs": robust.attempt["next_warmup_slugs"],
             "results": [
                 _enrich_debug_result(result, now_ts=current_ts, selected_keys=selected_keys)
                 for result in results
@@ -234,6 +413,87 @@ class PolymarketDiscoveryClient:
                 for market in markets
             ],
         }
+
+    async def discover_active_event_rolling_markets(
+        self,
+        *,
+        now_ts: int | None = None,
+        lookahead_windows: int = 2,
+        include_raw: bool = False,
+    ) -> tuple[tuple[PolymarketMarketMetadata, ...], dict[str, Any]]:
+        current_ts = now_ts or utc_now_ns() // 1_000_000_000
+        events = await self._fetch_paginated_events()
+        result = _empty_active_events_result(attempted=True)
+        result["event_count"] = len(events)
+        markets: list[PolymarketMarketMetadata] = []
+        reject_reasons: list[str] = []
+
+        for event in events:
+            candidates = _extract_market_payloads(event, fallback_slug=None)
+            result["candidate_count"] += len(candidates)
+            for candidate in candidates:
+                slug = str(candidate.get("slug") or candidate.get("market_slug") or "")
+                if include_raw:
+                    result.setdefault("raw_candidate_sample", []).append(candidate)
+                if not is_short_duration_crypto_market(candidate):
+                    reason = "not_btc_eth_5m_15m_updown"
+                    reject_reasons.append(reason)
+                    result["rejected_candidates"].append({"slug": slug, "reason": reason})
+                    continue
+
+                candidate_rejects: list[str] = []
+                metadata = parse_market_metadata(
+                    candidate,
+                    reject_logger=candidate_rejects.append,
+                )
+                if metadata is None:
+                    reason = ",".join(candidate_rejects) or "parse_failed"
+                    reject_reasons.extend(candidate_rejects or [reason])
+                    result["rejected_candidates"].append({"slug": slug, "reason": reason})
+                    continue
+
+                result["parsed_count"] += 1
+                metadata = metadata.model_copy(update={"discovery_source": "active_events"})
+                classification = classify_market_window(metadata, now_ts=current_ts)
+                runtime_ready = is_runtime_tradable_market(metadata, now_ts=current_ts)
+                compatible = _is_rolling_window_compatible(
+                    metadata,
+                    now_ts=current_ts,
+                    lookahead_windows=lookahead_windows,
+                )
+                if not runtime_ready or not compatible:
+                    reason = (
+                        "incompatible_rolling_window"
+                        if runtime_ready and not compatible
+                        else classification
+                    )
+                    reject_reasons.append(reason)
+                    result["rejected_candidates"].append(
+                        {
+                            "slug": metadata.market_slug,
+                            "market_id": metadata.market_id,
+                            "classification": classification,
+                            "reason": reason,
+                        }
+                    )
+                    continue
+
+                markets.append(metadata)
+
+        annotated = annotate_runtime_market_roles(
+            _dedupe_prefer_runtime(tuple(markets), now_ts=current_ts),
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+        result["runtime_tradable_count"] = sum(
+            1 for market in annotated if is_runtime_tradable_market(market, now_ts=current_ts)
+        )
+        result["reject_reasons"] = [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(Counter(reject_reasons).items())
+        ]
+        result["markets"] = [market.model_dump(mode="json") for market in annotated]
+        return annotated, result
 
     async def fetch_market_by_slug(self, slug: str) -> dict[str, Any] | None:
         return await self._fetch_slug_object("markets", slug)
@@ -450,6 +710,8 @@ class PolymarketDiscoveryClient:
     def _parse_market_payloads(
         self,
         raw_markets: Sequence[dict[str, Any]],
+        *,
+        discovery_source: DiscoverySource | None = None,
     ) -> list[PolymarketMarketMetadata]:
         markets: list[PolymarketMarketMetadata] = []
         seen_market_keys: set[tuple[str, tuple[str, ...]]] = set()
@@ -464,12 +726,119 @@ class PolymarketDiscoveryClient:
                 reject_logger=log_reject,
             )
             if metadata is not None:
+                if discovery_source is not None:
+                    metadata = metadata.model_copy(update={"discovery_source": discovery_source})
                 key = (metadata.market_id, metadata.token_ids)
                 if key in seen_market_keys:
                     continue
                 seen_market_keys.add(key)
                 markets.append(metadata)
         return markets
+
+    def validate_cache_for_runtime(
+        self,
+        *,
+        now_ts: int | None = None,
+        ttl_ms: int = DEFAULT_MARKET_CACHE_TTL_MS,
+        lookahead_windows: int = 2,
+    ) -> CacheRuntimeValidation:
+        def reject(
+            reason: str,
+            *,
+            markets: tuple[PolymarketMarketMetadata, ...] = (),
+            runtime_markets: tuple[PolymarketMarketMetadata, ...] = (),
+            age_ms: float | None = None,
+            error: str | None = None,
+        ) -> CacheRuntimeValidation:
+            self._logger.warning(
+                "cache_rejected_for_runtime",
+                reason=reason,
+                cache_path=str(self.cache_path),
+                cache_age_ms=age_ms,
+                market_count=len(markets),
+                runtime_count=len(runtime_markets),
+            )
+            return CacheRuntimeValidation(
+                exists=True,
+                valid=False,
+                markets=markets,
+                runtime_markets=runtime_markets,
+                cache_age_ms=age_ms,
+                ttl_ms=ttl_ms,
+                rejected=True,
+                rejected_reason=reason,
+                error=error,
+            )
+
+        current_ts = now_ts or utc_now_ns() // 1_000_000_000
+        if not self.cache_path.exists():
+            return CacheRuntimeValidation(exists=False, valid=False, ttl_ms=ttl_ms)
+        try:
+            cache = self.read_cache()
+        except (OSError, ValueError) as exc:
+            return reject(
+                "cache_missing_required_fields",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        age_ms = _cache_age_ms(cache.discovered_at_ts)
+        annotated = annotate_runtime_market_roles(
+            _with_discovery_source(cache.markets, "cache"),
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+        runtime_markets = select_runtime_markets(
+            annotated,
+            now_ts=current_ts,
+            lookahead_windows=lookahead_windows,
+        )
+        if age_ms is None:
+            return reject(
+                "cache_missing_required_fields",
+                markets=annotated,
+                runtime_markets=runtime_markets,
+                age_ms=age_ms,
+            )
+        if age_ms > ttl_ms:
+            return reject(
+                "cache_expired",
+                markets=annotated,
+                runtime_markets=runtime_markets,
+                age_ms=age_ms,
+            )
+        if annotated and all(market.closed is True for market in annotated):
+            return reject(
+                "cache_all_closed",
+                markets=annotated,
+                runtime_markets=runtime_markets,
+                age_ms=age_ms,
+            )
+        if annotated and all(market.accepting_orders is False for market in annotated):
+            return reject(
+                "cache_no_runtime_markets",
+                markets=annotated,
+                runtime_markets=runtime_markets,
+                age_ms=age_ms,
+            )
+        has_current_or_next = any(
+            market.classification in {"current_signal", "next_warmup"}
+            for market in runtime_markets
+        )
+        if not runtime_markets or not has_current_or_next:
+            return reject(
+                "cache_no_runtime_markets",
+                markets=annotated,
+                runtime_markets=runtime_markets,
+                age_ms=age_ms,
+            )
+        return CacheRuntimeValidation(
+            exists=True,
+            valid=True,
+            markets=annotated,
+            runtime_markets=runtime_markets,
+            cache_age_ms=age_ms,
+            ttl_ms=ttl_ms,
+        )
 
     def write_cache(self, markets: Sequence[PolymarketMarketMetadata]) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -510,6 +879,225 @@ def token_side_labels(
     return mapping
 
 
+def write_discovery_attempt_jsonl(path: Path | str, attempt: dict[str, Any]) -> None:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("ab") as handle:
+        handle.write(orjson.dumps(attempt, option=orjson.OPT_APPEND_NEWLINE))
+
+
+def _empty_active_events_result(*, attempted: bool) -> dict[str, Any]:
+    return {
+        "attempted": attempted,
+        "event_count": 0,
+        "candidate_count": 0,
+        "parsed_count": 0,
+        "runtime_tradable_count": 0,
+        "reject_reasons": [],
+        "rejected_candidates": [],
+        "markets": [],
+    }
+
+
+def _with_discovery_source(
+    markets: Sequence[PolymarketMarketMetadata],
+    source: DiscoverySource,
+) -> tuple[PolymarketMarketMetadata, ...]:
+    return tuple(market.model_copy(update={"discovery_source": source}) for market in markets)
+
+
+def _dedupe_prefer_runtime(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+) -> tuple[PolymarketMarketMetadata, ...]:
+    selected_by_key: dict[tuple[str, tuple[str, ...]], PolymarketMarketMetadata] = {}
+    order: list[tuple[str, tuple[str, ...]]] = []
+    for market in markets:
+        key = _market_key(market)
+        if key not in selected_by_key:
+            selected_by_key[key] = market
+            order.append(key)
+            continue
+        previous = selected_by_key[key]
+        previous_runtime = is_runtime_tradable_market(previous, now_ts=now_ts)
+        current_runtime = is_runtime_tradable_market(market, now_ts=now_ts)
+        if current_runtime and not previous_runtime:
+            selected_by_key[key] = market
+    return tuple(selected_by_key[key] for key in order)
+
+
+def _build_discovery_attempt(
+    *,
+    now_ts: int,
+    final_markets: Sequence[PolymarketMarketMetadata],
+    runtime_markets: Sequence[PolymarketMarketMetadata],
+    direct_markets: Sequence[PolymarketMarketMetadata],
+    direct_results: Sequence[dict[str, Any]],
+    active_markets: Sequence[PolymarketMarketMetadata],
+    active_result: dict[str, Any],
+    cache_validation: CacheRuntimeValidation,
+    cache_used: bool,
+    fallback_used: bool,
+) -> dict[str, Any]:
+    time_diagnostics = _time_sanity_diagnostics(now_ts, direct_markets, direct_results)
+    classifications = Counter(
+        classify_market_window(market, now_ts=now_ts) for market in final_markets
+    )
+    selected_market_slugs = [market.market_slug for market in runtime_markets]
+    current_signal_slugs = [
+        market.market_slug for market in runtime_markets if market.signal_enabled
+    ]
+    next_warmup_slugs = [
+        market.market_slug
+        for market in runtime_markets
+        if market.runtime_selection_reason == "next_warmup"
+    ]
+    failure_reason = None
+    direct_found_count = sum(1 for result in direct_results if result.get("found"))
+    direct_runtime_count = sum(
+        1 for market in direct_markets if is_runtime_tradable_market(market, now_ts=now_ts)
+    )
+    if not runtime_markets:
+        if direct_found_count and direct_markets and all(
+            classify_market_window(market, now_ts=now_ts) == "closed"
+            for market in direct_markets
+        ):
+            failure_reason = "direct_slug_found_but_all_closed"
+        else:
+            failure_reason = "no_runtime_tradable_markets"
+
+    diagnostics = list(time_diagnostics.pop("diagnostics"))
+    if failure_reason == "direct_slug_found_but_all_closed":
+        diagnostics.append("direct_slug_found_but_all_closed")
+
+    attempt = {
+        "event_type": "polymarket_discovery_attempt",
+        "timestamp": _iso_from_unix_seconds(now_ts),
+        "now_utc": _iso_from_unix_seconds(now_ts),
+        "now_utc_iso": _iso_from_unix_seconds(now_ts),
+        "local_system_time_iso": datetime.now().astimezone().isoformat(),
+        "strategy_results": {
+            "direct_slug": {
+                "attempted": bool(direct_results),
+                "generated_slug_count": len(direct_results),
+                "found_count": direct_found_count,
+                "market_count": len(direct_markets),
+                "runtime_tradable_count": direct_runtime_count,
+            },
+            "active_events": {
+                "attempted": bool(active_result.get("attempted")),
+                "event_count": active_result.get("event_count", 0),
+                "candidate_count": active_result.get("candidate_count", 0),
+                "parsed_count": active_result.get("parsed_count", 0),
+                "market_count": len(active_markets),
+                "runtime_tradable_count": active_result.get("runtime_tradable_count", 0),
+            },
+            "cache": cache_validation.to_summary(),
+        },
+        "generated_slug_count": len(direct_results),
+        "direct_found_count": direct_found_count,
+        "active_events_found_count": len(active_markets),
+        "active_events_found_runtime_count": active_result.get("runtime_tradable_count", 0),
+        "runtime_tradable_count": len(runtime_markets),
+        "current_signal_count": len(current_signal_slugs),
+        "next_warmup_count": len(next_warmup_slugs),
+        "closed_count": classifications.get("closed", 0),
+        "accepting_orders_false_count": sum(
+            1 for market in final_markets if market.accepting_orders is False
+        ),
+        "missing_orderbook_count": classifications.get("missing_orderbook", 0),
+        "missing_tokens_count": classifications.get("missing_tokens", 0)
+        + _reject_count(direct_results, "missing_clob_token_ids")
+        + _active_reject_count(active_result, "missing_clob_token_ids"),
+        "cache_used": cache_used,
+        "cache_rejected": cache_validation.rejected,
+        "cache_rejected_reason": cache_validation.rejected_reason,
+        "selected_market_slugs": selected_market_slugs,
+        "current_signal_slugs": current_signal_slugs,
+        "next_warmup_slugs": next_warmup_slugs,
+        "fallback_used": fallback_used,
+        "failure_reason": failure_reason,
+        "diagnostics": diagnostics,
+        **time_diagnostics,
+    }
+    return attempt
+
+
+def _reject_count(results: Sequence[dict[str, Any]], reason: str) -> int:
+    total = 0
+    for result in results:
+        for reject in result.get("reject_reasons") or []:
+            if str(reject) == reason:
+                total += 1
+    return total
+
+
+def _active_reject_count(active_result: dict[str, Any], reason: str) -> int:
+    total = 0
+    for item in active_result.get("reject_reasons") or []:
+        if isinstance(item, dict) and item.get("reason") == reason:
+            total += int(item.get("count", 0))
+    return total
+
+
+def _time_sanity_diagnostics(
+    now_ts: int,
+    direct_markets: Sequence[PolymarketMarketMetadata],
+    direct_results: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    generated = _generated_window_bounds(
+        now_ts,
+        [str(result.get("slug")) for result in direct_results if result.get("slug")],
+    )
+    diagnostics: list[str] = []
+    closed_future_count = 0
+    accepting_false_count = 0
+    for market in direct_markets:
+        start_ts = _market_start_sort_key(market)
+        end_ts = _unix_seconds(market.end_time)
+        current_or_future = (
+            end_ts is not None
+            and (start_ts <= now_ts < end_ts or start_ts > now_ts)
+        )
+        if market.closed is True and current_or_future:
+            closed_future_count += 1
+        if market.active is True and market.accepting_orders is False:
+            accepting_false_count += 1
+    if closed_future_count:
+        diagnostics.append("direct_slug_returned_closed_for_current_or_future_window")
+    return {
+        **generated,
+        "system_clock_skew_warning": None,
+        "direct_slug_closed_future_window_count": closed_future_count,
+        "direct_slug_active_but_accepting_orders_false_count": accepting_false_count,
+        "diagnostics": diagnostics,
+    }
+
+
+def _generated_window_bounds(now_ts: int, slugs: Sequence[str]) -> dict[str, Any]:
+    windows: list[tuple[int, int]] = []
+    for slug in slugs:
+        parts = _rolling_slug_parts(slug)
+        if parts is None:
+            continue
+        _asset, horizon, start_ts = parts
+        duration = ROLLING_HORIZON_SECONDS[horizon]
+        windows.append((start_ts, start_ts + duration))
+    future_starts = [start for start, _end in windows if start > now_ts]
+    ended = [end for _start, end in windows if end <= now_ts]
+    return {
+        "generated_slug_min_start": min((start for start, _end in windows), default=None),
+        "generated_slug_max_end": max((end for _start, end in windows), default=None),
+        "seconds_until_next_generated_start": (
+            min(future_starts) - now_ts if future_starts else None
+        ),
+        "seconds_since_last_generated_end": (
+            now_ts - max(ended) if ended else None
+        ),
+    }
+
+
 def is_runtime_tradable_market(
     market: PolymarketMarketMetadata,
     *,
@@ -543,25 +1131,29 @@ def classify_market_window(
 
     if market.closed is True:
         return "closed"
-    if (
-        market.active is not True
-        or market.accepting_orders is not True
-        or market.enable_order_book is not True
-    ):
-        return "not_accepting"
+    if market.active is True and market.closed is False and market.accepting_orders is not True:
+        return "active_but_not_accepting_orders"
+    if market.active is True and market.closed is False and market.enable_order_book is not True:
+        return "missing_orderbook"
+    if market.up_token_id is None or market.down_token_id is None or len(market.token_ids) < 2:
+        return "missing_tokens"
+    if market.active is not True or market.closed is not False:
+        return "unknown"
 
     end_ts = _unix_seconds(market.end_time)
-    if end_ts is None or end_ts <= now_ts:
+    if end_ts is None:
+        return "runtime_tradable"
+    if end_ts <= now_ts:
         return "expired"
 
     start_ts = _market_start_sort_key(market)
     if start_ts <= now_ts < end_ts:
-        return "current"
+        return "current_signal"
     if start_ts > now_ts:
         duration_seconds = _market_duration_seconds(market)
         if duration_seconds is not None and start_ts - now_ts <= duration_seconds:
-            return "next"
-        return "future"
+            return "next_warmup"
+        return "future_tracked"
     return "expired"
 
 
@@ -569,14 +1161,23 @@ def select_runtime_markets(
     markets: Sequence[PolymarketMarketMetadata],
     *,
     now_ts: int,
+    lookahead_windows: int = 1,
 ) -> tuple[PolymarketMarketMetadata, ...]:
     """Select current plus first future market per asset/duration for live monitoring."""
 
-    annotated = annotate_runtime_market_roles(markets, now_ts=now_ts)
+    annotated = annotate_runtime_market_roles(
+        markets,
+        now_ts=now_ts,
+        lookahead_windows=lookahead_windows,
+    )
     selected_by_key = {_market_key(market): market for market in annotated}
     return tuple(
         selected_by_key[key]
-        for key in _select_runtime_market_key_order(markets, now_ts=now_ts)
+        for key in _select_runtime_market_key_order(
+            markets,
+            now_ts=now_ts,
+            lookahead_windows=lookahead_windows,
+        )
         if key in selected_by_key
     )
 
@@ -585,18 +1186,22 @@ def annotate_runtime_market_roles(
     markets: Sequence[PolymarketMarketMetadata],
     *,
     now_ts: int,
+    lookahead_windows: int = 1,
 ) -> tuple[PolymarketMarketMetadata, ...]:
-    selected_keys = _select_runtime_market_keys(markets, now_ts=now_ts)
+    selected_roles = _select_runtime_market_key_roles(
+        markets,
+        now_ts=now_ts,
+        lookahead_windows=lookahead_windows,
+    )
     annotated: list[PolymarketMarketMetadata] = []
     for market in markets:
         classification = classify_market_window(market, now_ts=now_ts)
-        selected = _market_key(market) in selected_keys
-        if selected and classification in {"future", "next"}:
-            classification = "next"
-        signal_enabled = selected and classification == "current"
+        selected_role = selected_roles.get(_market_key(market))
+        selected = selected_role is not None
+        signal_enabled = selected_role == "current_signal"
         reason = _runtime_selection_reason(
             classification=classification,
-            selected=selected,
+            selected_role=selected_role,
             signal_enabled=signal_enabled,
         )
         annotated.append(
@@ -616,15 +1221,55 @@ def _select_runtime_market_keys(
     markets: Sequence[PolymarketMarketMetadata],
     *,
     now_ts: int,
+    lookahead_windows: int = 1,
 ) -> set[tuple[str, tuple[str, ...]]]:
-    return set(_select_runtime_market_key_order(markets, now_ts=now_ts))
+    return set(
+        _select_runtime_market_key_order(
+            markets,
+            now_ts=now_ts,
+            lookahead_windows=lookahead_windows,
+        )
+    )
+
+
+def _select_runtime_market_key_roles(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+    lookahead_windows: int = 1,
+) -> dict[tuple[str, tuple[str, ...]], MarketWindowClassification]:
+    roles: dict[tuple[str, tuple[str, ...]], MarketWindowClassification] = {}
+    for key, role in _select_runtime_market_key_role_order(
+        markets,
+        now_ts=now_ts,
+        lookahead_windows=lookahead_windows,
+    ):
+        roles[key] = role
+    return roles
 
 
 def _select_runtime_market_key_order(
     markets: Sequence[PolymarketMarketMetadata],
     *,
     now_ts: int,
+    lookahead_windows: int = 1,
 ) -> list[tuple[str, tuple[str, ...]]]:
+    return [
+        key
+        for key, _role in _select_runtime_market_key_role_order(
+            markets,
+            now_ts=now_ts,
+            lookahead_windows=lookahead_windows,
+        )
+    ]
+
+
+def _select_runtime_market_key_role_order(
+    markets: Sequence[PolymarketMarketMetadata],
+    *,
+    now_ts: int,
+    lookahead_windows: int = 1,
+) -> list[tuple[tuple[str, tuple[str, ...]], MarketWindowClassification]]:
     groups: dict[tuple[str | None, int | None], list[PolymarketMarketMetadata]] = {}
     group_order: list[tuple[str | None, int | None]] = []
     for market in markets:
@@ -636,36 +1281,40 @@ def _select_runtime_market_key_order(
             group_order.append(key)
         groups[key].append(market)
 
-    selected: list[PolymarketMarketMetadata] = []
+    selected: list[tuple[PolymarketMarketMetadata, MarketWindowClassification]] = []
     for key in group_order:
         group = groups[key]
         current = sorted(
             (market for market in group if _is_current_window(market, now_ts=now_ts)),
             key=_market_start_sort_key,
         )
-        selected.extend(current)
+        selected.extend((market, "current_signal") for market in current)
 
         futures = [
             market
             for market in group
             if _market_start_sort_key(market) > now_ts
         ]
-        if futures:
-            selected.append(min(futures, key=_market_start_sort_key))
+        futures.sort(key=_market_start_sort_key)
+        for index, market in enumerate(futures[: max(1, lookahead_windows)]):
+            role: MarketWindowClassification = (
+                "next_warmup" if index == 0 else "future_tracked"
+            )
+            selected.append((market, role))
 
-    return [_market_key(market) for market in selected]
+    return [(_market_key(market), role) for market, role in selected]
 
 
 def _runtime_selection_reason(
     *,
     classification: MarketWindowClassification,
-    selected: bool,
+    selected_role: MarketWindowClassification | None,
     signal_enabled: bool,
 ) -> str:
     if signal_enabled:
         return "current_signal"
-    if selected:
-        return "next_warmup"
+    if selected_role is not None:
+        return selected_role
     return classification
 
 
@@ -687,16 +1336,15 @@ def _debug_market_payload(
 ) -> dict[str, Any]:
     classification = classify_market_window(market, now_ts=now_ts)
     selected = _market_key(market) in selected_keys
-    if selected and classification in {"future", "next"}:
-        classification = "next"
-    signal_enabled = selected and classification == "current"
+    signal_enabled = selected and classification == "current_signal"
+    selected_role = classification if selected else None
     payload = market.model_dump(mode="json")
     payload["classification"] = classification
     payload["selected_for_runtime"] = selected
     payload["signal_enabled"] = signal_enabled
     payload["runtime_selection_reason"] = _runtime_selection_reason(
         classification=classification,
-        selected=selected,
+        selected_role=selected_role,
         signal_enabled=signal_enabled,
     )
     payload["token_for_up"] = market.token_for_direction("UP")
@@ -1042,6 +1690,17 @@ def _unix_seconds(value: object) -> int | None:
     return int(parsed.timestamp())
 
 
+def _cache_age_ms(discovered_at_ts: int | None) -> float | None:
+    if discovered_at_ts is None:
+        return None
+    now_ns = utc_now_ns()
+    if discovered_at_ts > 10_000_000_000_000:
+        return max(0.0, (now_ns - discovered_at_ts) / 1_000_000.0)
+    if discovered_at_ts > 10_000_000_000:
+        return max(0.0, (now_ns / 1_000_000.0) - discovered_at_ts)
+    return max(0.0, (now_ns / 1_000_000_000.0 - discovered_at_ts) * 1000.0)
+
+
 def _iso_from_unix_seconds(value: int | None) -> str | None:
     if value is None:
         return None
@@ -1122,6 +1781,26 @@ def _is_current_window(
     if end_ts is None:
         return False
     return _market_start_sort_key(market) <= now_ts < end_ts
+
+
+def _is_rolling_window_compatible(
+    market: PolymarketMarketMetadata,
+    *,
+    now_ts: int,
+    lookahead_windows: int,
+) -> bool:
+    if market.base_asset not in {"BTC", "ETH"}:
+        return False
+    duration_seconds = _market_duration_seconds(market)
+    if duration_seconds not in {300, 900}:
+        return False
+    end_ts = _unix_seconds(market.end_time)
+    if end_ts is None or end_ts <= now_ts:
+        return False
+    start_ts = _market_start_sort_key(market)
+    min_start = floor_to_window(now_ts, duration_seconds) - duration_seconds
+    max_start = floor_to_window(now_ts, duration_seconds) + max(1, lookahead_windows) * duration_seconds
+    return min_start <= start_ts <= max_start
 
 
 def _extract_market_payloads(
