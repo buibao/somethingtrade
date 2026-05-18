@@ -1,6 +1,0 @@
-category,reason,count,pct_total_rows,pct_rejected_rows,top_tier,top_validation_mode
-book_quality,book_incomplete,1297,0.5278795278795279,0.5526203664252237,B,tolerant
-liquidity,insufficient_best_ask_size,454,0.18477818477818478,0.19343843204090327,B,tolerant
-spread_and_entry_quality,spread_too_wide,283,0.11518111518111518,0.12057946314443971,B,tolerant
-staleness,quote_stale,166,0.06756206756206756,0.07072858968896463,D,tolerant
-timeout,max_observation_lifetime_reached,147,0.05982905982905983,0.06263314870046868,B,tolerant
