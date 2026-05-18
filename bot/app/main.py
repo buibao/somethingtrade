@@ -31,6 +31,10 @@ from app.core.events import (
 from app.execution.paper_executor import PaperExecutor
 from app.logging.event_logger import AsyncJsonlEventLogger
 from app.marketdata.binance_ws import BinanceWSClient
+from app.marketdata.orderbook_phase41 import (
+    OrderbookPhase41Paths,
+    run_orderbook_phase41_capture,
+)
 from app.marketdata.polymarket_discovery import (
     DEFAULT_DISCOVERY_DEBUG_JSONL_PATH,
     DEFAULT_MARKET_CACHE_TTL_MS,
@@ -72,6 +76,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--url",
         default=None,
         help="Binance websocket base URL.",
+    )
+
+    orderbook_capture = subparsers.add_parser(
+        "orderbook-quality-capture",
+        help="Run Phase 4.1 Binance orderbook quality capture and write audit reports.",
+    )
+    orderbook_capture.add_argument(
+        "--symbol",
+        default="BTCUSDT",
+        help="Binance symbol for Phase 4.1 capture.",
+    )
+    orderbook_capture.add_argument(
+        "--duration-sec",
+        type=float,
+        default=900.0,
+        help="Runtime capture duration in seconds.",
+    )
+    orderbook_capture.add_argument(
+        "--depth-n",
+        type=int,
+        default=20,
+        help="Top book depth to copy into clean samples.",
+    )
+    orderbook_capture.add_argument(
+        "--ws-url",
+        default="wss://stream.binance.com:9443/ws",
+        help="Binance websocket base URL.",
+    )
+    orderbook_capture.add_argument(
+        "--rest-url",
+        default="https://api.binance.com",
+        help="Binance REST base URL for depth snapshots.",
     )
 
     poly_monitor = subparsers.add_parser(
@@ -364,6 +400,17 @@ async def run(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     if args.command == "binance-monitor":
         await run_binance_monitor(args)
+        return
+    if args.command == "orderbook-quality-capture":
+        summary = await run_orderbook_phase41_capture(
+            symbol=args.symbol,
+            duration_sec=args.duration_sec,
+            depth_n=args.depth_n,
+            ws_url=args.ws_url,
+            rest_url=args.rest_url,
+            paths=OrderbookPhase41Paths(),
+        )
+        print(orjson.dumps(summary, option=orjson.OPT_INDENT_2).decode("utf-8"), flush=True)
         return
     if args.command == "polymarket-monitor":
         await run_polymarket_monitor(args)
