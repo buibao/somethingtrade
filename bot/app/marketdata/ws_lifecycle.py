@@ -80,11 +80,11 @@ class WSLifecycleTracker:
         self.counters["duplicate_messages_detected"] += 1
         self.counters["duplicate_messages_skipped"] += 1
 
-    def on_queue_backpressure(self) -> None:
-        self.counters["queue_backpressure_events"] += 1
+    def on_queue_backpressure(self, count: int = 1) -> None:
+        self.counters["queue_backpressure_events"] += count
 
-    def on_queue_dropped(self) -> None:
-        self.counters["queue_dropped_messages"] += 1
+    def on_queue_dropped(self, count: int = 1) -> None:
+        self.counters["queue_dropped_messages"] += count
 
     def on_sample_blocked_by_ready_guard(self) -> None:
         self.counters["sample_blocked_by_ready_guard"] += 1

@@ -80,6 +80,21 @@ class QueueBackpressureMonitor:
             self.queue_backpressure_events += 1
         return lag_ms
 
+    def record_processing_done(
+        self,
+        *,
+        dequeue_monotonic_ns: int,
+        processing_done_monotonic_ns: int,
+    ) -> float:
+        processing_lag_ms = (
+            processing_done_monotonic_ns - dequeue_monotonic_ns
+        ) / 1_000_000.0
+        self.max_processing_lag_ms = max(
+            self.max_processing_lag_ms,
+            processing_lag_ms,
+        )
+        return processing_lag_ms
+
     def record_drop(self, count: int = 1) -> None:
         self.queue_dropped_messages += count
         self.queue_backpressure_events += count

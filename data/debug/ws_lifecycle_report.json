@@ -11,7 +11,7 @@
   "messages_before_ready_count": 0,
   "queue_backpressure_events": 0,
   "queue_dropped_messages": 0,
-  "ready_to_emit_false_duration_ms_max": 829.4489,
+  "ready_to_emit_false_duration_ms_max": 1044.2616,
   "ready_to_emit_false_warning_count": 0,
   "reconnect_count": 0,
   "resubscribe_count": 0,

@@ -7,6 +7,20 @@ from app.marketdata.orderbook_phase41 import OrderbookPhase41Processor
 from app.marketdata.orderbook_state import OrderbookState
 
 
+class FakeMonotonicClock:
+    def __init__(self, value: int = 1_002_000_000) -> None:
+        self.value = value
+
+    def __call__(self) -> int:
+        return self.value
+
+    def advance_ms(self, value: float) -> None:
+        self.value += int(value * 1_000_000)
+
+    def set(self, value: int) -> None:
+        self.value = value
+
+
 def make_state(*, last_update_id: int = 100) -> OrderbookState:
     state = OrderbookState("BTCUSDT", ready_false_warning_after_sec=0.001)
     result = state.apply_snapshot(
@@ -48,9 +62,15 @@ def make_depth_update(
     )
 
 
-def make_processor(tmp_path) -> OrderbookPhase41Processor:
+def make_processor(
+    tmp_path,
+    *,
+    clock: FakeMonotonicClock | None = None,
+    stale_after_ms: float = 1_000.0,
+) -> OrderbookPhase41Processor:
     from app.marketdata.orderbook_phase41 import OrderbookPhase41Paths
 
+    clock = clock or FakeMonotonicClock()
     paths = OrderbookPhase41Paths(
         quality_report=tmp_path / "orderbook_quality_report.json",
         quality_samples=tmp_path / "orderbook_quality_samples.jsonl",
@@ -58,11 +78,18 @@ def make_processor(tmp_path) -> OrderbookPhase41Processor:
         book_incomplete_cases=tmp_path / "book_incomplete_cases.jsonl",
         sequence_gap_cases=tmp_path / "sequence_gap_cases.jsonl",
         duplicate_update_cases=tmp_path / "duplicate_update_cases.jsonl",
+        invalid_delta_cases=tmp_path / "invalid_delta_cases.jsonl",
+        stale_period_cases=tmp_path / "stale_period_cases.jsonl",
         lifecycle_report=tmp_path / "ws_lifecycle_report.json",
         clean_samples=tmp_path / "orderbook_clean_samples.jsonl",
         markdown_report=tmp_path / "phase_4_1_orderbook_quality_report.md",
     )
-    processor = OrderbookPhase41Processor(symbols=("BTCUSDT",), paths=paths)
+    processor = OrderbookPhase41Processor(
+        symbols=("BTCUSDT",),
+        paths=paths,
+        monotonic_clock=clock,
+        stale_after_ms=stale_after_ms,
+    )
     processor.load_snapshot(
         "BTCUSDT",
         bids=[("100.00", "1.0"), ("99.00", "2.0")],

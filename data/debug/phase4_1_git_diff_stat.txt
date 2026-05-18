@@ -1,0 +1,29 @@
+﻿ bot/app/marketdata/orderbook_phase41.py | 270 +++++++++++++++++++++++++++++---
+ bot/app/marketdata/orderbook_state.py   |  25 ++-
+ bot/app/marketdata/queue_monitor.py     |  15 ++
+ bot/app/marketdata/ws_lifecycle.py      |   8 +-
+ tests/orderbook_phase41_test_utils.py   |  31 +++-
+ tests/test_orderbook_performance.py     |   4 +
+ 6 files changed, 326 insertions(+), 27 deletions(-)
+ M bot/app/marketdata/orderbook_phase41.py
+ M bot/app/marketdata/orderbook_state.py
+ M bot/app/marketdata/queue_monitor.py
+ M bot/app/marketdata/ws_lifecycle.py
+ M data/dataset/orderbook_clean_samples.jsonl
+ M data/debug/duplicate_update_cases.jsonl
+ M data/debug/orderbook_quality_report.json
+ M data/debug/phase4_1_runtime_summary.json
+ M data/debug/sequence_gap_cases.jsonl
+ M data/debug/ws_lifecycle_report.json
+ M docs/reports/phase_4_1_orderbook_quality_report.md
+ M tests/orderbook_phase41_test_utils.py
+ M tests/test_orderbook_performance.py
+?? data/debug/invalid_delta_cases.jsonl
+?? data/debug/phase4_1_git_diff.txt
+?? data/debug/phase4_1_git_diff_stat.txt
+?? data/debug/phase4_1_pytest_output.txt
+?? data/debug/phase4_1_runtime_command.txt
+?? data/debug/phase4_1_runtime_console.log
+?? data/debug/stale_period_cases.jsonl
+?? docs/reports/phase_4_1_blocker_fix_summary.md
+?? tests/test_orderbook_phase41_blockers.py

@@ -83,7 +83,10 @@ class OrderbookState:
         self.sequence_continuous = False
         self.awaiting_first_delta_after_snapshot = False
         self.last_not_ready_reason: str | None = "initial_snapshot_missing"
+        self.last_message_recv_monotonic_ns: int | None = None
         self.last_book_update_monotonic_ns: int | None = None
+        self.last_successful_apply_monotonic_ns: int | None = None
+        self.last_stale_check_monotonic_ns: int | None = None
         self.last_local_recv_monotonic_ns: int | None = None
         self.ready_false_since_monotonic_ns: int | None = monotonic_now_ns()
         self.ready_false_warning_after_ns = int(ready_false_warning_after_sec * 1_000_000_000)
@@ -101,6 +104,7 @@ class OrderbookState:
         generation: int | None = None,
     ) -> OrderbookApplyResult:
         del local_recv_wall_ts
+        self.record_message_recv(local_recv_monotonic_ns)
         before = self._result_base()
         if generation is not None and generation != self.generation:
             return self._result(
@@ -148,6 +152,7 @@ class OrderbookState:
         self.snapshot_last_update_id = int(last_update_id)
         self.required_fresh_snapshot_after_update_id = None
         self.last_book_update_monotonic_ns = local_recv_monotonic_ns
+        self.last_successful_apply_monotonic_ns = local_recv_monotonic_ns
         self.last_local_recv_monotonic_ns = local_recv_monotonic_ns
         self.state_version += 1
         self._record_ready_false_age(local_recv_monotonic_ns)
@@ -164,6 +169,7 @@ class OrderbookState:
         previous_final_update_id: int | None = None,
     ) -> OrderbookApplyResult:
         del previous_final_update_id
+        self.record_message_recv(local_recv_monotonic_ns)
         before = self._result_base(
             first_update_id=first_update_id,
             final_update_id=final_update_id,
@@ -224,7 +230,11 @@ class OrderbookState:
         parsed_asks, ask_errors = _parse_levels(asks, allow_zero=True)
         errors = tuple(sorted(set(bid_errors + ask_errors)))
         if errors:
-            self._record_ready_false_age(local_recv_monotonic_ns)
+            self.mark_not_ready(
+                "invalid_delta_fail_closed",
+                local_recv_monotonic_ns=local_recv_monotonic_ns,
+                gap_boundary_update_id=final_update_id,
+            )
             return self._result(
                 before,
                 accepted=False,
@@ -240,6 +250,7 @@ class OrderbookState:
 
         self.last_update_id = int(final_update_id)
         self.last_book_update_monotonic_ns = local_recv_monotonic_ns
+        self.last_successful_apply_monotonic_ns = local_recv_monotonic_ns
         self.last_local_recv_monotonic_ns = local_recv_monotonic_ns
         self.awaiting_first_delta_after_snapshot = False
         self.sequence_continuous = True
@@ -278,6 +289,18 @@ class OrderbookState:
         now_ns = local_recv_monotonic_ns or monotonic_now_ns()
         self._refresh_ready_to_emit(now_ns)
         return self.ready_to_emit
+
+    def record_message_recv(self, local_recv_monotonic_ns: int) -> None:
+        self.last_message_recv_monotonic_ns = local_recv_monotonic_ns
+        self.last_local_recv_monotonic_ns = local_recv_monotonic_ns
+
+    def book_age_ms(self, now_monotonic_ns: int) -> float | None:
+        self.last_stale_check_monotonic_ns = now_monotonic_ns
+        if self.last_book_update_monotonic_ns is None:
+            return None
+        return (
+            now_monotonic_ns - self.last_book_update_monotonic_ns
+        ) / 1_000_000.0
 
     def best_bid(self) -> Decimal | None:
         self._ensure_price_indexes()

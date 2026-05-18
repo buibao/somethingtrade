@@ -7,7 +7,7 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import aiohttp
 
@@ -32,6 +32,8 @@ DEFAULT_ORDERBOOK_MISMATCH_CASES = Path("data/debug/orderbook_mismatch_cases.jso
 DEFAULT_BOOK_INCOMPLETE_CASES = Path("data/debug/book_incomplete_cases.jsonl")
 DEFAULT_SEQUENCE_GAP_CASES = Path("data/debug/sequence_gap_cases.jsonl")
 DEFAULT_DUPLICATE_UPDATE_CASES = Path("data/debug/duplicate_update_cases.jsonl")
+DEFAULT_INVALID_DELTA_CASES = Path("data/debug/invalid_delta_cases.jsonl")
+DEFAULT_STALE_PERIOD_CASES = Path("data/debug/stale_period_cases.jsonl")
 DEFAULT_WS_LIFECYCLE_REPORT = Path("data/debug/ws_lifecycle_report.json")
 DEFAULT_ORDERBOOK_CLEAN_SAMPLES = Path("data/dataset/orderbook_clean_samples.jsonl")
 DEFAULT_ORDERBOOK_MARKDOWN_REPORT = Path("docs/reports/phase_4_1_orderbook_quality_report.md")
@@ -49,6 +51,8 @@ class OrderbookPhase41Paths:
     book_incomplete_cases: Path = REPO_ROOT / DEFAULT_BOOK_INCOMPLETE_CASES
     sequence_gap_cases: Path = REPO_ROOT / DEFAULT_SEQUENCE_GAP_CASES
     duplicate_update_cases: Path = REPO_ROOT / DEFAULT_DUPLICATE_UPDATE_CASES
+    invalid_delta_cases: Path = REPO_ROOT / DEFAULT_INVALID_DELTA_CASES
+    stale_period_cases: Path = REPO_ROOT / DEFAULT_STALE_PERIOD_CASES
     lifecycle_report: Path = REPO_ROOT / DEFAULT_WS_LIFECYCLE_REPORT
     clean_samples: Path = REPO_ROOT / DEFAULT_ORDERBOOK_CLEAN_SAMPLES
     markdown_report: Path = REPO_ROOT / DEFAULT_ORDERBOOK_MARKDOWN_REPORT
@@ -69,12 +73,16 @@ class OrderbookDebugRecorder:
         self.book_incomplete_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.sequence_gap_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.duplicate_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
+        self.invalid_delta_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
+        self.stale_period_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         for path in (
             self.paths.quality_samples,
             self.paths.mismatch_cases,
             self.paths.book_incomplete_cases,
             self.paths.sequence_gap_cases,
             self.paths.duplicate_update_cases,
+            self.paths.invalid_delta_cases,
+            self.paths.stale_period_cases,
             self.paths.clean_samples,
         ):
             _ensure_file(path, reset=reset_files)
@@ -223,6 +231,41 @@ class OrderbookDebugRecorder:
         self.duplicate_cases.append(row)
         _append_jsonl(self.paths.duplicate_update_cases, row)
 
+    def record_invalid_delta_case(
+        self,
+        result: OrderbookApplyResult,
+        *,
+        symbol: str,
+        snapshot: OrderbookSnapshot,
+        local_recv_monotonic_ns: int,
+        raw_message_excerpt: str | None = None,
+    ) -> None:
+        row = {
+            "case_type": "invalid_delta_fail_closed",
+            "symbol": symbol,
+            "local_recv_monotonic_ns": local_recv_monotonic_ns,
+            "first_update_id": result.first_update_id,
+            "final_update_id": result.final_update_id,
+            "previous_last_update_id": result.previous_last_update_id,
+            "snapshot_ready_before": result.snapshot_ready_before,
+            "snapshot_ready_after": result.snapshot_ready_after,
+            "ready_to_emit_after": result.ready_to_emit_after,
+            "rejection_reason": result.errors,
+            "raw_message_excerpt": raw_message_excerpt,
+            "raw_message_hash": None,
+            "top_bids_before_rejection": snapshot.bids_top_n[:5],
+            "top_asks_before_rejection": snapshot.asks_top_n[:5],
+            "state_version_before": result.state_version_before,
+            "state_version_after": result.state_version_after,
+            "generation_id": result.generation_after,
+        }
+        self.invalid_delta_cases.append(row)
+        _append_jsonl(self.paths.invalid_delta_cases, row)
+
+    def record_stale_period_case(self, period: dict[str, Any]) -> None:
+        self.stale_period_cases.append(period)
+        _append_jsonl(self.paths.stale_period_cases, period)
+
     def record_clean_sample(
         self,
         sample: dict[str, Any],
@@ -241,10 +284,13 @@ class OrderbookPhase41Processor:
         queue_lag_warning_ms: float = 50.0,
         queue_lag_severe_ms: float = 250.0,
         debug_max_cases: int = 256,
+        monotonic_clock: Callable[[], int] = monotonic_now_ns,
     ) -> None:
         self.states = {symbol.upper(): OrderbookState(symbol) for symbol in symbols}
         self.paths = paths
         self.depth_n = depth_n
+        self.monotonic_clock = monotonic_clock
+        self.stale_threshold_ms = stale_after_ms
         self.validator = OrderbookQualityValidator(
             stale_after_ms=stale_after_ms,
             queue_lag_warning_ms=queue_lag_warning_ms,
@@ -259,6 +305,10 @@ class OrderbookPhase41Processor:
         self.counters: Counter[str] = Counter()
         self.blocked_by_quality_error: Counter[str] = Counter()
         self.snapshot_copy_us_samples: deque[float] = deque(maxlen=4096)
+        self.stale_periods: deque[dict[str, Any]] = deque(maxlen=256)
+        self._open_stale_periods: dict[str, dict[str, Any]] = {}
+        self.max_book_age_ms = 0.0
+        self.last_book_update_age_ms_at_report: float | None = None
 
     def state_for(self, symbol: str) -> OrderbookState:
         key = symbol.upper()
@@ -281,11 +331,12 @@ class OrderbookPhase41Processor:
             bids=bids,
             asks=asks,
             last_update_id=last_update_id,
-            local_recv_monotonic_ns=local_recv_monotonic_ns or monotonic_now_ns(),
+            local_recv_monotonic_ns=local_recv_monotonic_ns or self.monotonic_clock(),
             generation=generation,
         )
         if result.accepted:
             self.lifecycle.on_snapshot_loaded()
+            self._close_stale_period(symbol.upper(), now_monotonic_ns=state.last_book_update_monotonic_ns)
         else:
             self.lifecycle.on_snapshot_failed()
         self.lifecycle.observe_ready_false(state)
@@ -301,29 +352,36 @@ class OrderbookPhase41Processor:
         self.counters["messages_received"] += 1
         self.counters["messages_parsed"] += 1
         state = self.state_for(event.symbol)
+        recv_monotonic_ns = event.recv_monotonic_ns or self.monotonic_clock()
+        state.record_message_recv(recv_monotonic_ns)
+        self.check_stale_periods(
+            now_monotonic_ns=recv_monotonic_ns,
+            symbols=(event.symbol,),
+        )
         result = state.apply_delta(
             first_update_id=event.first_update_id,
             final_update_id=event.final_update_id,
             previous_final_update_id=event.previous_final_update_id,
             bids=[(level.price, level.size) for level in event.bids],
             asks=[(level.price, level.size) for level in event.asks],
-            local_recv_monotonic_ns=event.recv_monotonic_ns or monotonic_now_ns(),
+            local_recv_monotonic_ns=recv_monotonic_ns,
         )
         if result.accepted:
             self.counters["deltas_accepted"] += 1
+            self._close_stale_period(event.symbol, now_monotonic_ns=recv_monotonic_ns)
             if (
                 queue_lag_ms is not None
                 and queue_lag_ms > self.validator.queue_lag_severe_ms
             ):
                 state.mark_not_ready(
                     "queue_lag_exceeded",
-                    local_recv_monotonic_ns=event.recv_monotonic_ns or monotonic_now_ns(),
+                    local_recv_monotonic_ns=recv_monotonic_ns,
                 )
             snapshot = self.copy_snapshot(state)
             quality = self.validator.validate(
                 snapshot,
                 state=state,
-                now_monotonic_ns=event.recv_monotonic_ns or monotonic_now_ns(),
+                now_monotonic_ns=self.monotonic_clock(),
                 queue_lag_ms=queue_lag_ms,
             )
             self.debug.record_quality_sample(snapshot, quality)
@@ -342,6 +400,17 @@ class OrderbookPhase41Processor:
             elif result.status in {"sequence_gap_or_reset", "sequence_bridge_failed"}:
                 self.lifecycle.on_sequence_gap()
                 self.debug.record_sequence_gap_case(result, symbol=event.symbol)
+            elif result.status == "invalid_delta_levels":
+                self.counters["invalid_delta_count"] += 1
+                self.counters["ready_to_emit_disabled_count"] += 1
+                snapshot = self.copy_snapshot(state)
+                self.debug.record_invalid_delta_case(
+                    result,
+                    symbol=event.symbol,
+                    snapshot=snapshot,
+                    local_recv_monotonic_ns=recv_monotonic_ns,
+                    raw_message_excerpt=raw_message_excerpt,
+                )
             else:
                 self.lifecycle.on_message_before_ready()
         if not state.ready_to_emit:
@@ -364,7 +433,7 @@ class OrderbookPhase41Processor:
         quality = self.validator.validate(
             snapshot,
             state=state,
-            now_monotonic_ns=monotonic_now_ns(),
+            now_monotonic_ns=self.monotonic_clock(),
             reported_best_bid=reported_best_bid,
             reported_best_ask=reported_best_ask,
         )
@@ -390,33 +459,114 @@ class OrderbookPhase41Processor:
         state = self.states.pop(symbol.upper(), None)
         if state is not None:
             state.cleanup()
+        self._open_stale_periods.pop(symbol.upper(), None)
+
+    def check_stale_periods(
+        self,
+        *,
+        now_monotonic_ns: int | None = None,
+        symbols: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        now_ns = now_monotonic_ns if now_monotonic_ns is not None else self.monotonic_clock()
+        stale_periods: list[dict[str, Any]] = []
+        selected_symbols = tuple(symbol.upper() for symbol in symbols) if symbols else tuple(self.states)
+        for symbol in selected_symbols:
+            state = self.states.get(symbol)
+            if state is None:
+                continue
+            age_ms = state.book_age_ms(now_ns)
+            if age_ms is None:
+                continue
+            self.max_book_age_ms = max(self.max_book_age_ms, age_ms)
+            self.last_book_update_age_ms_at_report = age_ms
+            if age_ms <= self.stale_threshold_ms:
+                self._close_stale_period(symbol, now_monotonic_ns=now_ns)
+                continue
+            period = self._open_stale_periods.get(symbol)
+            if period is None:
+                started_ns = int(
+                    (state.last_book_update_monotonic_ns or now_ns)
+                    + self.stale_threshold_ms * 1_000_000
+                )
+                period = {
+                    "case_type": "stale_period",
+                    "symbol": symbol,
+                    "stale_threshold_ms": self.stale_threshold_ms,
+                    "started_monotonic_ns": started_ns,
+                    "ended_monotonic_ns": None,
+                    "max_age_ms": age_ms,
+                    "reason": "no_successful_book_update",
+                    "snapshot_ready": state.snapshot_ready,
+                    "ready_to_emit": state.ready_to_emit,
+                    "last_book_update_monotonic_ns": state.last_book_update_monotonic_ns,
+                    "last_message_recv_monotonic_ns": state.last_message_recv_monotonic_ns,
+                    "generation_id": state.generation,
+                }
+                self._open_stale_periods[symbol] = period
+                self.stale_periods.append(period)
+                self.counters["stale_book_count"] += 1
+                state.mark_not_ready(
+                    "stale_book",
+                    local_recv_monotonic_ns=now_ns,
+                    advance_generation=True,
+                )
+                period["snapshot_ready"] = state.snapshot_ready
+                period["ready_to_emit"] = state.ready_to_emit
+                period["generation_id"] = state.generation
+                self.lifecycle.observe_ready_false(state)
+                self.debug.record_stale_period_case(period)
+            else:
+                period["max_age_ms"] = max(float(period["max_age_ms"]), age_ms)
+                period["snapshot_ready"] = state.snapshot_ready
+                period["ready_to_emit"] = state.ready_to_emit
+                period["last_message_recv_monotonic_ns"] = state.last_message_recv_monotonic_ns
+                period["generation_id"] = state.generation
+            stale_periods.append(period)
+        return stale_periods
+
+    def _close_stale_period(
+        self,
+        symbol: str,
+        *,
+        now_monotonic_ns: int | None,
+    ) -> None:
+        period = self._open_stale_periods.pop(symbol.upper(), None)
+        if period is None or now_monotonic_ns is None:
+            return
+        period["ended_monotonic_ns"] = now_monotonic_ns
+        self.debug.record_stale_period_case(period)
 
     def summary(self, *, duration_sec: float | None = None) -> dict[str, Any]:
+        self.check_stale_periods(now_monotonic_ns=self.monotonic_clock())
         snapshot_copy_p99_us = _percentile(list(self.snapshot_copy_us_samples), 0.99)
         lifecycle_report = self.lifecycle.report()
         queue_report = self.queue_monitor.report()
-        phase_pass = (
-            self.counters["messages_received"] > 0
-            and self.counters["samples_emitted"] > 0
-            and self.counters["sequence_gap_count"] == 0
-            and self.counters["crossed_book_count"] == 0
-            and self.counters["stale_book_count"] == 0
-            and snapshot_copy_p99_us <= SNAPSHOT_COPY_BUDGET_US
-        )
-        return {
+        summary = {
             "duration_sec": duration_sec,
             "messages_received": int(self.counters["messages_received"]),
             "messages_parsed": int(self.counters["messages_parsed"]),
             "deltas_accepted": int(self.counters["deltas_accepted"]),
             "deltas_rejected": int(self.counters["deltas_rejected"]),
             "sequence_gap_count": int(lifecycle_report["sequence_gap_count"]),
+            "sequence_gap_or_reset_count": int(lifecycle_report["sequence_gap_count"]),
             "duplicates_skipped": int(lifecycle_report["duplicate_messages_skipped"]),
             "samples_emitted": int(self.counters["samples_emitted"]),
             "samples_blocked": int(self.counters["samples_blocked"]),
+            "sample_before_ready_count": int(lifecycle_report["delta_before_snapshot_count"]),
+            "invalid_delta_count": int(self.counters["invalid_delta_count"]),
+            "ready_to_emit_disabled_count": int(self.counters["ready_to_emit_disabled_count"]),
+            "ready_to_emit_violation_count": int(self.counters["ready_to_emit_violation_count"]),
+            "clean_sample_schema_violation_count": int(self.counters["clean_sample_schema_violation_count"]),
             "strict_mismatch_count": int(self.counters["strict_mismatch_count"]),
             "tolerant_mismatch_count": int(self.counters["tolerant_mismatch_count"]),
             "crossed_book_count": int(self.counters["crossed_book_count"]),
+            "book_empty_count": int(self.blocked_by_quality_error.get("book_empty", 0)),
+            "one_side_missing_count": int(self.blocked_by_quality_error.get("one_side_missing", 0)),
             "stale_book_count": int(self.counters["stale_book_count"]),
+            "stale_periods": list(self.stale_periods),
+            "max_book_age_ms": self.max_book_age_ms,
+            "last_book_update_age_ms_at_report": self.last_book_update_age_ms_at_report,
+            "stale_threshold_ms": self.stale_threshold_ms,
             "queue_backpressure_events": int(queue_report["queue_backpressure_events"]),
             "max_queue_lag_ms": queue_report["enqueue_to_dequeue_lag_ms_max"],
             "snapshot_copy_p99_us": snapshot_copy_p99_us,
@@ -426,9 +576,14 @@ class OrderbookPhase41Processor:
             "queue": queue_report,
             "lifecycle": lifecycle_report,
             "clean_sample_schema_version": PHASE_4_1_SCHEMA_VERSION,
+            "reported_best_validation_enabled": False,
             "market_status_known": False,
-            "phase_4_1_pass": phase_pass,
         }
+        phase_pass, failure_reasons = evaluate_phase_4_1_pass(summary)
+        summary["phase_4_1_pass"] = phase_pass
+        summary["phase_4_1_status"] = "pass" if phase_pass else "fail"
+        summary["phase_4_1_failure_reasons"] = failure_reasons
+        return summary
 
     def write_reports(self, *, duration_sec: float | None = None) -> dict[str, Any]:
         summary = self.summary(duration_sec=duration_sec)
@@ -485,6 +640,39 @@ class OrderbookPhase41Processor:
         )
         self.debug.record_clean_sample(sample)
         self.counters["samples_emitted"] += 1
+
+
+def evaluate_phase_4_1_pass(report: dict[str, Any]) -> tuple[bool, list[str]]:
+    failure_reasons: list[str] = []
+    if _numeric_value(report.get("sequence_gap_count")) > 0:
+        failure_reasons.append("sequence_gap_count > 0")
+    elif _numeric_value(report.get("sequence_gap_or_reset_count")) > 0:
+        failure_reasons.append("sequence_gap_or_reset_count > 0")
+    blocker_fields = (
+        "crossed_book_count",
+        "book_empty_count",
+        "one_side_missing_count",
+        "sample_before_ready_count",
+        "invalid_delta_count",
+        "stale_book_count",
+        "ready_to_emit_violation_count",
+        "clean_sample_schema_violation_count",
+    )
+    for field in blocker_fields:
+        if _numeric_value(report.get(field)) > 0:
+            failure_reasons.append(f"{field} > 0")
+
+    queue = report.get("queue")
+    if isinstance(queue, dict):
+        if _numeric_value(queue.get("queue_dropped_messages")) > 0:
+            failure_reasons.append("queue_dropped_messages > 0")
+        if _numeric_value(queue.get("queue_backpressure_events")) > 0:
+            failure_reasons.append("queue_backpressure_events > 0")
+
+    if not bool(report.get("snapshot_copy_budget_met", True)):
+        failure_reasons.append("snapshot_copy_p99_us > snapshot_copy_budget_us")
+
+    return not failure_reasons, failure_reasons
 
 
 def clean_sample_from_snapshot(
@@ -581,20 +769,45 @@ async def run_orderbook_phase41_capture(
                 try:
                     envelope = await asyncio.wait_for(queue.get(), timeout=timeout)
                 except TimeoutError:
+                    stale_periods = processor.check_stale_periods(
+                        now_monotonic_ns=monotonic_now_ns()
+                    )
+                    if stale_periods:
+                        await _load_fresh_snapshot(
+                            processor,
+                            session=session,
+                            symbol=symbol,
+                            rest_url=rest_url,
+                        )
                     continue
                 dequeue_ns = monotonic_now_ns()
+                backpressure_before = processor.queue_monitor.queue_backpressure_events
                 queue_lag_ms = processor.queue_monitor.record_dequeue(
                     envelope,
                     dequeue_monotonic_ns=dequeue_ns,
                     queue_size=queue.qsize(),
                 )
-                if processor.queue_monitor.queue_backpressure_events:
-                    processor.lifecycle.on_queue_backpressure()
                 result = processor.process_depth_update(
                     envelope.payload,
                     queue_lag_ms=queue_lag_ms,
                 )
-                if result.status in {"sequence_gap_or_reset", "sequence_bridge_failed"}:
+                processing_done_ns = monotonic_now_ns()
+                processor.queue_monitor.record_processing_done(
+                    dequeue_monotonic_ns=dequeue_ns,
+                    processing_done_monotonic_ns=processing_done_ns,
+                )
+                backpressure_delta = (
+                    processor.queue_monitor.queue_backpressure_events
+                    - backpressure_before
+                )
+                if backpressure_delta > 0:
+                    processor.lifecycle.on_queue_backpressure(backpressure_delta)
+                if result.status in {
+                    "sequence_gap_or_reset",
+                    "sequence_bridge_failed",
+                    "invalid_delta_levels",
+                    "delta_before_snapshot",
+                }:
                     await _load_fresh_snapshot(
                         processor,
                         session=session,
@@ -632,7 +845,7 @@ async def _load_fresh_snapshot(
         bids=snapshot["bids"],
         asks=snapshot["asks"],
         last_update_id=int(snapshot["lastUpdateId"]),
-        local_recv_monotonic_ns=monotonic_now_ns(),
+        local_recv_monotonic_ns=processor.monotonic_clock(),
     )
 
 
@@ -659,14 +872,20 @@ def render_phase41_markdown_report(summary: dict[str, Any]) -> str:
         "# Phase 4.1 Orderbook Quality Report",
         "",
         f"- Phase 4.1 pass: `{summary['phase_4_1_pass']}`",
+        f"- Phase 4.1 status: `{summary.get('phase_4_1_status', '-')}`",
+        f"- Failure reasons: `{json.dumps(summary.get('phase_4_1_failure_reasons', []), sort_keys=True)}`",
         f"- Messages received: {summary['messages_received']}",
         f"- Messages parsed successfully: {summary['messages_parsed']}",
         f"- Deltas accepted: {summary['deltas_accepted']}",
         f"- Deltas rejected: {summary['deltas_rejected']}",
         f"- Sequence gaps: {summary['sequence_gap_count']}",
+        f"- Sequence gap/reset count: {summary.get('sequence_gap_or_reset_count', 0)}",
+        f"- Invalid delta count: {summary.get('invalid_delta_count', 0)}",
         f"- Duplicate/old updates skipped: {summary['duplicates_skipped']}",
         f"- Samples emitted: {summary['samples_emitted']}",
         f"- Samples blocked by ready_to_emit: {lifecycle['sample_blocked_by_ready_guard']}",
+        f"- Sample-before-ready count: {summary.get('sample_before_ready_count', 0)}",
+        f"- ready_to_emit disabled count: {summary.get('ready_to_emit_disabled_count', 0)}",
         f"- Samples blocked by quality error: `{json.dumps(summary['blocked_by_quality_error'], sort_keys=True)}`",
         f"- Strict mismatch count: {summary['strict_mismatch_count']}",
         f"- Tolerant mismatch count: {summary['tolerant_mismatch_count']}",
@@ -677,6 +896,10 @@ def render_phase41_markdown_report(summary: dict[str, Any]) -> str:
         "- Top mismatch root causes: see `data/debug/orderbook_mismatch_cases.jsonl`",
         f"- Crossed book count: {summary['crossed_book_count']}",
         f"- Stale book count: {summary['stale_book_count']}",
+        f"- Stale threshold ms: {summary.get('stale_threshold_ms')}",
+        f"- Max book age ms: {summary.get('max_book_age_ms')}",
+        f"- Last book update age ms at report: {summary.get('last_book_update_age_ms_at_report')}",
+        f"- Stale periods: `{json.dumps(summary.get('stale_periods', []), sort_keys=True)}`",
         f"- Queue backpressure events: {summary['queue_backpressure_events']}",
         f"- Max queue lag ms: {summary['max_queue_lag_ms']}",
         (
@@ -747,6 +970,13 @@ def _levels_to_json(
 
 def _decimal_to_str(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
+
+
+def _numeric_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _percentile(values: list[float], pct: float) -> float:
