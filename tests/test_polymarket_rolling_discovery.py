@@ -387,7 +387,7 @@ async def test_pagination_fallback_stops_on_empty_page() -> None:
 async def test_discovery_returns_rolling_markets_before_broad_fallback() -> None:
     class Client(PolymarketDiscoveryClient):
         async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
-            return _market_payload(slug=slug, market_id="rolling-market")
+            return _payload_for_slug(slug, market_id=f"rolling-market-{slug}")
 
         async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
             return None
@@ -400,7 +400,46 @@ async def test_discovery_returns_rolling_markets_before_broad_fallback() -> None
     markets = await client.discover(write_cache=False, now_ts=1_778_832_999)
 
     assert markets
-    assert markets[0].market_id == "rolling-market"
+    assert markets[0].market_id.startswith("rolling-market-")
+
+
+@pytest.mark.asyncio
+async def test_discovery_returns_rolling_markets_before_broad_fallback_offline() -> None:
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _payload_for_slug(slug, market_id=f"offline-direct-{slug}")
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            raise AssertionError("event fallback should not run when direct lookup succeeds")
+
+        async def _fetch_page(self, endpoint: str, *, limit: int, offset: int) -> list[dict[str, object]]:
+            raise AssertionError("unit test must not perform broad network pagination")
+
+    markets = await Client().discover(write_cache=False, now_ts=1_778_832_999)
+
+    assert markets
+    assert markets[0].market_id.startswith("offline-direct-")
+
+
+@pytest.mark.asyncio
+async def test_polymarket_discovery_no_real_network_in_unit_tests() -> None:
+    class Client(PolymarketDiscoveryClient):
+        async def fetch_market_by_slug(self, slug: str) -> dict[str, object] | None:
+            return _payload_for_slug(slug, market_id=f"direct-no-network-{slug}")
+
+        async def fetch_event_by_slug(self, slug: str) -> dict[str, object] | None:
+            raise AssertionError("unexpected event network call")
+
+        async def _fetch_raw_market_payloads(self) -> list[dict[str, object]]:
+            raise AssertionError("unexpected raw market network call")
+
+        async def _fetch_paginated_events(self) -> list[dict[str, object]]:
+            raise AssertionError("unexpected active events network call")
+
+    result = await Client().discover_rolling_markets_robust(now_ts=1_778_832_999)
+
+    assert result.runtime_markets
+    assert result.runtime_markets[0].market_id.startswith("direct-no-network-")
 
 
 def test_cache_all_closed_is_rejected_for_runtime(tmp_path: Path) -> None:
@@ -699,6 +738,7 @@ async def test_active_events_reject_reasons_are_reported() -> None:
             ]
 
     result = await Client().discover_rolling_markets_robust(now_ts=now_ts)
+    assert result.active_events_result is not None
     reasons = {item["reason"] for item in result.active_events_result["reject_reasons"]}
 
     assert "active_but_not_accepting_orders" in reasons
@@ -750,6 +790,7 @@ async def test_active_events_missing_current_reports_runtime_zero_not_success() 
             return [{"markets": [_payload_for_slug("btc-updown-5m-1778833200", market_id="next-only")]}]
 
     result = await Client().discover_rolling_markets_robust(now_ts=now_ts)
+    assert result.active_events_result is not None
 
     assert result.active_events_result["runtime_candidate_count"] == 1
     assert result.active_events_result["runtime_tradable_count"] == 0

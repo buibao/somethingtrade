@@ -103,11 +103,15 @@ class WSLifecycleTracker:
             )
 
     def report(self) -> dict[str, Any]:
-        data = {field_name: int(self.counters[field_name]) for field_name in LIFECYCLE_COUNTER_FIELDS}
+        data: dict[str, Any] = {
+            field_name: int(self.counters[field_name])
+            for field_name in LIFECYCLE_COUNTER_FIELDS
+        }
         data.update(
             {
                 "ready_to_emit_false_duration_ms_max": self.ready_to_emit_false_duration_ms_max,
                 "market_status_known": False,
+                "market_status_mode": "not_applicable_for_binance_spot_orderbook",
                 "market_paused_count": 0,
                 "market_unpaused_count": 0,
                 "market_resolved_count": 0,

@@ -22,6 +22,7 @@ def _report(**overrides):
         "invalid_delta_count": 0,
         "stale_book_count": 0,
         "active_feed_stale_count": 0,
+        "feed_receive_stale_count": 0,
         "post_capture_age_warning_count": 0,
         "ready_to_emit_violation_count": 0,
         "clean_sample_schema_violation_count": 0,
@@ -161,9 +162,9 @@ def test_stale_detects_no_successful_update_after_fake_clock_advances(tmp_path) 
     assert summary["max_book_age_ms"] >= 250
     assert summary["last_book_update_age_ms_at_report"] >= 250
     assert summary["phase_4_1_pass"] is False
-    assert "active_feed_stale_count > 0" in summary["phase_4_1_failure_reasons"]
+    assert "feed_receive_stale_count > 0" in summary["phase_4_1_failure_reasons"]
     row = json.loads((tmp_path / "stale_period_cases.jsonl").read_text().splitlines()[0])
-    assert row["reason"] == "no_successful_book_update"
+    assert row["reason"] == "no_websocket_message_received"
 
 
 def test_post_capture_age_warning_does_not_fail_by_itself(tmp_path) -> None:
@@ -189,7 +190,7 @@ def test_active_stale_before_shutdown_remains_blocking(tmp_path) -> None:
     assert summary["active_feed_stale_count"] == 1
     assert summary["post_capture_age_warning_count"] == 0
     assert summary["phase_4_1_pass"] is False
-    assert "active_feed_stale_count > 0" in summary["phase_4_1_failure_reasons"]
+    assert "feed_receive_stale_count > 0" in summary["phase_4_1_failure_reasons"]
 
 
 def test_invalid_delta_does_not_refresh_last_successful_book_update_timestamp() -> None:

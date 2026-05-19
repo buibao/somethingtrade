@@ -212,6 +212,7 @@ def _lifecycle_flags(state: OrderbookState | None) -> dict[str, Any]:
             bool(state.sequence_continuous) if state is not None else False
         ),
         "market_status_known": False,
+        "market_status_mode": "not_applicable_for_binance_spot_orderbook",
     }
 
 

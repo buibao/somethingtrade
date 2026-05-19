@@ -20,6 +20,8 @@ from app.main import (
     _apply_market_universe_refresh,
     should_force_market_refresh,
 )
+from app.core.events import EventModel
+from app.logging.event_logger import AsyncJsonlEventLogger
 from app.marketdata.market_universe import (
     RuntimeMarketUniverseManager,
     build_market_universe_diff,
@@ -186,11 +188,11 @@ class FakeConnectFactory:
         return FakeConnectContext(websocket)
 
 
-class FakeLogger:
+class FakeLogger(AsyncJsonlEventLogger):
     def __init__(self) -> None:
         self.logged: list[object] = []
 
-    async def log(self, event: object) -> None:
+    async def log(self, event: EventModel) -> None:
         self.logged.append(event)
 
 
@@ -207,7 +209,7 @@ class FakeDiscovery(PolymarketDiscoveryClient):
         now_ts: int | None = None,
         rolling_lookahead_windows: int = 2,
         market_cache_ttl_ms: int = 60_000,
-        discovery_debug_jsonl: str | None = None,
+        discovery_debug_jsonl: Path | str | None = None,
         refresh_reason: str | None = None,
     ) -> tuple[PolymarketMarketMetadata, ...]:
         del (
@@ -225,22 +227,22 @@ class FakeDiscovery(PolymarketDiscoveryClient):
 
 
 def _stats(**overrides: object) -> GapMonitorStats:
-    base = dict(
-        detected_gaps=0,
-        completed_gaps=0,
-        fillable_at_detection_count=0,
-        non_fillable_at_detection_count=0,
-        median_mid_repricing_delay_ms=None,
-        p95_mid_repricing_delay_ms=None,
-        median_executable_repricing_delay_ms=None,
-        p95_executable_repricing_delay_ms=None,
-        median_tradable_window_ms=None,
-        p95_tradable_window_ms=None,
-        average_estimated_edge=None,
-        reject_count_by_reason={},
-        reject_count_by_stage={},
-        stale_feed_count=0,
-    )
+    base: dict[str, object] = {
+        "detected_gaps": 0,
+        "completed_gaps": 0,
+        "fillable_at_detection_count": 0,
+        "non_fillable_at_detection_count": 0,
+        "median_mid_repricing_delay_ms": None,
+        "p95_mid_repricing_delay_ms": None,
+        "median_executable_repricing_delay_ms": None,
+        "p95_executable_repricing_delay_ms": None,
+        "median_tradable_window_ms": None,
+        "p95_tradable_window_ms": None,
+        "average_estimated_edge": None,
+        "reject_count_by_reason": {},
+        "reject_count_by_stage": {},
+        "stale_feed_count": 0,
+    }
     base.update(overrides)
     return GapMonitorStats(**base)  # type: ignore[arg-type]
 
