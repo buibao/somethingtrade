@@ -1,0 +1,1 @@
+﻿python -m app.main orderbook-quality-capture --symbol BTCUSDT --duration-sec 600 --depth-n 20

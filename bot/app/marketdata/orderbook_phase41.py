@@ -34,6 +34,7 @@ DEFAULT_SEQUENCE_GAP_CASES = Path("data/debug/sequence_gap_cases.jsonl")
 DEFAULT_DUPLICATE_UPDATE_CASES = Path("data/debug/duplicate_update_cases.jsonl")
 DEFAULT_INVALID_DELTA_CASES = Path("data/debug/invalid_delta_cases.jsonl")
 DEFAULT_STALE_PERIOD_CASES = Path("data/debug/stale_period_cases.jsonl")
+DEFAULT_SEQUENCE_RECOVERY_TRACE = Path("data/debug/sequence_recovery_trace.jsonl")
 DEFAULT_WS_LIFECYCLE_REPORT = Path("data/debug/ws_lifecycle_report.json")
 DEFAULT_ORDERBOOK_CLEAN_SAMPLES = Path("data/dataset/orderbook_clean_samples.jsonl")
 DEFAULT_ORDERBOOK_MARKDOWN_REPORT = Path("docs/reports/phase_4_1_orderbook_quality_report.md")
@@ -53,6 +54,7 @@ class OrderbookPhase41Paths:
     duplicate_update_cases: Path = REPO_ROOT / DEFAULT_DUPLICATE_UPDATE_CASES
     invalid_delta_cases: Path = REPO_ROOT / DEFAULT_INVALID_DELTA_CASES
     stale_period_cases: Path = REPO_ROOT / DEFAULT_STALE_PERIOD_CASES
+    sequence_recovery_trace: Path = REPO_ROOT / DEFAULT_SEQUENCE_RECOVERY_TRACE
     lifecycle_report: Path = REPO_ROOT / DEFAULT_WS_LIFECYCLE_REPORT
     clean_samples: Path = REPO_ROOT / DEFAULT_ORDERBOOK_CLEAN_SAMPLES
     markdown_report: Path = REPO_ROOT / DEFAULT_ORDERBOOK_MARKDOWN_REPORT
@@ -75,6 +77,7 @@ class OrderbookDebugRecorder:
         self.duplicate_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.invalid_delta_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.stale_period_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
+        self.sequence_recovery_trace: deque[dict[str, Any]] = deque(maxlen=max_cases)
         for path in (
             self.paths.quality_samples,
             self.paths.mismatch_cases,
@@ -83,6 +86,7 @@ class OrderbookDebugRecorder:
             self.paths.duplicate_update_cases,
             self.paths.invalid_delta_cases,
             self.paths.stale_period_cases,
+            self.paths.sequence_recovery_trace,
             self.paths.clean_samples,
         ):
             _ensure_file(path, reset=reset_files)
@@ -266,6 +270,10 @@ class OrderbookDebugRecorder:
         self.stale_period_cases.append(period)
         _append_jsonl(self.paths.stale_period_cases, period)
 
+    def record_sequence_trace_event(self, event: dict[str, Any]) -> None:
+        self.sequence_recovery_trace.append(event)
+        _append_jsonl(self.paths.sequence_recovery_trace, event)
+
     def record_clean_sample(
         self,
         sample: dict[str, Any],
@@ -306,7 +314,13 @@ class OrderbookPhase41Processor:
         self.blocked_by_quality_error: Counter[str] = Counter()
         self.snapshot_copy_us_samples: deque[float] = deque(maxlen=4096)
         self.stale_periods: deque[dict[str, Any]] = deque(maxlen=256)
+        self.post_capture_age_warnings: deque[dict[str, Any]] = deque(maxlen=256)
         self._open_stale_periods: dict[str, dict[str, Any]] = {}
+        self._post_capture_warning_symbols: set[str] = set()
+        self._post_snapshot_trace_counts: Counter[str] = Counter()
+        self._updates_processed_since_snapshot: Counter[str] = Counter()
+        self._last_snapshot_last_update_id: dict[str, int] = {}
+        self.capture_active = True
         self.max_book_age_ms = 0.0
         self.last_book_update_age_ms_at_report: float | None = None
 
@@ -325,18 +339,49 @@ class OrderbookPhase41Processor:
         last_update_id: int,
         local_recv_monotonic_ns: int | None = None,
         generation: int | None = None,
+        snapshot_request_start_monotonic_ns: int | None = None,
+        snapshot_response_monotonic_ns: int | None = None,
+        snapshot_apply_monotonic_ns: int | None = None,
+        queue_size_before_snapshot: int = 0,
+        queue_size_after_snapshot: int = 0,
+        recovery: bool = False,
     ) -> OrderbookApplyResult:
         state = self.state_for(symbol)
+        apply_ns = (
+            snapshot_apply_monotonic_ns
+            if snapshot_apply_monotonic_ns is not None
+            else local_recv_monotonic_ns
+            if local_recv_monotonic_ns is not None
+            else self.monotonic_clock()
+        )
         result = state.apply_snapshot(
             bids=bids,
             asks=asks,
             last_update_id=last_update_id,
-            local_recv_monotonic_ns=local_recv_monotonic_ns or self.monotonic_clock(),
+            local_recv_monotonic_ns=apply_ns,
             generation=generation,
         )
         if result.accepted:
             self.lifecycle.on_snapshot_loaded()
             self._close_stale_period(symbol.upper(), now_monotonic_ns=state.last_book_update_monotonic_ns)
+            self._post_snapshot_trace_counts[symbol.upper()] = 0
+            self._updates_processed_since_snapshot[symbol.upper()] = 0
+            self._last_snapshot_last_update_id[symbol.upper()] = int(last_update_id)
+            self.debug.record_sequence_trace_event(
+                {
+                    "event": "recovery_snapshot_loaded" if recovery else "snapshot_loaded",
+                    "symbol": symbol.upper(),
+                    "generation_id": state.generation,
+                    "snapshot_last_update_id": int(last_update_id),
+                    "snapshot_request_start_monotonic_ns": snapshot_request_start_monotonic_ns,
+                    "snapshot_response_monotonic_ns": snapshot_response_monotonic_ns,
+                    "snapshot_apply_monotonic_ns": apply_ns,
+                    "queue_size_before_snapshot": queue_size_before_snapshot,
+                    "queue_size_after_snapshot": queue_size_after_snapshot,
+                    "ready_to_emit_after": state.ready_to_emit,
+                    "snapshot_ready_after": state.snapshot_ready,
+                }
+            )
         else:
             self.lifecycle.on_snapshot_failed()
         self.lifecycle.observe_ready_false(state)
@@ -357,6 +402,20 @@ class OrderbookPhase41Processor:
         self.check_stale_periods(
             now_monotonic_ns=recv_monotonic_ns,
             symbols=(event.symbol,),
+            feed_active=True,
+        )
+        symbol = event.symbol.upper()
+        ready_before = state.ready_to_emit
+        snapshot_ready_before = state.snapshot_ready
+        generation_before = state.generation
+        awaiting_bridge_before = state.awaiting_first_delta_after_snapshot
+        updates_since_snapshot_before = int(
+            self._updates_processed_since_snapshot[symbol]
+        )
+        queue_size_at_process = (
+            self.queue_monitor.queue_current_size
+            if queue_lag_ms is not None
+            else 0
         )
         result = state.apply_delta(
             first_update_id=event.first_update_id,
@@ -413,6 +472,48 @@ class OrderbookPhase41Processor:
                 )
             else:
                 self.lifecycle.on_message_before_ready()
+        classification = _sequence_trace_classification(
+            result,
+            awaiting_bridge_before=awaiting_bridge_before,
+        )
+        self._record_post_snapshot_update_range(
+            event,
+            result=result,
+            generation_id=generation_before,
+            classification=classification,
+            ready_to_emit_before=ready_before,
+            snapshot_ready_before=snapshot_ready_before,
+            queue_size_at_process=queue_size_at_process,
+            local_recv_monotonic_ns=recv_monotonic_ns,
+            apply_monotonic_ns=self.monotonic_clock(),
+        )
+        if result.status in {"sequence_gap_or_reset", "sequence_bridge_failed"}:
+            self._record_sequence_gap_trace(
+                event,
+                result=result,
+                generation_id=generation_before,
+                ready_to_emit_before=ready_before,
+                snapshot_ready_before=snapshot_ready_before,
+                queue_size_at_gap=queue_size_at_process,
+                updates_processed_since_snapshot=updates_since_snapshot_before,
+                local_recv_monotonic_ns=recv_monotonic_ns,
+            )
+        if result.accepted and (not ready_before) and state.ready_to_emit:
+            self.debug.record_sequence_trace_event(
+                {
+                    "event": "recovery_ready_restored",
+                    "symbol": symbol,
+                    "generation_id": state.generation,
+                    "last_update_id": state.last_update_id,
+                    "ready_to_emit_after": state.ready_to_emit,
+                    "snapshot_ready_after": state.snapshot_ready,
+                    "updates_processed_since_snapshot": int(
+                        self._updates_processed_since_snapshot[symbol]
+                    ),
+                    "local_recv_monotonic_ns": recv_monotonic_ns,
+                }
+            )
+        self._updates_processed_since_snapshot[symbol] += 1
         if not state.ready_to_emit:
             self.lifecycle.observe_ready_false(state)
         return result
@@ -461,14 +562,98 @@ class OrderbookPhase41Processor:
             state.cleanup()
         self._open_stale_periods.pop(symbol.upper(), None)
 
+    def set_capture_active(self, active: bool) -> None:
+        self.capture_active = active
+
+    def _record_post_snapshot_update_range(
+        self,
+        event: DepthUpdate,
+        *,
+        result: OrderbookApplyResult,
+        generation_id: int,
+        classification: str,
+        ready_to_emit_before: bool,
+        snapshot_ready_before: bool,
+        queue_size_at_process: int,
+        local_recv_monotonic_ns: int,
+        apply_monotonic_ns: int,
+    ) -> None:
+        symbol = event.symbol.upper()
+        index = int(self._post_snapshot_trace_counts[symbol]) + 1
+        if index > 20:
+            return
+        state = self.state_for(symbol)
+        self._post_snapshot_trace_counts[symbol] = index
+        self.debug.record_sequence_trace_event(
+            {
+                "event": "post_snapshot_update_range",
+                "symbol": symbol,
+                "generation_id": generation_id,
+                "index_after_snapshot": index,
+                "U": event.first_update_id,
+                "u": event.final_update_id,
+                "previous_last_update_id": result.previous_last_update_id,
+                "classification": classification,
+                "ready_to_emit_before": ready_to_emit_before,
+                "ready_to_emit_after": state.ready_to_emit,
+                "snapshot_ready_before": snapshot_ready_before,
+                "snapshot_ready_after": state.snapshot_ready,
+                "queue_size_at_process": queue_size_at_process,
+                "local_recv_monotonic_ns": local_recv_monotonic_ns,
+                "apply_monotonic_ns": apply_monotonic_ns,
+            }
+        )
+
+    def _record_sequence_gap_trace(
+        self,
+        event: DepthUpdate,
+        *,
+        result: OrderbookApplyResult,
+        generation_id: int,
+        ready_to_emit_before: bool,
+        snapshot_ready_before: bool,
+        queue_size_at_gap: int,
+        updates_processed_since_snapshot: int,
+        local_recv_monotonic_ns: int,
+    ) -> None:
+        state = self.state_for(event.symbol)
+        expected = result.expected_next_update_id
+        gap_size = (
+            None
+            if expected is None
+            else max(0, event.first_update_id - expected)
+        )
+        self.debug.record_sequence_trace_event(
+            {
+                "event": "sequence_gap_detected",
+                "symbol": event.symbol.upper(),
+                "generation_id": generation_id,
+                "previous_last_update_id": result.previous_last_update_id,
+                "expected_next_update_id": expected,
+                "received_first_update_id": event.first_update_id,
+                "received_final_update_id": event.final_update_id,
+                "gap_size": gap_size,
+                "queue_size_at_gap": queue_size_at_gap,
+                "ready_to_emit_before": ready_to_emit_before,
+                "ready_to_emit_after": state.ready_to_emit,
+                "snapshot_ready_before": snapshot_ready_before,
+                "snapshot_ready_after": state.snapshot_ready,
+                "last_snapshot_last_update_id": self._last_snapshot_last_update_id.get(event.symbol.upper()),
+                "updates_processed_since_snapshot": updates_processed_since_snapshot,
+                "local_recv_monotonic_ns": local_recv_monotonic_ns,
+            }
+        )
+
     def check_stale_periods(
         self,
         *,
         now_monotonic_ns: int | None = None,
         symbols: Iterable[str] | None = None,
+        feed_active: bool | None = None,
     ) -> list[dict[str, Any]]:
         now_ns = now_monotonic_ns if now_monotonic_ns is not None else self.monotonic_clock()
         stale_periods: list[dict[str, Any]] = []
+        active = self.capture_active if feed_active is None else feed_active
         selected_symbols = tuple(symbol.upper() for symbol in symbols) if symbols else tuple(self.states)
         for symbol in selected_symbols:
             state = self.states.get(symbol)
@@ -481,6 +666,15 @@ class OrderbookPhase41Processor:
             self.last_book_update_age_ms_at_report = age_ms
             if age_ms <= self.stale_threshold_ms:
                 self._close_stale_period(symbol, now_monotonic_ns=now_ns)
+                continue
+            if not active:
+                if symbol not in self._open_stale_periods:
+                    self._record_post_capture_age_warning(
+                        symbol=symbol,
+                        state=state,
+                        now_monotonic_ns=now_ns,
+                        age_ms=age_ms,
+                    )
                 continue
             period = self._open_stale_periods.get(symbol)
             if period is None:
@@ -504,6 +698,7 @@ class OrderbookPhase41Processor:
                 }
                 self._open_stale_periods[symbol] = period
                 self.stale_periods.append(period)
+                self.counters["active_feed_stale_count"] += 1
                 self.counters["stale_book_count"] += 1
                 state.mark_not_ready(
                     "stale_book",
@@ -524,6 +719,36 @@ class OrderbookPhase41Processor:
             stale_periods.append(period)
         return stale_periods
 
+    def _record_post_capture_age_warning(
+        self,
+        *,
+        symbol: str,
+        state: OrderbookState,
+        now_monotonic_ns: int,
+        age_ms: float,
+    ) -> None:
+        if symbol in self._post_capture_warning_symbols:
+            for warning in self.post_capture_age_warnings:
+                if warning.get("symbol") == symbol:
+                    warning["age_ms"] = age_ms
+                    warning["observed_monotonic_ns"] = now_monotonic_ns
+            return
+        warning = {
+            "event": "post_capture_age_warning",
+            "symbol": symbol,
+            "stale_threshold_ms": self.stale_threshold_ms,
+            "observed_monotonic_ns": now_monotonic_ns,
+            "age_ms": age_ms,
+            "reason": "book_age_exceeded_threshold_after_capture_end",
+            "snapshot_ready": state.snapshot_ready,
+            "ready_to_emit": state.ready_to_emit,
+            "last_book_update_monotonic_ns": state.last_book_update_monotonic_ns,
+            "last_message_recv_monotonic_ns": state.last_message_recv_monotonic_ns,
+            "generation_id": state.generation,
+        }
+        self._post_capture_warning_symbols.add(symbol)
+        self.post_capture_age_warnings.append(warning)
+
     def _close_stale_period(
         self,
         symbol: str,
@@ -537,7 +762,10 @@ class OrderbookPhase41Processor:
         self.debug.record_stale_period_case(period)
 
     def summary(self, *, duration_sec: float | None = None) -> dict[str, Any]:
-        self.check_stale_periods(now_monotonic_ns=self.monotonic_clock())
+        self.check_stale_periods(
+            now_monotonic_ns=self.monotonic_clock(),
+            feed_active=self.capture_active,
+        )
         snapshot_copy_p99_us = _percentile(list(self.snapshot_copy_us_samples), 0.99)
         lifecycle_report = self.lifecycle.report()
         queue_report = self.queue_monitor.report()
@@ -563,7 +791,10 @@ class OrderbookPhase41Processor:
             "book_empty_count": int(self.blocked_by_quality_error.get("book_empty", 0)),
             "one_side_missing_count": int(self.blocked_by_quality_error.get("one_side_missing", 0)),
             "stale_book_count": int(self.counters["stale_book_count"]),
+            "active_feed_stale_count": int(self.counters["active_feed_stale_count"]),
+            "post_capture_age_warning_count": len(self.post_capture_age_warnings),
             "stale_periods": list(self.stale_periods),
+            "post_capture_age_warnings": list(self.post_capture_age_warnings),
             "max_book_age_ms": self.max_book_age_ms,
             "last_book_update_age_ms_at_report": self.last_book_update_age_ms_at_report,
             "stale_threshold_ms": self.stale_threshold_ms,
@@ -654,13 +885,21 @@ def evaluate_phase_4_1_pass(report: dict[str, Any]) -> tuple[bool, list[str]]:
         "one_side_missing_count",
         "sample_before_ready_count",
         "invalid_delta_count",
-        "stale_book_count",
         "ready_to_emit_violation_count",
         "clean_sample_schema_violation_count",
     )
     for field in blocker_fields:
         if _numeric_value(report.get(field)) > 0:
             failure_reasons.append(f"{field} > 0")
+
+    active_stale = report.get("active_feed_stale_count")
+    if active_stale is None:
+        active_stale = report.get("stale_book_count")
+        stale_reason = "stale_book_count > 0"
+    else:
+        stale_reason = "active_feed_stale_count > 0"
+    if _numeric_value(active_stale) > 0:
+        failure_reasons.append(stale_reason)
 
     queue = report.get("queue")
     if isinstance(queue, dict):
@@ -673,6 +912,28 @@ def evaluate_phase_4_1_pass(report: dict[str, Any]) -> tuple[bool, list[str]]:
         failure_reasons.append("snapshot_copy_p99_us > snapshot_copy_budget_us")
 
     return not failure_reasons, failure_reasons
+
+
+def _sequence_trace_classification(
+    result: OrderbookApplyResult,
+    *,
+    awaiting_bridge_before: bool,
+) -> str:
+    if result.accepted:
+        return "bridge_accepted" if awaiting_bridge_before else "expected_accepted"
+    if result.status == "duplicate_update":
+        if (
+            result.previous_last_update_id is not None
+            and result.final_update_id is not None
+            and result.final_update_id < result.previous_last_update_id
+        ):
+            return "old_dropped"
+        return "duplicate_skipped"
+    if result.status in {"sequence_gap_or_reset", "sequence_bridge_failed"}:
+        return "gap_detected"
+    if result.status == "invalid_delta_levels":
+        return "invalid_fail_closed"
+    return result.status
 
 
 def clean_sample_from_snapshot(
@@ -762,6 +1023,8 @@ async def run_orderbook_phase41_capture(
                 session=session,
                 symbol=symbol,
                 rest_url=rest_url,
+                queue=queue,
+                recovery=False,
             )
             deadline = time.monotonic() + duration_sec
             while time.monotonic() < deadline:
@@ -778,6 +1041,8 @@ async def run_orderbook_phase41_capture(
                             session=session,
                             symbol=symbol,
                             rest_url=rest_url,
+                            queue=queue,
+                            recovery=True,
                         )
                     continue
                 dequeue_ns = monotonic_now_ns()
@@ -813,6 +1078,8 @@ async def run_orderbook_phase41_capture(
                         session=session,
                         symbol=symbol,
                         rest_url=rest_url,
+                        queue=queue,
+                        recovery=True,
                     )
     finally:
         stop.set()
@@ -822,6 +1089,7 @@ async def run_orderbook_phase41_capture(
         except asyncio.CancelledError:
             pass
         processor.lifecycle.on_disconnect()
+        processor.set_capture_active(False)
     duration = (monotonic_now_ns() - start_mono) / 1_000_000_000.0
     return processor.write_reports(duration_sec=duration)
 
@@ -832,20 +1100,41 @@ async def _load_fresh_snapshot(
     session: aiohttp.ClientSession,
     symbol: str,
     rest_url: str,
+    queue: asyncio.Queue[Any] | None = None,
+    recovery: bool = False,
 ) -> None:
     processor.lifecycle.on_snapshot_refresh()
+    queue_size_before = 0 if queue is None else queue.qsize()
+    request_start_ns = processor.monotonic_clock()
+    processor.debug.record_sequence_trace_event(
+        {
+            "event": "recovery_snapshot_requested" if recovery else "snapshot_requested",
+            "symbol": symbol.upper(),
+            "generation_id": processor.state_for(symbol).generation,
+            "snapshot_request_start_monotonic_ns": request_start_ns,
+            "queue_size_before_snapshot": queue_size_before,
+        }
+    )
     snapshot = await fetch_binance_depth_snapshot(
         session,
         symbol=symbol,
         rest_url=rest_url,
         limit=1000,
     )
+    response_ns = processor.monotonic_clock()
+    queue_size_after = 0 if queue is None else queue.qsize()
     processor.load_snapshot(
         symbol,
         bids=snapshot["bids"],
         asks=snapshot["asks"],
         last_update_id=int(snapshot["lastUpdateId"]),
         local_recv_monotonic_ns=processor.monotonic_clock(),
+        snapshot_request_start_monotonic_ns=request_start_ns,
+        snapshot_response_monotonic_ns=response_ns,
+        snapshot_apply_monotonic_ns=processor.monotonic_clock(),
+        queue_size_before_snapshot=queue_size_before,
+        queue_size_after_snapshot=queue_size_after,
+        recovery=recovery,
     )
 
 
@@ -896,10 +1185,13 @@ def render_phase41_markdown_report(summary: dict[str, Any]) -> str:
         "- Top mismatch root causes: see `data/debug/orderbook_mismatch_cases.jsonl`",
         f"- Crossed book count: {summary['crossed_book_count']}",
         f"- Stale book count: {summary['stale_book_count']}",
+        f"- Active-feed stale count: {summary.get('active_feed_stale_count', 0)}",
+        f"- Post-capture age warning count: {summary.get('post_capture_age_warning_count', 0)}",
         f"- Stale threshold ms: {summary.get('stale_threshold_ms')}",
         f"- Max book age ms: {summary.get('max_book_age_ms')}",
         f"- Last book update age ms at report: {summary.get('last_book_update_age_ms_at_report')}",
         f"- Stale periods: `{json.dumps(summary.get('stale_periods', []), sort_keys=True)}`",
+        f"- Post-capture age warnings: `{json.dumps(summary.get('post_capture_age_warnings', []), sort_keys=True)}`",
         f"- Queue backpressure events: {summary['queue_backpressure_events']}",
         f"- Max queue lag ms: {summary['max_queue_lag_ms']}",
         (

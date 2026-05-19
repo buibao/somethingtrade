@@ -80,6 +80,7 @@ def make_processor(
         duplicate_update_cases=tmp_path / "duplicate_update_cases.jsonl",
         invalid_delta_cases=tmp_path / "invalid_delta_cases.jsonl",
         stale_period_cases=tmp_path / "stale_period_cases.jsonl",
+        sequence_recovery_trace=tmp_path / "sequence_recovery_trace.jsonl",
         lifecycle_report=tmp_path / "ws_lifecycle_report.json",
         clean_samples=tmp_path / "orderbook_clean_samples.jsonl",
         markdown_report=tmp_path / "phase_4_1_orderbook_quality_report.md",
