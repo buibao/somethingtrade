@@ -247,8 +247,8 @@ def test_feature_extraction_basic_depth_microprice_and_slope() -> None:
             0,
             best_bid=100.0,
             best_ask=102.0,
-            bid_sizes=[10, 9, 8, 7, 6] + [1] * 15,
-            ask_sizes=[5, 4, 3, 2, 1] + [1] * 15,
+            bid_sizes=[10.0, 9.0, 8.0, 7.0, 6.0] + [1.0] * 15,
+            ask_sizes=[5.0, 4.0, 3.0, 2.0, 1.0] + [1.0] * 15,
         ),
         sample_index=0,
     )
@@ -411,4 +411,3 @@ def test_report_hard_fails_on_schema_timestamp_and_leakage_failures() -> None:
     assert any("invalid_clean_sample_count" in reason for reason in report["hard_fail_reasons"])
     assert any("timestamp_monotonic_violations" in reason for reason in report["hard_fail_reasons"])
     assert any("label_leakage_violations" in reason for reason in report["hard_fail_reasons"])
-

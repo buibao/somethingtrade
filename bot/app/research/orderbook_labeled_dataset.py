@@ -624,7 +624,8 @@ def run_leakage_check(
         current_timestamp = row.get("local_recv_monotonic_ns")
         if not isinstance(current_timestamp, int):
             continue
-        quality = row.get("quality") if isinstance(row.get("quality"), dict) else {}
+        row_quality = row.get("quality")
+        quality: dict[str, Any] = row_quality if isinstance(row_quality, dict) else {}
         feature_sources = quality.get("feature_source_indices", {})
         if isinstance(feature_sources, dict):
             for feature_name, source_index in feature_sources.items():
@@ -638,7 +639,8 @@ def run_leakage_check(
                             "reason": "past_feature_uses_future_sample",
                         }
                     )
-        labels = row.get("labels") if isinstance(row.get("labels"), dict) else {}
+        row_labels = row.get("labels")
+        labels: dict[str, Any] = row_labels if isinstance(row_labels, dict) else {}
         for horizon, horizon_ms in HORIZONS.items():
             label = labels.get(horizon)
             if not isinstance(label, dict):
@@ -1345,6 +1347,12 @@ def _build_label(
         return {**base, "invalid_reason": "FUTURE_GAP_TOO_LARGE"}
     if future_mid is None or not math.isfinite(future_mid) or future_mid <= 0:
         return {**base, "invalid_reason": "FUTURE_MID_INVALID"}
+    if (
+        not isinstance(current_spread_bps, (int, float))
+        or not math.isfinite(float(current_spread_bps))
+        or current_spread_bps < 0
+    ):
+        return {**base, "invalid_reason": "CURRENT_MID_INVALID"}
     try:
         return_bps = compute_return_bps(float(current_mid), future_mid)
         direction = direction_label(

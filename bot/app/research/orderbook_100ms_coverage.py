@@ -738,7 +738,9 @@ def write_phase42a_failure_investigation(
 
 
 def _normalize_runtime_quality(quality: dict[str, Any]) -> dict[str, Any]:
-    normalized = {field: int(_num(quality.get(field))) for field in RUNTIME_HARD_ZERO_FIELDS}
+    normalized: dict[str, Any] = {
+        field: int(_num(quality.get(field))) for field in RUNTIME_HARD_ZERO_FIELDS
+    }
     normalized["snapshot_copy_p99_us"] = _num(quality.get("snapshot_copy_p99_us"))
     return normalized
 

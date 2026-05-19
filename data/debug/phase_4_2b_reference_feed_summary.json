@@ -1,0 +1,14 @@
+{
+  "duplicate_update_id_count": 0,
+  "invalid_quote_reason_counts": {},
+  "invalid_reference_quote_count": 0,
+  "non_monotonic_reference_timestamp_count": 0,
+  "reference_gap_max_ms": 1688.0,
+  "reference_gap_p50_ms": 0.0,
+  "reference_gap_p90_ms": 31.0,
+  "reference_gap_p95_ms": 93.0,
+  "reference_gap_p99_ms": 312.0,
+  "reference_quote_count": 112249,
+  "reference_sample_rate_per_sec": 62.38332546935187,
+  "valid_reference_quote_count": 112249
+}

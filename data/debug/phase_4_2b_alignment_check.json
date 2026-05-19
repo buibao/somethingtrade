@@ -1,0 +1,6 @@
+{
+  "feature_sample_count": 18000,
+  "feature_to_reference_gap_too_large_count": 7159,
+  "feature_to_reference_no_future_count": 21,
+  "labeled_sample_count": 18000
+}
