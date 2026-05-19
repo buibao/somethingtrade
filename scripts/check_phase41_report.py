@@ -35,6 +35,7 @@ GATE_THRESHOLDS: dict[str, dict[str, float]] = {
 HARD_ZERO_FIELDS = (
     "sequence_gap_count",
     "invalid_delta_count",
+    "previous_final_update_id_mismatch_count",
     "crossed_book_count",
     "book_empty_count",
     "one_side_missing_count",
@@ -44,6 +45,40 @@ HARD_ZERO_FIELDS = (
     "queue_dropped_messages",
     "bridge_missing_after_snapshot_count",
     "first_delta_bridge_failed_count",
+)
+
+REQUIRED_TOP_LEVEL_FIELDS = (
+    "phase",
+    "symbol",
+    "duration_sec",
+    "sample_before_ready_count",
+    "feed_receive_stale_count",
+    "sequence_gap_count",
+    "invalid_delta_count",
+    "crossed_book_count",
+    "book_empty_count",
+    "one_side_missing_count",
+    "clean_sample_schema_violation_count",
+    "snapshot_copy_p99_us",
+    "queue",
+    "lifecycle",
+)
+
+REQUIRED_QUEUE_FIELDS = (
+    "queue_dropped_messages",
+    "queue_size_backpressure_events",
+    "queue_lag_backpressure_events",
+    "processing_lag_backpressure_events",
+    "snapshot_blocking_lag_events",
+)
+
+REQUIRED_LIFECYCLE_FIELDS = (
+    "snapshot_loaded_count",
+    "snapshot_refresh_count",
+    "feed_receive_stale_count",
+    "processor_apply_stale_count",
+    "post_capture_age_warning_count",
+    "stale_reset_count",
 )
 
 
@@ -97,6 +132,7 @@ def evaluate_report(report: JsonDict, *, gate: str) -> JsonDict:
 
     passed = not hard_fail_reasons
     return {
+        "schema_valid": True,
         "phase": "4.1.1",
         "gate": gate,
         "passed": passed,
@@ -126,7 +162,7 @@ def evaluate_report(report: JsonDict, *, gate: str) -> JsonDict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gate", required=True, choices=sorted(GATE_THRESHOLDS))
+    parser.add_argument("--gate", required=True)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument(
         "--output",
@@ -140,7 +176,9 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "gate": args.gate,
             "passed": False,
+            "schema_valid": False,
             "hard_fail_reasons": [f"report missing: {args.report}"],
+            "schema_errors": [f"report missing: {args.report}"],
             "warning_reasons": [],
             "next_action": "investigate_report_schema",
         }
@@ -152,22 +190,42 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(loaded_report, dict):
             raise ValueError("report root must be a JSON object")
         report = cast(JsonDict, loaded_report)
+        if args.gate not in GATE_THRESHOLDS:
+            raise ValueError(f"unsupported gate: {args.gate}")
+        schema_errors = validate_report_schema(report)
+        if schema_errors:
+            payload = {
+                "gate": args.gate,
+                "passed": False,
+                "schema_valid": False,
+                "hard_fail_reasons": [],
+                "schema_errors": schema_errors,
+                "warning_reasons": [],
+                "next_action": "investigate_report_schema",
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 2
         result = evaluate_report(report, gate=args.gate)
     except ValueError as exc:
+        unsupported_gate = str(exc).startswith("unsupported gate")
         payload = {
             "gate": args.gate,
             "passed": False,
+            "schema_valid": False,
             "hard_fail_reasons": [str(exc)],
+            "schema_errors": [] if unsupported_gate else [str(exc)],
             "warning_reasons": [],
-            "next_action": "unsupported_gate",
+            "next_action": "unsupported_gate" if unsupported_gate else "investigate_report_schema",
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
-        return 3
+        return 3 if unsupported_gate else 2
     except Exception as exc:
         payload = {
             "gate": args.gate,
             "passed": False,
+            "schema_valid": False,
             "hard_fail_reasons": [f"report schema invalid: {exc}"],
+            "schema_errors": [f"report schema invalid: {exc}"],
             "warning_reasons": [],
             "next_action": "investigate_report_schema",
         }
@@ -201,6 +259,37 @@ def _field(
         source, key = aliases[field]
         return source.get(key)
     return lifecycle.get(field, queue.get(field))
+
+
+def validate_report_schema(report: JsonDict) -> list[str]:
+    errors: list[str] = []
+    for field in REQUIRED_TOP_LEVEL_FIELDS:
+        if field not in report:
+            errors.append(f"missing required field: {field}")
+    if "phase_4_1_status" not in report and "status" not in report:
+        errors.append("missing required field: phase_4_1_status or status")
+
+    queue = _nested_dict(report, "queue")
+    if not queue:
+        errors.append("missing required object: queue")
+    else:
+        for field in REQUIRED_QUEUE_FIELDS:
+            if field not in queue:
+                errors.append(f"missing required queue field: {field}")
+        if "queue_lag_p99_ms" not in queue and "enqueue_to_dequeue_lag_p99_ms" not in queue:
+            errors.append(
+                "missing required queue field: queue_lag_p99_ms or enqueue_to_dequeue_lag_p99_ms"
+            )
+
+    lifecycle = _nested_dict(report, "lifecycle")
+    if not lifecycle:
+        errors.append("missing required object: lifecycle")
+    else:
+        for field in REQUIRED_LIFECYCLE_FIELDS:
+            if field not in lifecycle:
+                errors.append(f"missing required lifecycle field: {field}")
+
+    return errors
 
 
 def _nested_dict(mapping: JsonDict, key: str) -> JsonDict:

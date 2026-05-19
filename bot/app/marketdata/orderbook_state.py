@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, MutableMapping
 
-from app.core.clock import monotonic_now_ns
+from app.core.clock import monotonic_now_ns, utc_now_ns
 
 
 DECIMAL_ZERO = Decimal("0")
@@ -22,6 +23,7 @@ class OrderbookSnapshot:
     symbol: str
     snapshot_version: int
     state_version: int
+    generation_id: int
     bids_top_n: tuple[tuple[Decimal, Decimal], ...]
     asks_top_n: tuple[tuple[Decimal, Decimal], ...]
     bid_count: int
@@ -88,6 +90,7 @@ class OrderbookState:
         self.last_successful_apply_monotonic_ns: int | None = None
         self.last_stale_check_monotonic_ns: int | None = None
         self.last_local_recv_monotonic_ns: int | None = None
+        self.last_local_recv_wall_ts: str | None = None
         self.ready_false_since_monotonic_ns: int | None = monotonic_now_ns()
         self.ready_false_warning_after_ns = int(ready_false_warning_after_sec * 1_000_000_000)
         self.ready_to_emit_false_duration_ms_max = 0.0
@@ -103,7 +106,6 @@ class OrderbookState:
         local_recv_wall_ts: str | None = None,
         generation: int | None = None,
     ) -> OrderbookApplyResult:
-        del local_recv_wall_ts
         self.record_message_recv(local_recv_monotonic_ns)
         before = self._result_base()
         if generation is not None and generation != self.generation:
@@ -154,6 +156,7 @@ class OrderbookState:
         self.last_book_update_monotonic_ns = local_recv_monotonic_ns
         self.last_successful_apply_monotonic_ns = local_recv_monotonic_ns
         self.last_local_recv_monotonic_ns = local_recv_monotonic_ns
+        self.last_local_recv_wall_ts = local_recv_wall_ts or _utc_iso_now()
         self.state_version += 1
         self._record_ready_false_age(local_recv_monotonic_ns)
         return self._result(before, accepted=True, status="snapshot_loaded")
@@ -168,7 +171,6 @@ class OrderbookState:
         local_recv_monotonic_ns: int,
         previous_final_update_id: int | None = None,
     ) -> OrderbookApplyResult:
-        del previous_final_update_id
         self.record_message_recv(local_recv_monotonic_ns)
         before = self._result_base(
             first_update_id=first_update_id,
@@ -195,6 +197,23 @@ class OrderbookState:
             )
 
         expected_next_update_id = previous_last_update_id + 1
+        if (
+            previous_final_update_id is not None
+            and int(previous_final_update_id) != previous_last_update_id
+        ):
+            self.mark_not_ready(
+                "previous_final_update_id_mismatch",
+                local_recv_monotonic_ns=local_recv_monotonic_ns,
+                gap_boundary_update_id=final_update_id,
+            )
+            return self._result(
+                before,
+                accepted=False,
+                status="previous_final_update_id_mismatch",
+                errors=("previous_final_update_id_mismatch",),
+                expected_next_update_id=expected_next_update_id,
+            )
+
         if self.awaiting_first_delta_after_snapshot:
             snapshot_last_update_id = self.snapshot_last_update_id
             if snapshot_last_update_id is None or not (
@@ -349,6 +368,7 @@ class OrderbookState:
             symbol=self.symbol,
             snapshot_version=version,
             state_version=version,
+            generation_id=self.generation,
             bids_top_n=bids_top_n,
             asks_top_n=asks_top_n,
             bid_count=len(self.bids),
@@ -360,7 +380,7 @@ class OrderbookState:
             last_update_id=self.last_update_id,
             last_book_update_monotonic_ns=self.last_book_update_monotonic_ns,
             local_recv_monotonic_ns=local_recv_monotonic_ns or monotonic_now_ns(),
-            local_recv_wall_ts=local_recv_wall_ts,
+            local_recv_wall_ts=local_recv_wall_ts or self.last_local_recv_wall_ts or _utc_iso_now(),
         )
 
     def validate(self) -> tuple[str, ...]:
@@ -537,6 +557,10 @@ def _decimal_or_none(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _utc_iso_now() -> str:
+    return datetime.fromtimestamp(utc_now_ns() / 1_000_000_000, tz=UTC).isoformat()
 
 
 def _apply_level(

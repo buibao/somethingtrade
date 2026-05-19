@@ -15,10 +15,14 @@ def _checker_module():
 
 def _report(**overrides):
     report = {
+        "phase": "4.1.1",
         "duration_sec": 600,
         "symbol": "BTCUSDT",
+        "phase_4_1_status": "pass",
+        "status": "pass",
         "sequence_gap_count": 0,
         "invalid_delta_count": 0,
+        "previous_final_update_id_mismatch_count": 0,
         "crossed_book_count": 0,
         "book_empty_count": 0,
         "one_side_missing_count": 0,
@@ -32,6 +36,10 @@ def _report(**overrides):
         "snapshot_copy_p99_us": 50,
         "queue": {
             "queue_dropped_messages": 0,
+            "queue_size_backpressure_events": 0,
+            "queue_lag_backpressure_events": 0,
+            "processing_lag_backpressure_events": 0,
+            "snapshot_blocking_lag_events": 0,
             "enqueue_to_dequeue_lag_p95_ms": 10,
             "enqueue_to_dequeue_lag_p99_ms": 20,
             "processing_lag_p99_ms": 5,
@@ -39,6 +47,10 @@ def _report(**overrides):
         "lifecycle": {
             "snapshot_loaded_count": 1,
             "snapshot_refresh_count": 1,
+            "feed_receive_stale_count": 0,
+            "processor_apply_stale_count": 0,
+            "post_capture_age_warning_count": 0,
+            "stale_reset_count": 0,
         },
     }
     report.update(overrides)
@@ -79,7 +91,8 @@ def test_evaluator_market_status_not_applicable_not_fail() -> None:
 
 def test_evaluator_fails_on_queue_lag_p99_over_gate_threshold() -> None:
     checker = _checker_module()
-    report = _report(queue={"queue_dropped_messages": 0, "enqueue_to_dequeue_lag_p99_ms": 1000})
+    report = _report()
+    report["queue"]["enqueue_to_dequeue_lag_p99_ms"] = 1000
     result = checker.evaluate_report(report, gate="10m")
 
     assert result["passed"] is False

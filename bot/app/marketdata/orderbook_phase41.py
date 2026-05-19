@@ -5,7 +5,8 @@ import json
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
-from decimal import Decimal
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -35,6 +36,7 @@ DEFAULT_DUPLICATE_UPDATE_CASES = Path("data/debug/duplicate_update_cases.jsonl")
 DEFAULT_INVALID_DELTA_CASES = Path("data/debug/invalid_delta_cases.jsonl")
 DEFAULT_STALE_PERIOD_CASES = Path("data/debug/stale_period_cases.jsonl")
 DEFAULT_SEQUENCE_RECOVERY_TRACE = Path("data/debug/sequence_recovery_trace.jsonl")
+DEFAULT_CLEAN_SAMPLE_SCHEMA_VIOLATION_CASES = Path("data/debug/clean_sample_schema_violation_cases.jsonl")
 DEFAULT_WS_LIFECYCLE_REPORT = Path("data/debug/ws_lifecycle_report.json")
 DEFAULT_ORDERBOOK_CLEAN_SAMPLES = Path("data/dataset/orderbook_clean_samples.jsonl")
 DEFAULT_ORDERBOOK_MARKDOWN_REPORT = Path("docs/reports/phase_4_1_orderbook_quality_report.md")
@@ -57,6 +59,7 @@ class OrderbookPhase41Paths:
     invalid_delta_cases: Path = REPO_ROOT / DEFAULT_INVALID_DELTA_CASES
     stale_period_cases: Path = REPO_ROOT / DEFAULT_STALE_PERIOD_CASES
     sequence_recovery_trace: Path = REPO_ROOT / DEFAULT_SEQUENCE_RECOVERY_TRACE
+    clean_sample_schema_violation_cases: Path = REPO_ROOT / DEFAULT_CLEAN_SAMPLE_SCHEMA_VIOLATION_CASES
     lifecycle_report: Path = REPO_ROOT / DEFAULT_WS_LIFECYCLE_REPORT
     clean_samples: Path = REPO_ROOT / DEFAULT_ORDERBOOK_CLEAN_SAMPLES
     markdown_report: Path = REPO_ROOT / DEFAULT_ORDERBOOK_MARKDOWN_REPORT
@@ -124,6 +127,7 @@ class OrderbookDebugRecorder:
         self.invalid_delta_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.stale_period_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.sequence_recovery_trace: deque[dict[str, Any]] = deque(maxlen=max_cases)
+        self.clean_sample_schema_violation_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         for path in (
             self.paths.quality_samples,
             self.paths.mismatch_cases,
@@ -133,6 +137,7 @@ class OrderbookDebugRecorder:
             self.paths.invalid_delta_cases,
             self.paths.stale_period_cases,
             self.paths.sequence_recovery_trace,
+            self.paths.clean_sample_schema_violation_cases,
             self.paths.clean_samples,
         ):
             _ensure_file(path, reset=reset_files)
@@ -326,6 +331,13 @@ class OrderbookDebugRecorder:
     ) -> None:
         _append_jsonl(self.paths.clean_samples, sample)
 
+    def record_clean_sample_schema_violation_case(
+        self,
+        row: dict[str, Any],
+    ) -> None:
+        self.clean_sample_schema_violation_cases.append(row)
+        _append_jsonl(self.paths.clean_sample_schema_violation_cases, row)
+
 
 class OrderbookPhase41Processor:
     def __init__(
@@ -421,6 +433,7 @@ class OrderbookPhase41Processor:
             asks=asks,
             last_update_id=last_update_id,
             local_recv_monotonic_ns=apply_ns,
+            local_recv_wall_ts=_utc_iso_now(),
             generation=generation,
         )
         if result.accepted:
@@ -492,10 +505,11 @@ class OrderbookPhase41Processor:
             self.counters["deltas_accepted"] += 1
             self._close_stale_period(event.symbol, now_monotonic_ns=recv_monotonic_ns)
             snapshot = self.copy_snapshot(state)
+            validation_now_ns = max(self.monotonic_clock(), recv_monotonic_ns)
             quality = self.validator.validate(
                 snapshot,
                 state=state,
-                now_monotonic_ns=self.monotonic_clock(),
+                now_monotonic_ns=validation_now_ns,
                 queue_lag_ms=queue_lag_ms,
             )
             self.debug.record_quality_sample(snapshot, quality)
@@ -515,6 +529,10 @@ class OrderbookPhase41Processor:
                 if result.status == "sequence_bridge_failed":
                     self.counters["first_delta_bridge_failed_count"] += 1
                 self.lifecycle.on_sequence_gap()
+                self.debug.record_sequence_gap_case(result, symbol=event.symbol)
+            elif result.status == "previous_final_update_id_mismatch":
+                self.counters["previous_final_update_id_mismatch_count"] += 1
+                self.counters["ready_to_emit_disabled_count"] += 1
                 self.debug.record_sequence_gap_case(result, symbol=event.symbol)
             elif result.status == "invalid_delta_levels":
                 self.counters["invalid_delta_count"] += 1
@@ -544,7 +562,11 @@ class OrderbookPhase41Processor:
             local_recv_monotonic_ns=recv_monotonic_ns,
             apply_monotonic_ns=self.monotonic_clock(),
         )
-        if result.status in {"sequence_gap_or_reset", "sequence_bridge_failed"}:
+        if result.status in {
+            "sequence_gap_or_reset",
+            "sequence_bridge_failed",
+            "previous_final_update_id_mismatch",
+        }:
             self._record_sequence_gap_trace(
                 event,
                 result=result,
@@ -608,7 +630,14 @@ class OrderbookPhase41Processor:
 
     def copy_snapshot(self, state: OrderbookState) -> OrderbookSnapshot:
         start = time.perf_counter_ns()
-        snapshot = state.copy_snapshot(top_n=self.depth_n)
+        now_ns = self.monotonic_clock()
+        if state.last_local_recv_monotonic_ns is not None:
+            now_ns = max(now_ns, state.last_local_recv_monotonic_ns)
+        snapshot = state.copy_snapshot(
+            top_n=self.depth_n,
+            local_recv_monotonic_ns=now_ns,
+            local_recv_wall_ts=_utc_iso_now(),
+        )
         elapsed_us = (time.perf_counter_ns() - start) / 1_000.0
         self.snapshot_copy_us_samples.append(elapsed_us)
         return snapshot
@@ -955,6 +984,14 @@ class OrderbookPhase41Processor:
         snapshot_copy_p99_us = _percentile(list(self.snapshot_copy_us_samples), 0.99)
         lifecycle_report = self.lifecycle.report()
         queue_report = self.queue_monitor.report()
+        lifecycle_report.update(
+            {
+                "feed_receive_stale_count": int(self.counters["feed_receive_stale_count"]),
+                "processor_apply_stale_count": int(self.counters["processor_apply_stale_count"]),
+                "post_capture_age_warning_count": len(self.post_capture_age_warnings),
+                "stale_reset_count": int(self.counters["stale_reset_count"]),
+            }
+        )
         summary = {
             "phase": "4.1.1",
             "duration_sec": duration_sec,
@@ -972,6 +1009,9 @@ class OrderbookPhase41Processor:
             "samples_blocked": int(self.counters["samples_blocked"]),
             "sample_before_ready_count": int(lifecycle_report["delta_before_snapshot_count"]),
             "invalid_delta_count": int(self.counters["invalid_delta_count"]),
+            "previous_final_update_id_mismatch_count": int(
+                self.counters["previous_final_update_id_mismatch_count"]
+            ),
             "ready_to_emit_disabled_count": int(self.counters["ready_to_emit_disabled_count"]),
             "ready_to_emit_violation_count": int(self.counters["ready_to_emit_violation_count"]),
             "clean_sample_schema_violation_count": int(self.counters["clean_sample_schema_violation_count"]),
@@ -1078,6 +1118,26 @@ class OrderbookPhase41Processor:
             depth_n=self.depth_n,
             exchange_event_ts=exchange_event_ts,
         )
+        violations = validate_clean_sample_schema(sample)
+        if violations:
+            self.counters["samples_blocked"] += 1
+            self.counters["clean_sample_schema_violation_count"] += 1
+            self.debug.record_clean_sample_schema_violation_case(
+                {
+                    "event": "clean_sample_schema_violation",
+                    "symbol": sample.get("symbol"),
+                    "generation_id": sample.get("generation_id"),
+                    "last_update_id": sample.get("last_update_id"),
+                    "violations": violations,
+                    "sample_preview": {
+                        "schema_version": sample.get("schema_version"),
+                        "symbol": sample.get("symbol"),
+                        "last_update_id": sample.get("last_update_id"),
+                    },
+                    "monotonic_ts_ns": sample.get("local_recv_monotonic_ns"),
+                }
+            )
+            return
         self.debug.record_clean_sample(sample)
         self.counters["samples_emitted"] += 1
 
@@ -1094,6 +1154,7 @@ def evaluate_phase_4_1_pass(report: dict[str, Any]) -> tuple[bool, list[str]]:
         "one_side_missing_count",
         "sample_before_ready_count",
         "invalid_delta_count",
+        "previous_final_update_id_mismatch_count",
         "ready_to_emit_violation_count",
         "clean_sample_schema_violation_count",
     )
@@ -1158,7 +1219,11 @@ def _sequence_trace_classification(
         ):
             return "old_dropped"
         return "duplicate_skipped"
-    if result.status in {"sequence_gap_or_reset", "sequence_bridge_failed"}:
+    if result.status in {
+        "sequence_gap_or_reset",
+        "sequence_bridge_failed",
+        "previous_final_update_id_mismatch",
+    }:
         return "gap_detected"
     if result.status == "invalid_delta_levels":
         return "invalid_fail_closed"
@@ -1176,6 +1241,7 @@ def clean_sample_from_snapshot(
         "schema_version": PHASE_4_1_SCHEMA_VERSION,
         "symbol": snapshot.symbol,
         "source": "binance_ws",
+        "generation_id": snapshot.generation_id,
         "local_recv_monotonic_ns": snapshot.local_recv_monotonic_ns,
         "local_recv_wall_ts": snapshot.local_recv_wall_ts,
         "exchange_event_ts": exchange_event_ts,
@@ -1199,6 +1265,88 @@ def clean_sample_from_snapshot(
         },
         "lifecycle": quality.lifecycle_flags,
     }
+
+
+def validate_clean_sample_schema(sample: dict[str, Any]) -> list[str]:
+    violations: list[str] = []
+    for field in (
+        "schema_version",
+        "symbol",
+        "source",
+        "state_version",
+        "snapshot_version",
+        "last_update_id",
+        "local_recv_monotonic_ns",
+        "best_bid",
+        "best_ask",
+        "book_age_ms",
+        "quality",
+        "lifecycle",
+    ):
+        if field not in sample:
+            violations.append(f"{field}_missing")
+        elif sample.get(field) is None:
+            violations.append(f"{field}_null")
+
+    if "generation_id" not in sample:
+        violations.append("generation_id_missing")
+    elif sample.get("generation_id") is None:
+        violations.append("generation_id_null")
+    elif isinstance(sample.get("generation_id"), bool) or not isinstance(sample.get("generation_id"), int):
+        violations.append("generation_id_not_int")
+
+    wall_timestamp = sample.get("local_recv_wall_ts") or sample.get("local_recv_wall_iso") or sample.get("local_recv_wall_ts_ns")
+    if wall_timestamp is None:
+        violations.append("wall_timestamp_missing")
+
+    bids = sample.get("bids")
+    asks = sample.get("asks")
+    if not isinstance(bids, list) or not bids:
+        violations.append("bids_empty")
+        bid_prices: list[Decimal] = []
+    else:
+        bid_prices = _validate_sample_levels(bids, side="bid", violations=violations)
+
+    if not isinstance(asks, list) or not asks:
+        violations.append("asks_empty")
+        ask_prices: list[Decimal] = []
+    else:
+        ask_prices = _validate_sample_levels(asks, side="ask", violations=violations)
+
+    if bid_prices and bid_prices != sorted(bid_prices, reverse=True):
+        violations.append("bids_unsorted")
+    if ask_prices and ask_prices != sorted(ask_prices):
+        violations.append("asks_unsorted")
+
+    best_bid = _sample_decimal(sample.get("best_bid"), "best_bid", violations)
+    best_ask = _sample_decimal(sample.get("best_ask"), "best_ask", violations)
+    if best_bid is not None and best_ask is not None and best_bid >= best_ask:
+        violations.append("crossed_book")
+
+    book_age = _sample_decimal(sample.get("book_age_ms"), "book_age_ms", violations)
+    if book_age is not None and book_age < 0:
+        violations.append("book_age_ms_negative")
+
+    quality = sample.get("quality")
+    if not isinstance(quality, dict):
+        violations.append("quality_missing")
+    else:
+        errors = quality.get("errors")
+        if errors:
+            violations.append("quality_errors_present")
+
+    lifecycle = sample.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        violations.append("lifecycle_missing")
+    else:
+        if lifecycle.get("snapshot_ready") is not True:
+            violations.append("snapshot_not_ready")
+        if lifecycle.get("ready_to_emit") is not True:
+            violations.append("not_ready_to_emit")
+        if lifecycle.get("sequence_continuous") is not True:
+            violations.append("sequence_not_continuous")
+
+    return sorted(set(violations))
 
 
 def purge_queued_depth_updates_after_snapshot(
@@ -1412,6 +1560,7 @@ async def run_orderbook_phase41_capture(
                 if result.status in {
                     "sequence_gap_or_reset",
                     "sequence_bridge_failed",
+                    "previous_final_update_id_mismatch",
                     "invalid_delta_levels",
                     "delta_before_snapshot",
                 }:
@@ -1676,6 +1825,59 @@ def _levels_to_json(
 
 def _decimal_to_str(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
+
+
+def _sample_decimal(value: Any, field: str, violations: list[str]) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        if field == "price":
+            violations.append("invalid_price_level")
+        elif field == "size":
+            violations.append("invalid_size_level")
+        else:
+            violations.append(f"{field}_invalid")
+        return None
+    if not parsed.is_finite():
+        if field == "price":
+            violations.append("non_finite_price")
+        elif field == "size":
+            violations.append("non_finite_size")
+        else:
+            violations.append(f"{field}_non_finite")
+        return None
+    return parsed
+
+
+def _validate_sample_levels(
+    levels: list[Any],
+    *,
+    side: str,
+    violations: list[str],
+) -> list[Decimal]:
+    prices: list[Decimal] = []
+    for row in levels:
+        if not isinstance(row, list | tuple) or len(row) < 2:
+            violations.append(f"{side}_level_malformed")
+            continue
+        price = _sample_decimal(row[0], "price", violations)
+        size = _sample_decimal(row[1], "size", violations)
+        if price is None or size is None:
+            continue
+        if price <= 0:
+            violations.append("negative_price")
+        if size < 0:
+            violations.append("negative_size")
+        if size == 0:
+            violations.append("zero_size_level")
+        prices.append(price)
+    return prices
+
+
+def _utc_iso_now() -> str:
+    return datetime.fromtimestamp(utc_now_ns() / 1_000_000_000, tz=UTC).isoformat()
 
 
 def _numeric_value(value: Any) -> float:
