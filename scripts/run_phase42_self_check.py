@@ -60,7 +60,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         code = _run_pytest(pytest_output)
         if code != 0:
-            _write_self_check(self_check_path, passed=False, classification="TEST_FAILURE")
+            _write_self_check(
+                self_check_path,
+                passed=False,
+                classification="TEST_FAILURE",
+                report=None,
+                bundle_created=False,
+            )
             write_failure_investigation(
                 investigation_path,
                 classification="TEST_FAILURE",
@@ -85,7 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     if pipeline.report["status"] != "pass":
         classification = classify_report_failure(pipeline.report)
-        _write_self_check(self_check_path, passed=False, classification=classification)
+        _write_self_check(
+            self_check_path,
+            passed=False,
+            classification=classification,
+            report=pipeline.report,
+            bundle_created=False,
+        )
         write_failure_investigation(
             investigation_path,
             classification=classification,
@@ -99,10 +111,24 @@ def main(argv: list[str] | None = None) -> int:
                 pytest_output,
             ],
             hypothesis=_failure_hypothesis(pipeline.report),
+            fix_applied=(
+                "Artifact/report compliance was enforced. Label logic, "
+                "max_future_gap_ms thresholds, and valid-rate thresholds were not changed."
+            ),
+            rerun_result=(
+                "This invocation completed pytest, generated reports/debug artifacts, "
+                "failed Definition of Done, and did not create the final bundle."
+            ),
         )
         return 1
 
-    _write_self_check(self_check_path, passed=True, classification=None)
+    _write_self_check(
+        self_check_path,
+        passed=True,
+        classification=None,
+        report=pipeline.report,
+        bundle_created=False,
+    )
     if not args.no_bundle:
         try:
             create_phase42_bundle(
@@ -112,7 +138,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             missing = bundle_missing_files(bundle_path)
         except Exception as exc:
-            _write_self_check(self_check_path, passed=False, classification="BUNDLE_FAILURE")
+            _write_self_check(
+                self_check_path,
+                passed=False,
+                classification="BUNDLE_FAILURE",
+                report=pipeline.report,
+                bundle_created=False,
+            )
             write_failure_investigation(
                 investigation_path,
                 classification="BUNDLE_FAILURE",
@@ -123,7 +155,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         if missing:
-            _write_self_check(self_check_path, passed=False, classification="BUNDLE_FAILURE")
+            _write_self_check(
+                self_check_path,
+                passed=False,
+                classification="BUNDLE_FAILURE",
+                report=pipeline.report,
+                bundle_created=False,
+            )
             write_failure_investigation(
                 investigation_path,
                 classification="BUNDLE_FAILURE",
@@ -135,6 +173,13 @@ def main(argv: list[str] | None = None) -> int:
             if bundle_path.exists():
                 bundle_path.unlink()
             return 1
+        _write_self_check(
+            self_check_path,
+            passed=True,
+            classification=None,
+            report=pipeline.report,
+            bundle_created=True,
+        )
     print("Phase 4.2 self-check passed")
     return 0
 
@@ -162,18 +207,78 @@ def _write_self_check(
     *,
     passed: bool,
     classification: str | None,
+    report: dict[str, object] | None,
+    bundle_created: bool,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "phase": "4.2",
+        "status": "pass" if passed else "fail",
         "passed": passed,
+        "definition_of_done_passed": passed,
         "failure_classification": classification,
+        "failure_domain": _failure_domain(classification),
+        "summary": _self_check_summary(
+            passed=passed,
+            classification=classification,
+            report=report,
+            bundle_created=bundle_created,
+        ),
         "pytest_output_path": "data/debug/phase_4_2_pytest_output.txt",
         "report_json_path": "data/reports/phase_4_2_dataset_quality_report.json",
         "report_md_path": "data/reports/phase_4_2_dataset_quality_report.md",
         "bundle_path": "phase_4_2_dataset_quality_bundle.zip",
+        "bundle_created": bundle_created,
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _failure_domain(classification: str | None) -> str | None:
+    if classification == "LABEL_VALID_RATE_FAILURE":
+        return "dataset_coverage"
+    if classification in {"FEATURE_LEAKAGE_FAILURE", "LABEL_LEAKAGE_FAILURE"}:
+        return "leakage"
+    if classification in {
+        "INPUT_FILE_MISSING",
+        "INPUT_EMPTY",
+        "INPUT_SCHEMA_FAILURE",
+        "TIMESTAMP_MONOTONIC_FAILURE",
+        "DUPLICATE_TIMESTAMP_FAILURE",
+        "LABELED_SCHEMA_FAILURE",
+        "REPORT_SCHEMA_FAILURE",
+    }:
+        return "data_quality"
+    if classification in {"TEST_FAILURE", "BUNDLE_FAILURE"}:
+        return "self_check"
+    return None
+
+
+def _self_check_summary(
+    *,
+    passed: bool,
+    classification: str | None,
+    report: dict[str, object] | None,
+    bundle_created: bool,
+) -> str:
+    if passed:
+        return (
+            "Phase 4.2 Definition of Done passed; reports are valid and "
+            f"bundle_created={bundle_created}."
+        )
+    hard_fails = []
+    if report is not None and isinstance(report.get("hard_fail_reasons"), list):
+        hard_fails = [str(reason) for reason in report["hard_fail_reasons"]]
+    if classification == "LABEL_VALID_RATE_FAILURE":
+        return (
+            "Phase 4.2 failed due to dataset coverage. Label generation, schema, "
+            "and leakage checks may pass, but Definition of Done is failed while "
+            "eligible label valid-rate thresholds are not met. No final bundle was created. "
+            f"Hard fail reasons: {hard_fails}"
+        )
+    return (
+        "Phase 4.2 Definition of Done failed. No final bundle was created. "
+        f"Failure classification: {classification}. Hard fail reasons: {hard_fails}"
+    )
 
 
 def _failure_hypothesis(report: dict[str, object]) -> str:

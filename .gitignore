@@ -8,4 +8,8 @@ data/logs/*.jsonl
 data/logs/**/*.jsonl
 data/debug/**/*samples*.jsonl
 data/reports/*.json
+!data/reports/phase_4_2_dataset_quality_report.json
+!data/reports/phase42_self_check.json
+!data/reports/phase_4_2a_100ms_coverage_report.json
+!data/reports/phase42a_self_check.json
 phase4_final_report_artifacts.zip

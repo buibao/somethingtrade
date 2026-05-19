@@ -1,0 +1,237 @@
+{
+  "duration_sec": 1799.8835632,
+  "feature_quality": {
+    "feature_leakage_violations": 0,
+    "feature_warning_counts": {
+      "past_mid_return_1000ms_bps_no_past_sample": 11,
+      "past_mid_return_100ms_bps_gap_too_large": 3001,
+      "past_mid_return_100ms_bps_no_past_sample": 1,
+      "past_mid_return_500ms_bps_gap_too_large": 8,
+      "past_mid_return_500ms_bps_no_past_sample": 6,
+      "past_spread_change_500ms_bps_gap_too_large": 8,
+      "past_spread_change_500ms_bps_no_past_sample": 6
+    },
+    "null_feature_counts": {
+      "past_mid_return_1000ms_bps": 11,
+      "past_mid_return_100ms_bps": 3002,
+      "past_mid_return_500ms_bps": 14,
+      "past_spread_change_500ms_bps": 14
+    }
+  },
+  "hard_fail_reasons": [
+    "horizon_100ms valid_rate_eligible_rows 0.839213 below threshold 0.95"
+  ],
+  "input_path": "data/dataset/orderbook_clean_samples.jsonl",
+  "input_sample_count": 18000,
+  "input_schema_quality": {
+    "invalid_clean_sample_count": 0,
+    "schema_violation_count": 0
+  },
+  "label_quality": {
+    "horizons": {
+      "horizon_1000ms": {
+        "down_count": 1420,
+        "down_pct": 0.0789942145082332,
+        "eligible_count": 17990,
+        "flat_count": 15295,
+        "flat_pct": 0.8508566978193146,
+        "future_gap_ms_p50": 35.4699,
+        "future_gap_ms_p95": 108.7005,
+        "future_gap_ms_p99": 152.9881,
+        "invalid_count": 24,
+        "invalid_reason_counts": {
+          "FUTURE_GAP_TOO_LARGE": 14,
+          "NO_FUTURE_SAMPLE": 10
+        },
+        "return_bps_p50": 0.0,
+        "return_bps_p95_abs": 0.7227350008273979,
+        "tail_no_future_count": 10,
+        "up_count": 1261,
+        "up_pct": 0.07014908767245216,
+        "valid_count": 17976,
+        "valid_rate_all_rows": 0.9986666666666667,
+        "valid_rate_eligible_rows": 0.9992217898832685
+      },
+      "horizon_100ms": {
+        "down_count": 257,
+        "down_pct": 0.017014233697451177,
+        "eligible_count": 17999,
+        "flat_count": 14658,
+        "flat_pct": 0.9704071499503476,
+        "future_gap_ms_p50": 6.8394,
+        "future_gap_ms_p95": 99.0015,
+        "future_gap_ms_p99": 99.7968,
+        "invalid_count": 2895,
+        "invalid_reason_counts": {
+          "FUTURE_GAP_TOO_LARGE": 2894,
+          "NO_FUTURE_SAMPLE": 1
+        },
+        "return_bps_p50": 0.0,
+        "return_bps_p95_abs": 0.0,
+        "tail_no_future_count": 1,
+        "up_count": 190,
+        "up_pct": 0.012578616352201259,
+        "valid_count": 15105,
+        "valid_rate_all_rows": 0.8391666666666666,
+        "valid_rate_eligible_rows": 0.8392132896272015
+      },
+      "horizon_2000ms": {
+        "down_count": 2278,
+        "down_pct": 0.12669632925472749,
+        "eligible_count": 17980,
+        "flat_count": 13547,
+        "flat_pct": 0.753448275862069,
+        "future_gap_ms_p50": 48.6197,
+        "future_gap_ms_p95": 104.5113,
+        "future_gap_ms_p99": 153.8089,
+        "invalid_count": 20,
+        "invalid_reason_counts": {
+          "NO_FUTURE_SAMPLE": 20
+        },
+        "return_bps_p50": 0.0,
+        "return_bps_p95_abs": 1.099520459440426,
+        "tail_no_future_count": 20,
+        "up_count": 2155,
+        "up_pct": 0.11985539488320356,
+        "valid_count": 17980,
+        "valid_rate_all_rows": 0.9988888888888889,
+        "valid_rate_eligible_rows": 1.0
+      },
+      "horizon_250ms": {
+        "down_count": 554,
+        "down_pct": 0.030977409975397004,
+        "eligible_count": 17997,
+        "flat_count": 16882,
+        "flat_pct": 0.9439722657123686,
+        "future_gap_ms_p50": 50.3995,
+        "future_gap_ms_p95": 75.4433,
+        "future_gap_ms_p99": 104.2744,
+        "invalid_count": 116,
+        "invalid_reason_counts": {
+          "FUTURE_GAP_TOO_LARGE": 113,
+          "NO_FUTURE_SAMPLE": 3
+        },
+        "return_bps_p50": 0.0,
+        "return_bps_p95_abs": 0.018200289109625085,
+        "tail_no_future_count": 3,
+        "up_count": 448,
+        "up_pct": 0.0250503243122344,
+        "valid_count": 17884,
+        "valid_rate_all_rows": 0.9935555555555555,
+        "valid_rate_eligible_rows": 0.9937211757515142
+      },
+      "horizon_5000ms": {
+        "down_count": 4094,
+        "down_pct": 0.22809070143183463,
+        "eligible_count": 17949,
+        "flat_count": 9658,
+        "flat_pct": 0.5380801158838933,
+        "future_gap_ms_p50": 32.8238,
+        "future_gap_ms_p95": 107.8865,
+        "future_gap_ms_p99": 151.1291,
+        "invalid_count": 51,
+        "invalid_reason_counts": {
+          "NO_FUTURE_SAMPLE": 51
+        },
+        "return_bps_p50": 0.0,
+        "return_bps_p95_abs": 1.7623039542527887,
+        "tail_no_future_count": 51,
+        "up_count": 4197,
+        "up_pct": 0.2338291826842721,
+        "valid_count": 17949,
+        "valid_rate_all_rows": 0.9971666666666666,
+        "valid_rate_eligible_rows": 1.0
+      },
+      "horizon_500ms": {
+        "down_count": 874,
+        "down_pct": 0.04867453775896636,
+        "eligible_count": 17995,
+        "flat_count": 16339,
+        "flat_pct": 0.9099465359768323,
+        "future_gap_ms_p50": 38.0881,
+        "future_gap_ms_p95": 111.0368,
+        "future_gap_ms_p99": 137.9567,
+        "invalid_count": 44,
+        "invalid_reason_counts": {
+          "FUTURE_GAP_TOO_LARGE": 39,
+          "NO_FUTURE_SAMPLE": 5
+        },
+        "return_bps_p50": 0.0,
+        "return_bps_p95_abs": 0.4407684270924965,
+        "tail_no_future_count": 5,
+        "up_count": 743,
+        "up_pct": 0.04137892626420138,
+        "valid_count": 17956,
+        "valid_rate_all_rows": 0.9975555555555555,
+        "valid_rate_eligible_rows": 0.997832731314254
+      }
+    },
+    "label_leakage_violations": 0
+  },
+  "labeled_sample_count": 18000,
+  "labeled_schema_quality": {
+    "labeled_schema_violation_count": 0
+  },
+  "leakage_check": {
+    "feature_leakage_violations": 0,
+    "label_leakage_violations": 0,
+    "passed": true,
+    "violations": []
+  },
+  "output_path": "data/dataset/orderbook_labeled_samples.jsonl",
+  "phase": "4.2",
+  "policies": {
+    "direction_flat_threshold_bps": 0.0,
+    "eligible_row_valid_rate_thresholds": {
+      "horizon_1000ms": 0.95,
+      "horizon_100ms": 0.95,
+      "horizon_2000ms": 0.9,
+      "horizon_250ms": 0.95,
+      "horizon_5000ms": 0.9,
+      "horizon_500ms": 0.95
+    },
+    "future_label_policy": "first_sample_at_or_after_target_time",
+    "max_future_gap_policy_ms": {
+      "horizon_1000ms": 500,
+      "horizon_100ms": 100,
+      "horizon_2000ms": 1000,
+      "horizon_250ms": 150,
+      "horizon_5000ms": 2000,
+      "horizon_500ms": 250
+    },
+    "past_feature_policy": "latest_sample_at_or_before_target_time",
+    "spread_adjusted_direction": "return_bps must strictly exceed current spread_bps"
+  },
+  "processing_wall_time_sec": 9.513754,
+  "report_schema_valid": true,
+  "sample_rate_per_sec": 10.000646912958041,
+  "source": "binance_ws",
+  "status": "fail",
+  "symbol": "BTCUSDT",
+  "timestamp_quality": {
+    "duplicate_timestamp_count": 0,
+    "large_gap_count": 0,
+    "large_gap_threshold_ms": 1000.0,
+    "max_gap_ms": 953.0022,
+    "p50_gap_ms": 100.4747,
+    "p95_gap_ms": 122.9177,
+    "p99_gap_ms": 165.3203,
+    "timestamp_monotonic_violations": 0
+  },
+  "warning_reasons": [
+    "horizon_1000ms:null_future_labels_near_end_of_file",
+    "horizon_100ms:class_imbalance",
+    "horizon_100ms:low_volatility_period",
+    "horizon_100ms:null_future_labels_near_end_of_file",
+    "horizon_100ms:too_many_flat_labels_or_low_volatility_period",
+    "horizon_2000ms:null_future_labels_near_end_of_file",
+    "horizon_250ms:class_imbalance",
+    "horizon_250ms:null_future_labels_near_end_of_file",
+    "horizon_250ms:too_many_flat_labels_or_low_volatility_period",
+    "horizon_5000ms:null_future_labels_near_end_of_file",
+    "horizon_500ms:class_imbalance",
+    "horizon_500ms:null_future_labels_near_end_of_file",
+    "horizon_500ms:too_many_flat_labels_or_low_volatility_period",
+    "null_past_change_features_near_beginning_or_sparse_gaps"
+  ]
+}

@@ -33,8 +33,8 @@ If pytest, schema, timestamp monotonicity, and leakage all pass while only eligi
 
 ## Fix Applied
 
-No label-generation source edit was applied because the failure is caused by source dataset coverage at the required 100ms horizon/max-gap policy, not by schema, leakage, or calculation logic. The self-check investigation output was improved to record per-horizon valid rates and invalid reason counts.
+Artifact/report compliance was enforced. Label logic, max_future_gap_ms thresholds, and valid-rate thresholds were not changed.
 
 ## Rerun Result
 
-Rerun completed on 2026-05-20: pytest passed, schema/leakage checks passed, and Phase 4.2 self-check still failed only on `horizon_100ms valid_rate_eligible_rows 0.839213 below threshold 0.95`. Bundle was not created.
+This invocation completed pytest, generated reports/debug artifacts, failed Definition of Done, and did not create the final bundle.

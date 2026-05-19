@@ -1,0 +1,15 @@
+{
+  "duplicate_timestamp_count": 0,
+  "gap_count": 17999,
+  "gap_max_ms": 1554.0005,
+  "gap_mean_ms": 99.99893060725596,
+  "gap_p50_ms": 99.9467,
+  "gap_p90_ms": 102.2414,
+  "gap_p95_ms": 105.2301,
+  "gap_p99_ms": 306.3938,
+  "large_gap_count": 343,
+  "large_gap_threshold_ms": 200.0,
+  "sample_gap_p95_ms": 105.2301,
+  "sample_gap_p99_ms": 306.3938,
+  "timestamp_monotonic_violations": 0
+}

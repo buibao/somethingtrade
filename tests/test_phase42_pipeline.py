@@ -205,3 +205,67 @@ def test_phase42_self_check_fails_invalid_fixture_without_bundle(tmp_path: Path)
     assert not (tmp_path / "phase_4_2_dataset_quality_bundle.zip").exists()
     assert (tmp_path / "data/debug/phase42_failure_investigation.md").exists()
 
+
+def test_phase42_failed_dod_coverage_writes_artifacts_and_no_bundle(tmp_path: Path) -> None:
+    input_path = tmp_path / "data/dataset/orderbook_clean_samples.jsonl"
+    output_path = tmp_path / "data/dataset/orderbook_labeled_samples.jsonl"
+    _write_jsonl(
+        input_path,
+        [_sample(index * 250, last_update_id=100 + index) for index in range(30)],
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(ROOT / "scripts/run_phase42_self_check.py"),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--root",
+            str(tmp_path),
+            "--skip-pytest",
+            "--min-valid-rate-100ms",
+            "0.95",
+            "--min-valid-rate-250ms",
+            "0",
+            "--min-valid-rate-500ms",
+            "0",
+            "--min-valid-rate-1000ms",
+            "0",
+            "--min-valid-rate-2000ms",
+            "0",
+            "--min-valid-rate-5000ms",
+            "0",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+    assert result.returncode != 0
+    report_path = tmp_path / "data/reports/phase_4_2_dataset_quality_report.json"
+    self_check_path = tmp_path / "data/reports/phase42_self_check.json"
+    investigation_path = tmp_path / "data/debug/phase42_failure_investigation.md"
+    bundle_path = tmp_path / "phase_4_2_dataset_quality_bundle.zip"
+
+    assert report_path.exists()
+    assert self_check_path.exists()
+    assert investigation_path.exists()
+    assert not bundle_path.exists()
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    self_check = json.loads(self_check_path.read_text(encoding="utf-8"))
+    investigation = investigation_path.read_text(encoding="utf-8")
+
+    assert report["status"] == "fail"
+    assert any("horizon_100ms valid_rate_eligible_rows" in reason for reason in report["hard_fail_reasons"])
+    assert self_check["passed"] is False
+    assert self_check["status"] == "fail"
+    assert self_check["failure_classification"] == "LABEL_VALID_RATE_FAILURE"
+    assert self_check["failure_domain"] == "dataset_coverage"
+    assert "Phase 4.2 failed due to dataset coverage" in self_check["summary"]
+    assert "dataset coverage" in investigation
