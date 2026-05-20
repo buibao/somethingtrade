@@ -16,4 +16,5 @@ data/reports/*.json
 !data/reports/phase42b_self_check.json
 !data/reports/phase_4_2c_reference_feed_benchmark_report.json
 !data/reports/phase42c_self_check.json
+data/dataset/*.jsonl
 phase4_final_report_artifacts.zip
