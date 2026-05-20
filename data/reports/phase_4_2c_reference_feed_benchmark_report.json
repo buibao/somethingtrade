@@ -1,0 +1,266 @@
+{
+  "benchmark_status": "fail",
+  "capture": {
+    "depth_clean_sample_count": 18000,
+    "depth_stream": "btcusdt@depth@100ms",
+    "downsampling_enabled": false,
+    "duration_sec": 1800.0,
+    "fixture_mode": true,
+    "fresh_capture_performed": false,
+    "reference_event_counts": {
+      "aggTrade_price": 0,
+      "bookTicker_mid": 112249,
+      "trade_price": 0
+    },
+    "reference_streams": [
+      "btcusdt@bookTicker",
+      "btcusdt@trade",
+      "btcusdt@aggTrade"
+    ]
+  },
+  "clean_sample_count": 18000,
+  "dataset_paths": {
+    "aggtrade_reference_events": "data/dataset/aggtrade_reference_events.jsonl",
+    "benchmark_labels": "data/dataset/orderbook_reference_benchmark_labels.jsonl",
+    "bookticker_reference_quotes": "data/dataset/bookticker_reference_quotes.jsonl",
+    "clean_samples": "data/dataset/orderbook_clean_samples.jsonl",
+    "trade_reference_events": "data/dataset/trade_reference_events.jsonl"
+  },
+  "definition_of_done_status": "fail",
+  "depth_runtime_quality": {
+    "book_empty_count": 0,
+    "clean_sample_schema_violation_count": 0,
+    "crossed_book_count": 0,
+    "feed_receive_stale_count": 0,
+    "invalid_delta_count": 0,
+    "one_side_missing_count": 0,
+    "queue_dropped_messages": 0,
+    "sample_before_ready_count": 0,
+    "sequence_gap_count": 0,
+    "snapshot_copy_p99_us": 0.0
+  },
+  "duration_sec": 1800.0,
+  "fresh_capture_required": false,
+  "hard_fail_reasons": [
+    "reference datasets missing: trade_price,aggTrade_price",
+    "no reference source achieved valid_rate_eligible_rows >= 0.95 with strict 100ms gate"
+  ],
+  "implementation_status": "pass",
+  "label_semantics": {
+    "aggTrade_price": "future aggregate transaction price label",
+    "bookTicker_mid": "future best bid/ask mid label",
+    "depth_mid": "future orderbook mid label",
+    "trade_price": "future transaction price label"
+  },
+  "labeled_sample_count": 18000,
+  "leakage_check": {
+    "checked_horizons": [
+      "horizon_100ms"
+    ],
+    "checked_samples": 18000,
+    "checked_sources": [
+      "depth_mid",
+      "bookTicker_mid",
+      "trade_price",
+      "aggTrade_price"
+    ],
+    "feature_leakage_violations": 0,
+    "label_leakage_violations": 0,
+    "label_leakage_violations_by_source": {
+      "aggTrade_price": 0,
+      "bookTicker_mid": 0,
+      "depth_mid": 0,
+      "trade_price": 0
+    },
+    "passed": true,
+    "violations": []
+  },
+  "phase": "4.2C",
+  "primary_failure": "REFERENCE_FEED_EMPTY",
+  "ranking": [
+    {
+      "gap_p95_ms": 104.3829,
+      "gap_p99_ms": 236.2084,
+      "passes_100ms_gate": false,
+      "reference_source": "depth_mid",
+      "semantic_type": "quote_mid",
+      "valid_rate_eligible_rows": 0.8111561753430746
+    },
+    {
+      "gap_p95_ms": 93.0,
+      "gap_p99_ms": 312.0,
+      "passes_100ms_gate": false,
+      "reference_source": "bookTicker_mid",
+      "semantic_type": "quote_mid",
+      "valid_rate_eligible_rows": 0.6018132265420769
+    },
+    {
+      "gap_p95_ms": null,
+      "gap_p99_ms": null,
+      "passes_100ms_gate": false,
+      "reference_source": "trade_price",
+      "semantic_type": "transaction_price",
+      "valid_rate_eligible_rows": 0.0
+    },
+    {
+      "gap_p95_ms": null,
+      "gap_p99_ms": null,
+      "passes_100ms_gate": false,
+      "reference_source": "aggTrade_price",
+      "semantic_type": "transaction_price",
+      "valid_rate_eligible_rows": 0.0
+    }
+  ],
+  "recommendation": "Keep 100ms as a hard gate. Next engineering step: collect during a more active session, benchmark futures/SBE/paid feeds later, or improve capture locality. Do not move to strategy/model/execution/PnL from this failing benchmark.",
+  "reference_sources": {
+    "aggTrade_price": {
+      "bad_time_coverage_ratio_100ms": 0.0,
+      "eligible_count": 0,
+      "file_exists": false,
+      "future_gap_max_ms": null,
+      "future_gap_p50_ms": null,
+      "future_gap_p90_ms": null,
+      "future_gap_p95_ms": null,
+      "future_gap_p99_ms": null,
+      "gap_max_ms": null,
+      "gap_over_100ms_count": 0,
+      "gap_over_100ms_total_duration_ms": 0,
+      "gap_p50_ms": null,
+      "gap_p90_ms": null,
+      "gap_p95_ms": null,
+      "gap_p99_ms": null,
+      "invalid_count": 18000,
+      "invalid_reason_counts": {
+        "NO_FUTURE_REFERENCE": 18000
+      },
+      "invalid_reference_event_count": 0,
+      "label_leakage_violations": 0,
+      "max_future_gap_ms": 100,
+      "passes_100ms_gate": false,
+      "reference_event_count": 0,
+      "reference_sample_rate_per_sec": 0.0,
+      "reference_source": "aggTrade_price",
+      "reference_timestamp_monotonic_violations": 0,
+      "semantic_description": "future aggregate transaction price label",
+      "semantic_type": "transaction_price",
+      "valid_count": 0,
+      "valid_rate_all_rows": 0.0,
+      "valid_rate_eligible_rows": 0.0,
+      "valid_reference_event_count": 0
+    },
+    "bookTicker_mid": {
+      "bad_time_coverage_ratio_100ms": 0.40290150349321946,
+      "eligible_count": 17979,
+      "file_exists": true,
+      "future_gap_max_ms": 1670.8843,
+      "future_gap_p50_ms": 63.5521,
+      "future_gap_p90_ms": 331.6867,
+      "future_gap_p95_ms": 451.9467,
+      "future_gap_p99_ms": 779.1944,
+      "gap_max_ms": 1688.0,
+      "gap_over_100ms_count": 4916,
+      "gap_over_100ms_total_duration_ms": 724958.0,
+      "gap_p50_ms": 0.0,
+      "gap_p90_ms": 31.0,
+      "gap_p95_ms": 93.0,
+      "gap_p99_ms": 312.0,
+      "invalid_count": 7180,
+      "invalid_reason_counts": {
+        "FUTURE_REFERENCE_GAP_TOO_LARGE": 7159,
+        "NO_FUTURE_REFERENCE": 21
+      },
+      "invalid_reference_event_count": 0,
+      "label_leakage_violations": 0,
+      "max_future_gap_ms": 100,
+      "passes_100ms_gate": false,
+      "reference_event_count": 112249,
+      "reference_sample_rate_per_sec": 62.38332546935187,
+      "reference_source": "bookTicker_mid",
+      "reference_timestamp_monotonic_violations": 0,
+      "semantic_description": "future best bid/ask mid label",
+      "semantic_type": "quote_mid",
+      "valid_count": 10820,
+      "valid_rate_all_rows": 0.6011111111111112,
+      "valid_rate_eligible_rows": 0.6018132265420769,
+      "valid_reference_event_count": 112249
+    },
+    "depth_mid": {
+      "bad_time_coverage_ratio_100ms": 0.03557677220770099,
+      "eligible_count": 17999,
+      "file_exists": true,
+      "future_gap_max_ms": 608.7662,
+      "future_gap_p50_ms": 89.1711,
+      "future_gap_p90_ms": 101.1764,
+      "future_gap_p95_ms": 103.247,
+      "future_gap_p99_ms": 224.591,
+      "gap_max_ms": 636.5089,
+      "gap_over_100ms_count": 8869,
+      "gap_over_100ms_total_duration_ms": 64034.0216,
+      "gap_p50_ms": 99.9754,
+      "gap_p90_ms": 102.8373,
+      "gap_p95_ms": 104.3829,
+      "gap_p99_ms": 236.2084,
+      "invalid_count": 3400,
+      "invalid_reason_counts": {
+        "FUTURE_REFERENCE_GAP_TOO_LARGE": 3399,
+        "NO_FUTURE_REFERENCE": 1
+      },
+      "invalid_reference_event_count": 0,
+      "label_leakage_violations": 0,
+      "max_future_gap_ms": 100,
+      "passes_100ms_gate": false,
+      "reference_event_count": 18000,
+      "reference_sample_rate_per_sec": 10.000650962372442,
+      "reference_source": "depth_mid",
+      "reference_timestamp_monotonic_violations": 0,
+      "semantic_description": "future orderbook mid label",
+      "semantic_type": "quote_mid",
+      "valid_count": 14600,
+      "valid_rate_all_rows": 0.8111111111111111,
+      "valid_rate_eligible_rows": 0.8111561753430746,
+      "valid_reference_event_count": 18000
+    },
+    "trade_price": {
+      "bad_time_coverage_ratio_100ms": 0.0,
+      "eligible_count": 0,
+      "file_exists": false,
+      "future_gap_max_ms": null,
+      "future_gap_p50_ms": null,
+      "future_gap_p90_ms": null,
+      "future_gap_p95_ms": null,
+      "future_gap_p99_ms": null,
+      "gap_max_ms": null,
+      "gap_over_100ms_count": 0,
+      "gap_over_100ms_total_duration_ms": 0,
+      "gap_p50_ms": null,
+      "gap_p90_ms": null,
+      "gap_p95_ms": null,
+      "gap_p99_ms": null,
+      "invalid_count": 18000,
+      "invalid_reason_counts": {
+        "NO_FUTURE_REFERENCE": 18000
+      },
+      "invalid_reference_event_count": 0,
+      "label_leakage_violations": 0,
+      "max_future_gap_ms": 100,
+      "passes_100ms_gate": false,
+      "reference_event_count": 0,
+      "reference_sample_rate_per_sec": 0.0,
+      "reference_source": "trade_price",
+      "reference_timestamp_monotonic_violations": 0,
+      "semantic_description": "future transaction price label",
+      "semantic_type": "transaction_price",
+      "valid_count": 0,
+      "valid_rate_all_rows": 0.0,
+      "valid_rate_eligible_rows": 0.0,
+      "valid_reference_event_count": 0
+    }
+  },
+  "runtime_status": "pass",
+  "selected_reference_source": null,
+  "selected_reference_source_status": "fail",
+  "semantic_warning": null,
+  "status": "fail",
+  "symbol": "BTCUSDT",
+  "warning_reasons": []
+}

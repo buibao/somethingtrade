@@ -1,0 +1,42 @@
+{
+  "aggTrade_price": {
+    "bad_time_coverage_ratio_100ms": 0.0,
+    "gap_max_ms": null,
+    "gap_over_100ms_count": 0,
+    "gap_over_100ms_total_duration_ms": 0,
+    "gap_p50_ms": null,
+    "gap_p90_ms": null,
+    "gap_p95_ms": null,
+    "gap_p99_ms": null
+  },
+  "bookTicker_mid": {
+    "bad_time_coverage_ratio_100ms": 0.40290150349321946,
+    "gap_max_ms": 1688.0,
+    "gap_over_100ms_count": 4916,
+    "gap_over_100ms_total_duration_ms": 724958.0,
+    "gap_p50_ms": 0.0,
+    "gap_p90_ms": 31.0,
+    "gap_p95_ms": 93.0,
+    "gap_p99_ms": 312.0
+  },
+  "depth_mid": {
+    "bad_time_coverage_ratio_100ms": 0.03557677220770099,
+    "gap_max_ms": 636.5089,
+    "gap_over_100ms_count": 8869,
+    "gap_over_100ms_total_duration_ms": 64034.0216,
+    "gap_p50_ms": 99.9754,
+    "gap_p90_ms": 102.8373,
+    "gap_p95_ms": 104.3829,
+    "gap_p99_ms": 236.2084
+  },
+  "trade_price": {
+    "bad_time_coverage_ratio_100ms": 0.0,
+    "gap_max_ms": null,
+    "gap_over_100ms_count": 0,
+    "gap_over_100ms_total_duration_ms": 0,
+    "gap_p50_ms": null,
+    "gap_p90_ms": null,
+    "gap_p95_ms": null,
+    "gap_p99_ms": null
+  }
+}
