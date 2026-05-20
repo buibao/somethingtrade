@@ -1,13 +1,13 @@
 # Phase 4.2C Failure Investigation
 
-- Failure classification: `REFERENCE_FEED_EMPTY`
+- Failure classification: `NO_REFERENCE_SOURCE_PASSED_100MS`
 - Definition of Done status: `fail`
-- Primary failure: `REFERENCE_FEED_EMPTY`
+- Primary failure: `NO_REFERENCE_SOURCE_PASSED_100MS`
 - Report path: `data/reports/phase_4_2c_reference_feed_benchmark_report.json`
 
 ## Hard Fail Reasons
 
-- reference datasets missing: trade_price,aggTrade_price
+- measured reference sources are below valid_rate_eligible_rows 0.95
 - no reference source achieved valid_rate_eligible_rows >= 0.95 with strict 100ms gate
 
 ## Recommendation

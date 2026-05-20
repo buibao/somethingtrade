@@ -7,14 +7,14 @@ Status: **fail**
 - Implementation: `pass`
 - Runtime: `pass`
 - Benchmark: `fail`
-- Primary failure: `REFERENCE_FEED_EMPTY`
+- Primary failure: `NO_REFERENCE_SOURCE_PASSED_100MS`
 
 ## Ranking
 
-- `depth_mid` valid_rate_eligible_rows=`0.8111561753430746` gap_p95_ms=`104.3829` gap_p99_ms=`236.2084` passes_100ms_gate=`False` semantic=`quote_mid`
-- `bookTicker_mid` valid_rate_eligible_rows=`0.6018132265420769` gap_p95_ms=`93.0` gap_p99_ms=`312.0` passes_100ms_gate=`False` semantic=`quote_mid`
-- `trade_price` valid_rate_eligible_rows=`0.0` gap_p95_ms=`None` gap_p99_ms=`None` passes_100ms_gate=`False` semantic=`transaction_price`
-- `aggTrade_price` valid_rate_eligible_rows=`0.0` gap_p95_ms=`None` gap_p99_ms=`None` passes_100ms_gate=`False` semantic=`transaction_price`
+- `depth_mid` valid_rate_eligible_rows=`0.8130451691760653` gap_p95_ms=`106.7319` gap_p99_ms=`252.7549` passes_100ms_gate=`False` semantic=`quote_mid`
+- `bookTicker_mid` valid_rate_eligible_rows=`0.810678531701891` gap_p95_ms=`31.0` gap_p99_ms=`110.0` passes_100ms_gate=`False` semantic=`quote_mid`
+- `trade_price` valid_rate_eligible_rows=`0.26692252071861616` gap_p95_ms=`32.0` gap_p99_ms=`563.0` passes_100ms_gate=`False` semantic=`transaction_price`
+- `aggTrade_price` valid_rate_eligible_rows=`0.26558763001279273` gap_p95_ms=`469.0` gap_p99_ms=`1203.0` passes_100ms_gate=`False` semantic=`transaction_price`
 
 ## Selected Source
 
@@ -23,14 +23,14 @@ Status: **fail**
 
 ## Sources
 
-- `depth_mid` events=`18000` valid_events=`18000` eligible_rate=`0.8111561753430746` future_gap_p95/p99=`103.247`/`224.591` bad_time_ratio=`0.03557677220770099` leakage=`0`
-- `bookTicker_mid` events=`112249` valid_events=`112249` eligible_rate=`0.6018132265420769` future_gap_p95/p99=`451.9467`/`779.1944` bad_time_ratio=`0.40290150349321946` leakage=`0`
-- `trade_price` events=`0` valid_events=`0` eligible_rate=`0.0` future_gap_p95/p99=`None`/`None` bad_time_ratio=`0.0` leakage=`0`
-- `aggTrade_price` events=`0` valid_events=`0` eligible_rate=`0.0` future_gap_p95/p99=`None`/`None` bad_time_ratio=`0.0` leakage=`0`
+- `depth_mid` events=`18000` valid_events=`18000` eligible_rate=`0.8130451691760653` future_gap_p95/p99=`105.8043`/`230.1305` bad_time_ratio=`0.04284274786763263` leakage=`0`
+- `bookTicker_mid` events=`301538` valid_events=`301538` eligible_rate=`0.810678531701891` future_gap_p95/p99=`249.825`/`497.2529` bad_time_ratio=`0.19960306366820968` leakage=`0`
+- `trade_price` events=`96705` valid_events=`96705` eligible_rate=`0.26692252071861616` future_gap_p95/p99=`1456.8406`/`2456.6371` bad_time_ratio=`0.7391516764378281` leakage=`0`
+- `aggTrade_price` events=`24297` valid_events=`24297` eligible_rate=`0.26558763001279273` future_gap_p95/p99=`1456.8406`/`2456.6371` bad_time_ratio=`0.7397429683696133` leakage=`0`
 
 ## Hard Fail Reasons
 
-- reference datasets missing: trade_price,aggTrade_price
+- measured reference sources are below valid_rate_eligible_rows 0.95
 - no reference source achieved valid_rate_eligible_rows >= 0.95 with strict 100ms gate
 
 ## Recommendation

@@ -1,0 +1,33 @@
+{
+  "cleanup_performed": true,
+  "deleted_files": [
+    "data/dataset/bookticker_reference_quotes.jsonl",
+    "data/dataset/orderbook_clean_samples.jsonl",
+    "data/dataset/orderbook_reference_benchmark_labels.jsonl",
+    "data/debug/phase42c_failure_investigation.md",
+    "data/debug/phase_4_2c_100ms_invalid_cases.jsonl",
+    "data/debug/phase_4_2c_leakage_check.json",
+    "data/debug/phase_4_2c_pytest_output.txt",
+    "data/debug/phase_4_2c_reference_feed_summary.json",
+    "data/debug/phase_4_2c_reference_gap_distribution.json",
+    "data/debug/sequence_recovery_trace.jsonl",
+    "data/reports/phase42c_self_check.json",
+    "data/reports/phase_4_1_orderbook_quality_report.json",
+    "data/reports/phase_4_1_orderbook_quality_report.md",
+    "data/reports/phase_4_2c_reference_feed_benchmark_report.json",
+    "data/reports/phase_4_2c_reference_feed_benchmark_report.md"
+  ],
+  "errors": [],
+  "missing_files_skipped": [
+    "data/dataset/aggtrade_reference_events.jsonl",
+    "data/dataset/trade_reference_events.jsonl",
+    "data/debug/phase_4_2c_artifact_cleanup.json",
+    "data/debug/phase_4_2c_multifeed_capture_diagnostics.json",
+    "data/debug/phase_4_2c_recapture_stderr.log",
+    "data/debug/phase_4_2c_recapture_stdout.log",
+    "data/debug/phase_4_2c_runtime_stderr.log",
+    "data/debug/phase_4_2c_runtime_stdout.log",
+    "data/debug/phase_4_2c_typecheck_report.txt",
+    "phase_4_2c_reference_feed_benchmark_bundle.zip"
+  ]
+}

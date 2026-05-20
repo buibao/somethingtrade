@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 import zipfile
 
-from app.research.bookticker_reference import parse_bookticker_payload
 from app.research.orderbook_labeled_dataset import (
     NS_PER_MS,
     compute_return_bps,
@@ -70,7 +69,23 @@ PHASE42C_INVALID_100MS = Path("data/debug/phase_4_2c_100ms_invalid_cases.jsonl")
 PHASE42C_LEAKAGE_CHECK = Path("data/debug/phase_4_2c_leakage_check.json")
 PHASE42C_PYTEST_OUTPUT = Path("data/debug/phase_4_2c_pytest_output.txt")
 PHASE42C_INVESTIGATION = Path("data/debug/phase42c_failure_investigation.md")
+PHASE42C_CLEANUP_REPORT = Path("data/debug/phase_4_2c_artifact_cleanup.json")
+PHASE42C_CAPTURE_DIAGNOSTICS = Path("data/debug/phase_4_2c_multifeed_capture_diagnostics.json")
+PHASE42C_TYPECHECK_REPORT = Path("data/debug/phase_4_2c_typecheck_report.txt")
 PHASE42C_BUNDLE = Path("phase_4_2c_reference_feed_benchmark_bundle.zip")
+
+SOURCE_TO_STREAM_SUFFIX = {
+    "depth_mid": "depth@100ms",
+    "bookTicker_mid": "bookTicker",
+    "trade_price": "trade",
+    "aggTrade_price": "aggTrade",
+}
+SOURCE_TO_DATASET_KEY = {
+    "depth_mid": "clean_samples",
+    "bookTicker_mid": "bookticker_reference_quotes",
+    "trade_price": "trade_reference_events",
+    "aggTrade_price": "aggtrade_reference_events",
+}
 
 DEPTH_RUNTIME_ZERO_FIELDS = (
     "sample_before_ready_count",
@@ -93,8 +108,13 @@ PHASE42C_REQUIRED_REPORT_FIELDS = frozenset(
         "benchmark_status",
         "definition_of_done_status",
         "primary_failure",
+        "failure_classifications",
         "symbol",
         "duration_sec",
+        "fresh_capture_performed",
+        "fixture_mode",
+        "skip_capture",
+        "cleanup_performed",
         "capture",
         "dataset_paths",
         "clean_sample_count",
@@ -105,6 +125,8 @@ PHASE42C_REQUIRED_REPORT_FIELDS = frozenset(
         "semantic_warning",
         "label_semantics",
         "depth_runtime_quality",
+        "capture_diagnostics_path",
+        "typecheck_report_path",
         "leakage_check",
         "hard_fail_reasons",
         "warning_reasons",
@@ -139,6 +161,7 @@ REQUIRED_SOURCE_METRIC_FIELDS = frozenset(
         "label_leakage_violations",
         "max_future_gap_ms",
         "passes_100ms_gate",
+        "source_status",
     }
 )
 
@@ -158,7 +181,38 @@ PHASE42C_REQUIRED_BUNDLE_FILES = (
     "data/debug/phase_4_2c_reference_gap_distribution.json",
     "data/debug/phase_4_2c_100ms_invalid_cases.jsonl",
     "data/debug/phase_4_2c_leakage_check.json",
+    "data/debug/phase_4_2c_multifeed_capture_diagnostics.json",
+    "data/debug/phase_4_2c_artifact_cleanup.json",
+    "data/debug/phase_4_2c_typecheck_report.txt",
     "data/debug/phase_4_2c_pytest_output.txt",
+)
+
+CLEANUP_EXPLICIT_FILES = (
+    "data/dataset/orderbook_clean_samples.jsonl",
+    "data/dataset/bookticker_reference_quotes.jsonl",
+    "data/dataset/trade_reference_events.jsonl",
+    "data/dataset/aggtrade_reference_events.jsonl",
+    "data/dataset/orderbook_reference_benchmark_labels.jsonl",
+    "data/reports/phase_4_1_orderbook_quality_report.json",
+    "data/reports/phase_4_1_orderbook_quality_report.md",
+    "data/reports/phase_4_2c_reference_feed_benchmark_report.json",
+    "data/reports/phase_4_2c_reference_feed_benchmark_report.md",
+    "data/reports/phase42c_self_check.json",
+    "data/debug/phase_4_2c_reference_feed_summary.json",
+    "data/debug/phase_4_2c_reference_gap_distribution.json",
+    "data/debug/phase_4_2c_100ms_invalid_cases.jsonl",
+    "data/debug/phase_4_2c_leakage_check.json",
+    "data/debug/phase_4_2c_pytest_output.txt",
+    "data/debug/phase42c_failure_investigation.md",
+    "data/debug/phase_4_2c_multifeed_capture_diagnostics.json",
+    "data/debug/phase_4_2c_artifact_cleanup.json",
+    "data/debug/phase_4_2c_typecheck_report.txt",
+    "data/debug/phase_4_2c_runtime_stdout.log",
+    "data/debug/phase_4_2c_runtime_stderr.log",
+    "data/debug/phase_4_2c_recapture_stdout.log",
+    "data/debug/phase_4_2c_recapture_stderr.log",
+    "data/debug/sequence_recovery_trace.jsonl",
+    "phase_4_2c_reference_feed_benchmark_bundle.zip",
 )
 
 
@@ -173,6 +227,82 @@ class ReferenceValidationResult:
     invalid_events: list[dict[str, Any]]
     timestamp_monotonic_violations: int
     quality: dict[str, Any]
+
+
+def cleanup_phase42c_artifacts(root: str | Path) -> dict[str, Any]:
+    root_path = Path(root)
+    deleted_files: list[str] = []
+    missing_files_skipped: list[str] = []
+    errors: list[str] = []
+    candidates: list[Path] = [root_path / relative for relative in CLEANUP_EXPLICIT_FILES]
+    for directory in ("data/dataset", "data/reports", "data/debug"):
+        base = root_path / directory
+        if not base.exists():
+            continue
+        for path in base.iterdir():
+            if path.is_file() and path.name.startswith(("phase_4_2c_", "phase42c_")):
+                candidates.append(path)
+
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        display = _relative_display(root_path, path)
+        if not path.exists():
+            missing_files_skipped.append(display)
+            continue
+        if path.is_dir():
+            errors.append(f"refusing to delete directory: {display}")
+            continue
+        try:
+            path.unlink()
+            deleted_files.append(display)
+        except OSError as exc:
+            errors.append(f"{display}: {exc}")
+
+    report = {
+        "cleanup_performed": True,
+        "deleted_files": sorted(deleted_files),
+        "missing_files_skipped": sorted(missing_files_skipped),
+        "errors": errors,
+    }
+    _write_json(root_path / PHASE42C_CLEANUP_REPORT, report)
+    return report
+
+
+def required_streams(symbol: str) -> list[str]:
+    symbol_lower = symbol.lower()
+    return [
+        f"{symbol_lower}@depth@100ms",
+        f"{symbol_lower}@bookTicker",
+        f"{symbol_lower}@trade",
+        f"{symbol_lower}@aggTrade",
+    ]
+
+
+def stream_name_for_source(*, symbol: str, reference_source: str) -> str:
+    suffix = SOURCE_TO_STREAM_SUFFIX[reference_source]
+    return f"{symbol.lower()}@{suffix}"
+
+
+def validate_capture_diagnostics(diagnostics: dict[str, Any], *, symbol: str) -> list[str]:
+    errors: list[str] = []
+    requested = _list_of_str(diagnostics.get("requested_streams"))
+    for stream in required_streams(symbol):
+        if stream not in requested:
+            errors.append(f"missing requested stream: {stream}")
+    for field in (
+        "message_count_by_stream",
+        "parsed_count_by_source",
+        "parse_error_count_by_source",
+        "output_file_paths",
+        "output_file_sizes_bytes",
+    ):
+        if not isinstance(diagnostics.get(field), dict):
+            errors.append(f"missing diagnostics object: {field}")
+    return errors
 
 
 def validate_reference_event_schema(row: dict[str, Any], reference_source: str) -> list[str]:
@@ -546,6 +676,8 @@ def compute_source_metrics(
     clean_samples: list[dict[str, Any]],
     benchmark_rows: list[dict[str, Any]],
     label_leakage_violations: int,
+    capture_diagnostics: dict[str, Any] | None = None,
+    symbol: str = "BTCUSDT",
 ) -> dict[str, Any]:
     labels = [
         row.get("reference_labels", {}).get(reference_source, {}).get(HORIZON_NAME)
@@ -624,7 +756,42 @@ def compute_source_metrics(
         and metrics["label_leakage_violations"] == 0
         and metrics["reference_timestamp_monotonic_violations"] == 0
     )
+    metrics["source_status"] = classify_source_status(
+        reference_source=reference_source,
+        metrics=metrics,
+        capture_diagnostics=capture_diagnostics,
+        symbol=symbol,
+    )
     return metrics
+
+
+def classify_source_status(
+    *,
+    reference_source: str,
+    metrics: dict[str, Any],
+    capture_diagnostics: dict[str, Any] | None,
+    symbol: str,
+) -> str:
+    stream_name = stream_name_for_source(symbol=symbol, reference_source=reference_source)
+    requested_streams = _list_of_str(_dict(capture_diagnostics).get("requested_streams"))
+    message_counts = _dict(_dict(capture_diagnostics).get("message_count_by_stream"))
+    message_count = _num(message_counts.get(stream_name)) if capture_diagnostics is not None else None
+
+    if capture_diagnostics is not None and stream_name not in requested_streams:
+        return "not_captured"
+    if metrics.get("file_exists") is not True:
+        return "not_captured"
+    if capture_diagnostics is not None and message_count == 0:
+        return "captured_but_empty"
+    if capture_diagnostics is None and _num(metrics.get("reference_event_count")) <= 0:
+        return "captured_but_empty"
+    if _num(metrics.get("reference_event_count")) > 0 and _num(metrics.get("valid_reference_event_count")) <= 0:
+        return "parser_failed_or_all_invalid"
+    if metrics.get("passes_100ms_gate") is True:
+        return "measured_pass"
+    if _num(metrics.get("valid_reference_event_count")) > 0:
+        return "measured_coverage_failed"
+    return "not_captured"
 
 
 def run_phase42c_leakage_check(
@@ -709,9 +876,10 @@ def run_phase42c_leakage_check(
 
 
 def rank_reference_sources(source_metrics: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    def sort_key(item: tuple[str, dict[str, Any]]) -> tuple[float, int]:
+    def sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, float, int]:
         source, metrics = item
-        return (-_num(metrics.get("valid_rate_eligible_rows")), SEMANTIC_TIE_BREAKER[source])
+        pass_rank = 0 if metrics.get("passes_100ms_gate") is True else 1
+        return (pass_rank, -_num(metrics.get("valid_rate_eligible_rows")), SEMANTIC_TIE_BREAKER[source])
 
     ranking: list[dict[str, Any]] = []
     for source, metrics in sorted(source_metrics.items(), key=sort_key):
@@ -740,6 +908,9 @@ def build_phase42c_report(
     fresh_capture_required: bool,
     dataset_paths: dict[str, str | Path] | None = None,
 ) -> dict[str, Any]:
+    normalized_metrics = {source: dict(source_metrics.get(source, {})) for source in REFERENCE_SOURCES}
+    for source, metrics in normalized_metrics.items():
+        metrics.setdefault("source_status", "measured_pass" if metrics.get("passes_100ms_gate") is True else "measured_coverage_failed")
     ranking = rank_reference_sources(source_metrics)
     selected = next(
         (item["reference_source"] for item in ranking if item.get("passes_100ms_gate") is True),
@@ -758,13 +929,25 @@ def build_phase42c_report(
         "benchmark_status": "pass",
         "definition_of_done_status": "pass",
         "primary_failure": None,
+        "failure_classifications": [],
         "symbol": symbol,
         "duration_sec": float(capture.get("duration_sec", 0.0) or 0.0),
+        "fresh_capture_performed": bool(capture.get("fresh_capture_performed", False)),
+        "fixture_mode": bool(capture.get("fixture_mode", False)),
+        "skip_capture": bool(capture.get("skip_capture", False)),
+        "cleanup_performed": bool(capture.get("cleanup_performed", False)),
         "capture": {
             "fresh_capture_performed": bool(capture.get("fresh_capture_performed", False)),
             "fixture_mode": bool(capture.get("fixture_mode", False)),
+            "skip_capture": bool(capture.get("skip_capture", False)),
             "duration_sec": float(capture.get("duration_sec", 0.0) or 0.0),
             "depth_stream": str(capture.get("depth_stream", f"{symbol.lower()}@depth@100ms")),
+            "requested_streams": list(
+                capture.get(
+                    "requested_streams",
+                    required_streams(symbol),
+                )
+            ),
             "reference_streams": list(
                 capture.get(
                     "reference_streams",
@@ -779,6 +962,10 @@ def build_phase42c_report(
             "depth_clean_sample_count": int(capture.get("depth_clean_sample_count", len(clean_samples)) or 0),
             "reference_event_counts": dict(capture.get("reference_event_counts", {})),
         },
+        "capture_diagnostics_path": _display_path(PHASE42C_CAPTURE_DIAGNOSTICS),
+        "typecheck_report_path": _display_path(PHASE42C_TYPECHECK_REPORT),
+        "cleanup_report_path": _display_path(PHASE42C_CLEANUP_REPORT),
+        "capture_diagnostics": _dict(capture.get("capture_diagnostics")),
         "fresh_capture_required": fresh_capture_required,
         "dataset_paths": {
             "clean_samples": "data/dataset/orderbook_clean_samples.jsonl",
@@ -790,7 +977,7 @@ def build_phase42c_report(
         },
         "clean_sample_count": len(clean_samples),
         "labeled_sample_count": len(benchmark_rows),
-        "reference_sources": source_metrics,
+        "reference_sources": normalized_metrics,
         "ranking": ranking,
         "selected_reference_source": selected,
         "selected_reference_source_status": "pass" if selected is not None else "fail",
@@ -808,16 +995,27 @@ def build_phase42c_report(
 def evaluate_phase42c_report(report: dict[str, Any]) -> dict[str, Any]:
     evaluated = json.loads(json.dumps(report))
     hard: list[str] = [str(reason) for reason in evaluated.get("hard_fail_reasons", [])]
+    classifications: list[str] = [
+        str(item) for item in evaluated.get("failure_classifications", []) if item
+    ]
     warnings = [str(reason) for reason in evaluated.get("warning_reasons", [])]
     implementation_status = "pass"
     runtime_status = "pass"
     benchmark_status = "pass"
     primary: str | None = evaluated.get("primary_failure")
 
-    def add(reason: str, classification: str, *, domain: str) -> None:
+    def add(
+        reason: str,
+        classification: str,
+        *,
+        domain: str,
+        primary_classification: str | None = None,
+    ) -> None:
         nonlocal implementation_status, runtime_status, benchmark_status, primary
         hard.append(reason)
-        primary = primary or classification
+        if classification not in classifications:
+            classifications.append(classification)
+        primary = primary_classification or primary or classification
         if domain == "implementation":
             implementation_status = "fail"
         elif domain == "runtime":
@@ -831,21 +1029,53 @@ def evaluate_phase42c_report(report: dict[str, Any]) -> dict[str, Any]:
             add(f"report schema invalid: {error}", "REPORT_SCHEMA_FAILURE", domain="implementation")
     if evaluated.get("pytest_failed") is True:
         add("pytest failed", "TEST_FAILURE", domain="implementation")
+    if evaluated.get("typecheck_failed") is True:
+        add("typecheck/compileall failed", "TYPECHECK_FAILURE", domain="implementation")
+    if evaluated.get("cleanup_failed") is True:
+        add("artifact cleanup failed", "ARTIFACT_CLEANUP_FAILURE", domain="implementation")
     if evaluated.get("multi_feed_capture_failed") is True:
-        add("fresh multi-feed capture failed", "MULTI_FEED_CAPTURE_FAILURE", domain="runtime")
+        add("fresh multi-feed capture failed", "MULTI_FEED_CAPTURE_INCOMPLETE", domain="runtime")
 
     capture = _dict(evaluated.get("capture"))
-    fixture_mode = bool(capture.get("fixture_mode", False))
-    if evaluated.get("fresh_capture_required") is True and capture.get("fresh_capture_performed") is not True:
+    fresh_required = bool(evaluated.get("fresh_capture_required", False))
+    fresh_capture_performed = bool(evaluated.get("fresh_capture_performed", capture.get("fresh_capture_performed", False)))
+    fixture_mode = bool(evaluated.get("fixture_mode", capture.get("fixture_mode", False)))
+    skip_capture = bool(evaluated.get("skip_capture", capture.get("skip_capture", False)))
+    duration_sec = _num(evaluated.get("duration_sec", capture.get("duration_sec")))
+    cleanup_performed = bool(evaluated.get("cleanup_performed", False))
+
+    if fresh_required and not cleanup_performed:
+        add("artifact cleanup was not performed before final run", "ARTIFACT_CLEANUP_FAILURE", domain="implementation")
+    if fresh_required and "MULTI_FEED_CAPTURE_INCOMPLETE" not in classifications and (
+        fresh_capture_performed is not True or fixture_mode is True or skip_capture is True
+    ):
         add(
-            "fresh multi-feed capture required but not performed",
-            "MULTI_FEED_CAPTURE_FAILURE",
+            "final run did not perform a real fresh multi-feed capture",
+            "FRESH_CAPTURE_NOT_PERFORMED",
             domain="runtime",
+            primary_classification="MULTI_FEED_CAPTURE_INCOMPLETE",
         )
-    if capture.get("fresh_capture_performed") is True and not fixture_mode and _num(capture.get("duration_sec")) < 1800:
-        add("fresh capture duration_sec < 1800", "MULTI_FEED_CAPTURE_FAILURE", domain="runtime")
+    if fresh_required and fresh_capture_performed and not fixture_mode and duration_sec < 1800:
+        add("fresh capture duration_sec < 1800", "MULTI_FEED_CAPTURE_INCOMPLETE", domain="runtime")
     if capture.get("downsampling_enabled") is True:
         add("downsampling_enabled must be false", "DEPTH_RUNTIME_QUALITY_FAILURE", domain="runtime")
+
+    diagnostics = _dict(evaluated.get("capture_diagnostics"))
+    requested_streams = _list_of_str(
+        diagnostics.get("requested_streams")
+        if diagnostics
+        else capture.get("requested_streams")
+    )
+    if fresh_required and fresh_capture_performed and not diagnostics:
+        add("multi-feed capture diagnostics missing", "MULTI_FEED_CAPTURE_INCOMPLETE", domain="runtime")
+    if fresh_required and fresh_capture_performed:
+        missing_streams = [stream for stream in required_streams(str(evaluated.get("symbol") or "BTCUSDT")) if stream not in requested_streams]
+        if missing_streams:
+            add(
+                f"required streams not requested: {','.join(missing_streams)}",
+                "MULTI_FEED_CAPTURE_INCOMPLETE",
+                domain="runtime",
+            )
 
     runtime = _dict(evaluated.get("depth_runtime_quality"))
     for field in DEPTH_RUNTIME_ZERO_FIELDS:
@@ -861,24 +1091,38 @@ def evaluate_phase42c_report(report: dict[str, Any]) -> dict[str, Any]:
     if _num(evaluated.get("clean_sample_count")) <= 0:
         add("clean sample count = 0", "DEPTH_RUNTIME_QUALITY_FAILURE", domain="runtime")
     if _num(evaluated.get("labeled_sample_count")) <= 0:
-        add("benchmark labeled sample count = 0", "REFERENCE_FEED_EMPTY", domain="benchmark")
+        add("benchmark labeled sample count = 0", "MULTI_FEED_CAPTURE_INCOMPLETE", domain="benchmark")
 
     reference_sources = _dict(evaluated.get("reference_sources"))
-    external_missing = [
-        source
-        for source in EXTERNAL_REFERENCE_SOURCES
-        if not _dict(reference_sources.get(source)).get("file_exists", False)
+    missing_dataset_sources = [
+        source for source in EXTERNAL_REFERENCE_SOURCES
+        if _dict(reference_sources.get(source)).get("file_exists") is not True
     ]
-    if external_missing:
+    if missing_dataset_sources:
         add(
-            f"reference datasets missing: {','.join(external_missing)}",
-            "REFERENCE_FEED_EMPTY",
+            f"reference datasets missing: {','.join(missing_dataset_sources)}",
+            "MULTI_FEED_CAPTURE_INCOMPLETE",
             domain="benchmark",
         )
-    if all(_num(_dict(reference_sources.get(source)).get("reference_event_count")) <= 0 for source in REFERENCE_SOURCES):
-        add("all candidate reference feeds are missing or empty", "REFERENCE_FEED_EMPTY", domain="benchmark")
-    if all(_num(_dict(reference_sources.get(source)).get("valid_reference_event_count")) <= 0 for source in REFERENCE_SOURCES):
-        add("reference schema validation failed for all sources", "REFERENCE_SCHEMA_FAILURE", domain="benchmark")
+    source_statuses = {
+        source: str(_dict(reference_sources.get(source)).get("source_status", "not_captured"))
+        for source in REFERENCE_SOURCES
+    }
+    if fresh_required and fresh_capture_performed:
+        not_captured = [source for source, status in source_statuses.items() if status == "not_captured"]
+        if not_captured:
+            add(
+                f"required sources not captured: {','.join(not_captured)}",
+                "MULTI_FEED_CAPTURE_INCOMPLETE",
+                domain="benchmark",
+            )
+    parser_failed = [source for source, status in source_statuses.items() if status == "parser_failed_or_all_invalid"]
+    if parser_failed:
+        add(
+            f"reference parser emitted zero valid events: {','.join(parser_failed)}",
+            "REFERENCE_SCHEMA_FAILURE",
+            domain="benchmark",
+        )
     for source in REFERENCE_SOURCES:
         metrics = _dict(reference_sources.get(source))
         if int(metrics.get("max_future_gap_ms", -1) or -1) != REQUIRED_100MS_MAX_FUTURE_GAP_MS:
@@ -889,7 +1133,27 @@ def evaluate_phase42c_report(report: dict[str, Any]) -> dict[str, Any]:
         add("ranking missing or empty", "REPORT_SCHEMA_FAILURE", domain="implementation")
     selected = evaluated.get("selected_reference_source")
     if selected is None:
-        add("no reference source achieved valid_rate_eligible_rows >= 0.95 with strict 100ms gate", "NO_REFERENCE_SOURCE_PASSED_100MS", domain="benchmark")
+        if any(
+            _num(_dict(reference_sources.get(source)).get("valid_reference_event_count")) > 0
+            for source in REFERENCE_SOURCES
+        ):
+            add(
+                "measured reference sources are below valid_rate_eligible_rows 0.95",
+                "LABEL_VALID_RATE_FAILURE",
+                domain="benchmark",
+            )
+        if "MULTI_FEED_CAPTURE_INCOMPLETE" not in classifications and "FRESH_CAPTURE_NOT_PERFORMED" not in classifications:
+            empty_sources = [source for source, status in source_statuses.items() if status == "captured_but_empty"]
+            if empty_sources:
+                if "REFERENCE_FEED_EMPTY" not in classifications:
+                    classifications.append("REFERENCE_FEED_EMPTY")
+                benchmark_status = "fail"
+            add(
+                "no reference source achieved valid_rate_eligible_rows >= 0.95 with strict 100ms gate",
+                "NO_REFERENCE_SOURCE_PASSED_100MS",
+                domain="benchmark",
+                primary_classification="NO_REFERENCE_SOURCE_PASSED_100MS",
+            )
     elif selected not in REFERENCE_SOURCES:
         add("selected_reference_source invalid", "REPORT_SCHEMA_FAILURE", domain="implementation")
     else:
@@ -908,7 +1172,7 @@ def evaluate_phase42c_report(report: dict[str, Any]) -> dict[str, Any]:
         add("global feature_leakage_violations > 0", "FEATURE_LEAKAGE_FAILURE", domain="implementation")
 
     if hard and primary is None:
-        primary = classify_phase42c_failure({**evaluated, "hard_fail_reasons": hard})
+        primary = classify_phase42c_failure({**evaluated, "hard_fail_reasons": hard, "failure_classifications": classifications})
     hard = list(dict.fromkeys(hard))
     evaluated["implementation_status"] = implementation_status
     evaluated["runtime_status"] = runtime_status
@@ -916,6 +1180,7 @@ def evaluate_phase42c_report(report: dict[str, Any]) -> dict[str, Any]:
     evaluated["definition_of_done_status"] = "fail" if hard else "pass"
     evaluated["status"] = evaluated["definition_of_done_status"]
     evaluated["primary_failure"] = primary if hard else None
+    evaluated["failure_classifications"] = sorted(set(classifications)) if hard else []
     evaluated["hard_fail_reasons"] = hard
     evaluated["warning_reasons"] = sorted(set(warnings))
     evaluated["selected_reference_source_status"] = "pass" if not hard and selected is not None else ("fail" if selected is None else evaluated.get("selected_reference_source_status", "fail"))
@@ -926,10 +1191,16 @@ def classify_phase42c_failure(report: dict[str, Any]) -> str:
     if report.get("definition_of_done_status") == "pass":
         return "UNKNOWN_PHASE42C_FAILURE"
     primary = str(report.get("primary_failure") or "")
+    classifications = [str(item) for item in report.get("failure_classifications", [])]
+    if primary == "MULTI_FEED_CAPTURE_INCOMPLETE" and "FRESH_CAPTURE_NOT_PERFORMED" in classifications:
+        return "FRESH_CAPTURE_NOT_PERFORMED"
     reasons = " ".join(str(reason) for reason in report.get("hard_fail_reasons", []))
     for classification in (
+        "ARTIFACT_CLEANUP_FAILURE",
         "TEST_FAILURE",
-        "MULTI_FEED_CAPTURE_FAILURE",
+        "TYPECHECK_FAILURE",
+        "FRESH_CAPTURE_NOT_PERFORMED",
+        "MULTI_FEED_CAPTURE_INCOMPLETE",
         "DEPTH_RUNTIME_QUALITY_FAILURE",
         "REFERENCE_FEED_EMPTY",
         "REFERENCE_SCHEMA_FAILURE",
@@ -945,14 +1216,36 @@ def classify_phase42c_failure(report: dict[str, Any]) -> str:
     ):
         if classification in primary:
             return classification
+    for classification in (
+        "ARTIFACT_CLEANUP_FAILURE",
+        "TEST_FAILURE",
+        "TYPECHECK_FAILURE",
+        "FRESH_CAPTURE_NOT_PERFORMED",
+        "MULTI_FEED_CAPTURE_INCOMPLETE",
+        "REFERENCE_SCHEMA_FAILURE",
+        "HORIZON_100MS_POLICY_RELAXED",
+        "FEATURE_LEAKAGE_FAILURE",
+        "LABEL_LEAKAGE_FAILURE",
+        "REPORT_SCHEMA_FAILURE",
+        "BUNDLE_FAILURE",
+        "NO_REFERENCE_SOURCE_PASSED_100MS",
+        "LABEL_VALID_RATE_FAILURE",
+        "REFERENCE_FEED_EMPTY",
+    ):
+        if classification in classifications:
+            return classification
     if "pytest failed" in reasons:
         return "TEST_FAILURE"
+    if "typecheck" in reasons or "compileall" in reasons:
+        return "TYPECHECK_FAILURE"
+    if "cleanup" in reasons:
+        return "ARTIFACT_CLEANUP_FAILURE"
     if "capture" in reasons:
-        return "MULTI_FEED_CAPTURE_FAILURE"
+        return "MULTI_FEED_CAPTURE_INCOMPLETE"
     if "snapshot_copy_p99_us" in reasons or any(field in reasons for field in DEPTH_RUNTIME_ZERO_FIELDS):
         return "DEPTH_RUNTIME_QUALITY_FAILURE"
     if "missing or empty" in reasons or "datasets missing" in reasons or "clean sample count = 0" in reasons:
-        return "REFERENCE_FEED_EMPTY"
+        return "MULTI_FEED_CAPTURE_INCOMPLETE"
     if "schema validation failed" in reasons:
         return "REFERENCE_SCHEMA_FAILURE"
     if "monotonic" in reasons:
@@ -1014,6 +1307,7 @@ def run_phase42c_analysis(
     depth_runtime_quality: dict[str, Any],
     capture: dict[str, Any],
     fresh_capture_required: bool,
+    capture_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root_path = Path(root)
     clean_path = _resolve(root_path, clean_samples_path)
@@ -1043,6 +1337,8 @@ def run_phase42c_analysis(
             clean_samples=clean_samples,
             benchmark_rows=benchmark_rows,
             label_leakage_violations=int(_dict(by_source).get(source, 0) or 0),
+            capture_diagnostics=capture_diagnostics or _dict(capture.get("capture_diagnostics")),
+            symbol=symbol,
         )
         for source, validation in validations.items()
     }
@@ -1053,7 +1349,7 @@ def run_phase42c_analysis(
         benchmark_rows=benchmark_rows,
         leakage_result=leakage,
         depth_runtime_quality=depth_runtime_quality,
-        capture=capture,
+        capture={**capture, "capture_diagnostics": capture_diagnostics or _dict(capture.get("capture_diagnostics"))},
         fresh_capture_required=fresh_capture_required,
         dataset_paths={
             "clean_samples": _relative_display(root_path, clean_path),
@@ -1344,6 +1640,7 @@ def empty_phase42c_report(
             "future_gap_max_ms": None,
             "label_leakage_violations": 0,
             "passes_100ms_gate": False,
+            "source_status": "not_captured",
             **empty_quality,
         }
         for source in REFERENCE_SOURCES
@@ -1367,11 +1664,16 @@ def empty_phase42c_report(
         capture=capture,
         fresh_capture_required=not bool(capture.get("fixture_mode", False)),
     )
-    report["primary_failure"] = classification
+    report["primary_failure"] = "MULTI_FEED_CAPTURE_INCOMPLETE" if classification == "FRESH_CAPTURE_NOT_PERFORMED" else classification
+    report["failure_classifications"] = [classification]
     report["hard_fail_reasons"].append(reason)
     if classification == "TEST_FAILURE":
         report["pytest_failed"] = True
-    if classification == "MULTI_FEED_CAPTURE_FAILURE":
+    if classification == "TYPECHECK_FAILURE":
+        report["typecheck_failed"] = True
+    if classification == "ARTIFACT_CLEANUP_FAILURE":
+        report["cleanup_failed"] = True
+    if classification in {"MULTI_FEED_CAPTURE_FAILURE", "MULTI_FEED_CAPTURE_INCOMPLETE"}:
         report["multi_feed_capture_failed"] = True
     return evaluate_phase42c_report(report)
 
@@ -1454,6 +1756,12 @@ def _num(value: Any) -> float:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _list_of_str(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
 
 
 def _float_or_none(value: Any) -> float | None:

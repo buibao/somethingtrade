@@ -12,7 +12,10 @@ from app.marketdata.binance_aggtrade_source import parse_aggtrade_payload
 from app.marketdata.binance_trade_source import parse_trade_payload
 from app.research.bookticker_reference import parse_bookticker_payload
 from app.research.reference_feed_benchmark import (
+    PHASE42C_CAPTURE_DIAGNOSTICS,
+    PHASE42C_CLEANUP_REPORT,
     PHASE42C_REQUIRED_BUNDLE_FILES,
+    PHASE42C_TYPECHECK_REPORT,
     REFERENCE_SOURCES,
     REQUIRED_100MS_MAX_FUTURE_GAP_MS,
     ReferenceValidationResult,
@@ -20,6 +23,7 @@ from app.research.reference_feed_benchmark import (
     build_phase42c_report,
     build_reference_label,
     classify_phase42c_failure,
+    cleanup_phase42c_artifacts,
     compute_source_metrics,
     create_phase42c_bundle,
     evaluate_phase42c_report,
@@ -27,8 +31,11 @@ from app.research.reference_feed_benchmark import (
     phase42c_bundle_missing_files,
     rank_reference_sources,
     reference_timestamp_monotonic_violations,
+    required_streams,
     run_phase42c_leakage_check,
+    stream_name_for_source,
     validate_depth_reference_events,
+    validate_capture_diagnostics,
     validate_phase42c_report_schema,
     validate_reference_event_schema,
     validate_reference_events,
@@ -181,6 +188,55 @@ def _capture(**overrides: object) -> dict[str, object]:
     return capture
 
 
+def _diagnostics(
+    *,
+    symbol: str = "BTCUSDT",
+    missing_stream: str | None = None,
+    message_overrides: dict[str, int] | None = None,
+    parsed_overrides: dict[str, int] | None = None,
+) -> dict[str, object]:
+    streams = required_streams(symbol)
+    if missing_stream is not None:
+        streams = [stream for stream in streams if stream != missing_stream]
+    messages = {stream: 10 for stream in required_streams(symbol)}
+    if message_overrides:
+        messages.update(message_overrides)
+    parsed = {source: 10 for source in REFERENCE_SOURCES}
+    if parsed_overrides:
+        parsed.update(parsed_overrides)
+    return {
+        "fresh_capture_performed": True,
+        "fixture_mode": False,
+        "skip_capture": False,
+        "duration_sec": 1800.0,
+        "symbol": symbol,
+        "websocket_url": "wss://stream.binance.com:9443/stream?streams=x",
+        "requested_streams": streams,
+        "connected": True,
+        "connect_count": 1,
+        "disconnect_count": 1,
+        "reconnect_count": 0,
+        "message_count_by_stream": messages,
+        "parsed_count_by_source": parsed,
+        "parse_error_count_by_source": {source: 0 for source in REFERENCE_SOURCES},
+        "unknown_stream_count": 0,
+        "first_message_wall_ts_by_stream": {},
+        "last_message_wall_ts_by_stream": {},
+        "output_file_paths": {
+            "clean_samples": "data/dataset/orderbook_clean_samples.jsonl",
+            "bookticker": "data/dataset/bookticker_reference_quotes.jsonl",
+            "trade": "data/dataset/trade_reference_events.jsonl",
+            "aggtrade": "data/dataset/aggtrade_reference_events.jsonl",
+        },
+        "output_file_sizes_bytes": {
+            "clean_samples": 1,
+            "bookticker": 1,
+            "trade": 1,
+            "aggtrade": 1,
+        },
+    }
+
+
 def _metrics(source: str, rate: float, *, leakage: int = 0, monotonic: int = 0) -> dict[str, object]:
     passes = rate >= 0.95 and leakage == 0 and monotonic == 0
     return {
@@ -215,6 +271,7 @@ def _metrics(source: str, rate: float, *, leakage: int = 0, monotonic: int = 0) 
         "future_gap_max_ms": 4.0,
         "label_leakage_violations": leakage,
         "passes_100ms_gate": passes,
+        "source_status": "measured_pass" if passes else "measured_coverage_failed",
     }
 
 
@@ -546,6 +603,119 @@ def test_phase42c_fail_artifacts_and_no_bundle(tmp_path: Path) -> None:
     assert not (tmp_path / "phase_4_2c_reference_feed_benchmark_bundle.zip").exists()
 
 
+def test_phase42c_cleanup_deletes_stale_artifacts_and_skips_missing(tmp_path: Path) -> None:
+    stale = tmp_path / "data/debug/phase_4_2c_old.json"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("stale\n", encoding="utf-8")
+    explicit = tmp_path / "data/dataset/trade_reference_events.jsonl"
+    explicit.parent.mkdir(parents=True, exist_ok=True)
+    explicit.write_text("stale\n", encoding="utf-8")
+
+    report = cleanup_phase42c_artifacts(tmp_path)
+
+    assert report["cleanup_performed"] is True
+    assert "data/debug/phase_4_2c_old.json" in report["deleted_files"]
+    assert "data/dataset/trade_reference_events.jsonl" in report["deleted_files"]
+    assert report["errors"] == []
+    assert not stale.exists()
+    assert not explicit.exists()
+    assert (tmp_path / PHASE42C_CLEANUP_REPORT).exists()
+    assert report["missing_files_skipped"]
+
+
+def test_phase42c_cleanup_failure_blocks_self_check() -> None:
+    report = _report_from_rates({source: 0.96 for source in REFERENCE_SOURCES})
+    report["cleanup_failed"] = True
+    evaluated = evaluate_phase42c_report(report)
+    assert classify_phase42c_failure(evaluated) == "ARTIFACT_CLEANUP_FAILURE"
+    assert evaluated["definition_of_done_status"] == "fail"
+
+
+def test_phase42c_final_run_fails_if_skip_capture_without_fixture_flag(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(ROOT / "scripts/run_phase42c_reference_feed_benchmark.py"),
+            "--skip-capture",
+            "--skip-pytest",
+            "--root",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+    assert result.returncode != 0
+    self_check = json.loads((tmp_path / "data/reports/phase42c_self_check.json").read_text())
+    assert self_check["failure_classification"] == "FRESH_CAPTURE_NOT_PERFORMED"
+    assert not (tmp_path / "phase_4_2c_reference_feed_benchmark_bundle.zip").exists()
+
+
+def test_phase42c_final_run_requires_duration_at_least_1800(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(ROOT / "scripts/run_phase42c_reference_feed_benchmark.py"),
+            "--skip-pytest",
+            "--duration-sec",
+            "1",
+            "--root",
+            str(tmp_path),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+    assert result.returncode != 0
+    self_check = json.loads((tmp_path / "data/reports/phase42c_self_check.json").read_text())
+    assert self_check["failure_classification"] == "MULTI_FEED_CAPTURE_INCOMPLETE"
+
+
+def test_phase42c_diagnostics_required_streams_and_counts() -> None:
+    diagnostics = _diagnostics()
+    assert validate_capture_diagnostics(diagnostics, symbol="BTCUSDT") == []
+    assert set(diagnostics["message_count_by_stream"]) == set(required_streams("BTCUSDT"))
+    assert set(diagnostics["parse_error_count_by_source"]) == set(REFERENCE_SOURCES)
+
+    missing = _diagnostics(missing_stream="btcusdt@trade")
+    assert "missing requested stream: btcusdt@trade" in validate_capture_diagnostics(missing, symbol="BTCUSDT")
+
+
+def test_phase42c_source_statuses_from_diagnostics() -> None:
+    trade_stream = stream_name_for_source(symbol="BTCUSDT", reference_source="trade_price")
+    empty_diag = _diagnostics(message_overrides={trade_stream: 0}, parsed_overrides={"trade_price": 0})
+    empty_metrics = compute_source_metrics(
+        reference_source="trade_price",
+        validation=_validation("trade_price", []),
+        clean_samples=[_sample_ms(0)],
+        benchmark_rows=[],
+        label_leakage_violations=0,
+        capture_diagnostics=empty_diag,
+    )
+    assert empty_metrics["source_status"] == "captured_but_empty"
+
+    parser_diag = _diagnostics(message_overrides={trade_stream: 5}, parsed_overrides={"trade_price": 5})
+    invalid_trade = _ref_ms("trade_price", 100)
+    invalid_trade["price"] = None
+    parser_metrics = compute_source_metrics(
+        reference_source="trade_price",
+        validation=_validation("trade_price", [invalid_trade]),
+        clean_samples=[_sample_ms(0)],
+        benchmark_rows=[],
+        label_leakage_violations=0,
+        capture_diagnostics=parser_diag,
+    )
+    assert parser_metrics["source_status"] == "parser_failed_or_all_invalid"
+
+
 def test_phase42c_bundle_contains_required_files(tmp_path: Path) -> None:
     for relative in PHASE42C_REQUIRED_BUNDLE_FILES:
         if relative.endswith("/"):
@@ -580,6 +750,7 @@ def test_phase42c_self_check_skip_capture_fixture_passes_and_creates_bundle(tmp_
             "utf8",
             str(ROOT / "scripts/run_phase42c_reference_feed_benchmark.py"),
             "--skip-capture",
+            "--allow-fixture-mode",
             "--skip-pytest",
             "--root",
             str(tmp_path),
