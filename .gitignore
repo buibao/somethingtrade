@@ -18,3 +18,9 @@ data/reports/*.json
 !data/reports/phase42c_self_check.json
 data/dataset/*.jsonl
 phase4_final_report_artifacts.zip
+
+# Generated runtime/data artifacts
+/data/dataset/*.jsonl
+/data/debug/*.jsonl
+/logs/
+/reports/
