@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class QueueEnvelope:
     payload: Any
     enqueue_monotonic_ns: int
     queue_size_at_enqueue: int
+    queue_put_end_monotonic_ns: int | None = None
 
 
 class QueueBackpressureMonitor:

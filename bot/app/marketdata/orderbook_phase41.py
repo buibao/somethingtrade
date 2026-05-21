@@ -14,6 +14,7 @@ import aiohttp
 
 from app.core.clock import monotonic_now_ns, utc_now_ns
 from app.core.events import DepthUpdate
+from app.marketdata.batch_writer import JsonlBatchWriter, WriterEnqueueResult, write_jsonl_sync
 from app.marketdata.binance_ws import BinanceWSClient
 from app.marketdata.orderbook_quality import (
     OrderbookQualityResult,
@@ -118,9 +119,13 @@ class OrderbookDebugRecorder:
         paths: OrderbookPhase41Paths = OrderbookPhase41Paths(),
         max_cases: int = 256,
         reset_files: bool = True,
+        writer: JsonlBatchWriter | None = None,
+        hot_path_decoupled: bool = False,
     ) -> None:
         self.paths = paths
         self.max_cases = max_cases
+        self.writer = writer
+        self.hot_path_decoupled = hot_path_decoupled
         self.quality_samples: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.mismatch_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
         self.book_incomplete_cases: deque[dict[str, Any]] = deque(maxlen=max_cases)
@@ -166,7 +171,7 @@ class OrderbookDebugRecorder:
             "is_valid": quality.is_valid,
         }
         self.quality_samples.append(row)
-        _append_jsonl(self.paths.quality_samples, row)
+        self._record_jsonl(self.paths.quality_samples, row)
 
     def record_mismatch_case(
         self,
@@ -219,7 +224,7 @@ class OrderbookDebugRecorder:
             "raw_message_hash": None,
         }
         self.mismatch_cases.append(row)
-        _append_jsonl(self.paths.mismatch_cases, row)
+        self._record_jsonl(self.paths.mismatch_cases, row)
 
     def record_book_incomplete_case(
         self,
@@ -245,7 +250,7 @@ class OrderbookDebugRecorder:
             "action_taken": "sample_blocked",
         }
         self.book_incomplete_cases.append(row)
-        _append_jsonl(self.paths.book_incomplete_cases, row)
+        self._record_jsonl(self.paths.book_incomplete_cases, row)
 
     def record_sequence_gap_case(
         self,
@@ -268,7 +273,7 @@ class OrderbookDebugRecorder:
             "state_version_after": result.state_version_after,
         }
         self.sequence_gap_cases.append(row)
-        _append_jsonl(self.paths.sequence_gap_cases, row)
+        self._record_jsonl(self.paths.sequence_gap_cases, row)
 
     def record_duplicate_case(
         self,
@@ -287,7 +292,7 @@ class OrderbookDebugRecorder:
             "state_version_after": result.state_version_after,
         }
         self.duplicate_cases.append(row)
-        _append_jsonl(self.paths.duplicate_update_cases, row)
+        self._record_jsonl(self.paths.duplicate_update_cases, row)
 
     def record_invalid_delta_case(
         self,
@@ -318,34 +323,36 @@ class OrderbookDebugRecorder:
             "generation_id": result.generation_after,
         }
         self.invalid_delta_cases.append(row)
-        _append_jsonl(self.paths.invalid_delta_cases, row)
+        self._record_jsonl(self.paths.invalid_delta_cases, row)
 
     def record_stale_period_case(self, period: dict[str, Any]) -> None:
         self.stale_period_cases.append(period)
-        _append_jsonl(self.paths.stale_period_cases, period)
+        self._record_jsonl(self.paths.stale_period_cases, period)
 
     def record_sequence_trace_event(self, event: dict[str, Any]) -> None:
         self.sequence_recovery_trace.append(event)
-        _append_jsonl(self.paths.sequence_recovery_trace, event)
+        self._record_jsonl(self.paths.sequence_recovery_trace, event)
 
     def record_clean_sample(
         self,
         sample: dict[str, Any],
-    ) -> tuple[int, int]:
-        file_write_start_ns = monotonic_now_ns()
-        _append_jsonl(self.paths.clean_samples, sample)
-        file_write_end_ns = monotonic_now_ns()
-        return file_write_start_ns, file_write_end_ns
+    ) -> WriterEnqueueResult:
+        return self._record_jsonl(self.paths.clean_samples, sample)
 
     def record_latency_profile_sample(self, row: dict[str, Any]) -> None:
-        _append_jsonl(self.paths.latency_profile_samples, row)
+        self._record_jsonl(self.paths.latency_profile_samples, row)
 
     def record_clean_sample_schema_violation_case(
         self,
         row: dict[str, Any],
     ) -> None:
         self.clean_sample_schema_violation_cases.append(row)
-        _append_jsonl(self.paths.clean_sample_schema_violation_cases, row)
+        self._record_jsonl(self.paths.clean_sample_schema_violation_cases, row)
+
+    def _record_jsonl(self, path: Path, row: dict[str, Any]) -> WriterEnqueueResult:
+        if self.writer is not None:
+            return self.writer.enqueue_jsonl(path, row)
+        return write_jsonl_sync(path, row)
 
 
 class OrderbookPhase41Processor:
@@ -361,6 +368,10 @@ class OrderbookPhase41Processor:
         queue_lag_severe_ms: float = 250.0,
         debug_max_cases: int = 256,
         monotonic_clock: Callable[[], int] = monotonic_now_ns,
+        batch_writer_enabled: bool = False,
+        writer_batch_size: int = 512,
+        writer_flush_interval_ms: float = 100.0,
+        writer_queue_max_size: int = 65_536,
     ) -> None:
         self.states = {symbol.upper(): OrderbookState(symbol) for symbol in symbols}
         self.paths = paths
@@ -382,7 +393,24 @@ class OrderbookPhase41Processor:
             capacity=1024,
             severe_lag_ms=queue_lag_severe_ms,
         )
-        self.debug = OrderbookDebugRecorder(paths=paths, max_cases=debug_max_cases)
+        self.batch_writer_enabled = batch_writer_enabled
+        self.writer = (
+            JsonlBatchWriter(
+                batch_size=writer_batch_size,
+                flush_interval_ms=writer_flush_interval_ms,
+                queue_max_size=writer_queue_max_size,
+            )
+            if batch_writer_enabled
+            else None
+        )
+        if self.writer is not None:
+            self.writer.start()
+        self.debug = OrderbookDebugRecorder(
+            paths=paths,
+            max_cases=debug_max_cases,
+            writer=self.writer,
+            hot_path_decoupled=batch_writer_enabled,
+        )
         self.counters: Counter[str] = Counter()
         self.blocked_by_quality_error: Counter[str] = Counter()
         self.snapshot_copy_us_samples: deque[float] = deque(maxlen=4096)
@@ -478,6 +506,7 @@ class OrderbookPhase41Processor:
         raw_message_excerpt: str | None = None,
         queue_lag_ms: float | None = None,
         queue_put_monotonic_ns: int | None = None,
+        queue_put_end_monotonic_ns: int | None = None,
         queue_dequeue_monotonic_ns: int | None = None,
         queue_size_at_enqueue: int | None = None,
     ) -> OrderbookApplyResult:
@@ -535,6 +564,7 @@ class OrderbookPhase41Processor:
                 book_apply_start_monotonic_ns=book_apply_start_ns,
                 book_apply_end_monotonic_ns=book_apply_end_ns,
                 queue_put_monotonic_ns=queue_put_monotonic_ns,
+                queue_put_end_monotonic_ns=queue_put_end_monotonic_ns,
                 queue_dequeue_monotonic_ns=queue_dequeue_monotonic_ns,
                 queue_wait_ms=queue_lag_ms,
                 queue_size_at_enqueue=queue_size_at_enqueue,
@@ -1076,6 +1106,10 @@ class OrderbookPhase41Processor:
             "snapshot_copy_budget_met": snapshot_copy_p99_us <= SNAPSHOT_COPY_BUDGET_US,
             "blocked_by_quality_error": dict(sorted(self.blocked_by_quality_error.items())),
             "queue": queue_report,
+            "writer_batch_report": self.writer_report(),
+            "disk_write_on_hot_path": not self.batch_writer_enabled,
+            "debug_logging_on_hot_path": not self.batch_writer_enabled,
+            "batch_writer_enabled": self.batch_writer_enabled,
             "lifecycle": lifecycle_report,
             "clean_sample_schema_version": PHASE_4_1_SCHEMA_VERSION,
             "reported_best_validation_enabled": False,
@@ -1102,6 +1136,31 @@ class OrderbookPhase41Processor:
         )
         return summary
 
+    def close_writer(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+
+    def writer_report(self) -> dict[str, Any]:
+        if self.writer is None:
+            return {
+                "writer_mode": "synchronous_jsonl_writer",
+                "writer_batch_size": 1,
+                "writer_flush_interval_ms": 0.0,
+                "writer_queue_max_size": 0,
+                "writer_thread_or_task_count": 0,
+                "writer_shutdown_flush_completed": True,
+                "writer_dropped_records": 0,
+                "writer_error_count": 0,
+                "writer_records_enqueued": 0,
+                "writer_records_written": 0,
+                "writer_flush_count": 0,
+                "writer_flush_p50_ms": 0.0,
+                "writer_flush_p95_ms": 0.0,
+                "writer_flush_p99_ms": 0.0,
+                "writer_flush_max_ms": 0.0,
+            }
+        return self.writer.report()
+
     def _maybe_emit_or_block_sample(
         self,
         snapshot: OrderbookSnapshot,
@@ -1112,6 +1171,7 @@ class OrderbookPhase41Processor:
         book_apply_start_monotonic_ns: int,
         book_apply_end_monotonic_ns: int,
         queue_put_monotonic_ns: int | None,
+        queue_put_end_monotonic_ns: int | None,
         queue_dequeue_monotonic_ns: int | None,
         queue_wait_ms: float | None,
         queue_size_at_enqueue: int | None,
@@ -1174,7 +1234,7 @@ class OrderbookPhase41Processor:
             )
             return
         sample_emit_ns = self.monotonic_clock()
-        file_write_start_ns, file_write_end_ns = self.debug.record_clean_sample(sample)
+        clean_write = self.debug.record_clean_sample(sample)
         self.debug.record_latency_profile_sample(
             build_latency_profile_sample(
                 event=event,
@@ -1185,11 +1245,16 @@ class OrderbookPhase41Processor:
                 sample_build_end_monotonic_ns=sample_build_end_ns,
                 sample_emit_monotonic_ns=sample_emit_ns,
                 queue_put_monotonic_ns=queue_put_monotonic_ns,
+                queue_put_end_monotonic_ns=queue_put_end_monotonic_ns,
                 queue_dequeue_monotonic_ns=queue_dequeue_monotonic_ns,
                 queue_wait_ms=queue_wait_ms,
                 queue_size_at_enqueue=queue_size_at_enqueue,
-                file_write_start_monotonic_ns=file_write_start_ns,
-                file_write_end_monotonic_ns=file_write_end_ns,
+                writer_enqueue_monotonic_ns=clean_write.writer_enqueue_start_monotonic_ns,
+                file_write_start_monotonic_ns=clean_write.file_write_start_monotonic_ns,
+                file_write_end_monotonic_ns=clean_write.file_write_end_monotonic_ns,
+                disk_write_on_hot_path=not self.batch_writer_enabled,
+                debug_logging_on_hot_path=not self.batch_writer_enabled,
+                batch_writer_enabled=self.batch_writer_enabled,
             )
         )
         self.counters["samples_emitted"] += 1
@@ -1330,48 +1395,77 @@ def build_latency_profile_sample(
     sample_build_end_monotonic_ns: int,
     sample_emit_monotonic_ns: int,
     queue_put_monotonic_ns: int | None,
-    queue_dequeue_monotonic_ns: int | None,
-    queue_wait_ms: float | None,
-    queue_size_at_enqueue: int | None,
-    file_write_start_monotonic_ns: int,
-    file_write_end_monotonic_ns: int,
+    queue_put_end_monotonic_ns: int | None = None,
+    queue_dequeue_monotonic_ns: int | None = None,
+    queue_wait_ms: float | None = None,
+    queue_size_at_enqueue: int | None = None,
+    writer_enqueue_monotonic_ns: int | None = None,
+    file_write_start_monotonic_ns: int | None = None,
+    file_write_end_monotonic_ns: int | None = None,
+    disk_write_on_hot_path: bool = True,
+    debug_logging_on_hot_path: bool = True,
+    batch_writer_enabled: bool = False,
 ) -> dict[str, Any]:
     ws_message_received_ns = event.ws_message_received_monotonic_ns or event.recv_monotonic_ns
     parse_start_ns = event.parse_start_monotonic_ns
     parse_end_ns = event.parse_end_monotonic_ns or event.parse_done_monotonic_ns
+    raw_callback_ns = event.raw_ws_callback_monotonic_ns or ws_message_received_ns
+    dispatch_start_ns = event.message_dispatch_start_monotonic_ns or parse_start_ns
+    earliest_receive_ns = event.socket_recv_monotonic_ns or raw_callback_ns or ws_message_received_ns
+    hot_path_end_ns = sample_emit_monotonic_ns if batch_writer_enabled else file_write_end_monotonic_ns
     stages: dict[str, int | None] = {
         "socket_recv_monotonic_ns": event.socket_recv_monotonic_ns,
+        "raw_ws_callback_monotonic_ns": raw_callback_ns,
         "ws_message_received_monotonic_ns": ws_message_received_ns,
+        "message_dispatch_start_monotonic_ns": dispatch_start_ns,
         "parse_start_monotonic_ns": parse_start_ns,
         "parse_end_monotonic_ns": parse_end_ns,
         "book_apply_start_monotonic_ns": book_apply_start_monotonic_ns,
         "book_apply_end_monotonic_ns": book_apply_end_monotonic_ns,
         "sample_build_start_monotonic_ns": sample_build_start_monotonic_ns,
+        "sample_build_end_monotonic_ns": sample_build_end_monotonic_ns,
         "sample_emit_monotonic_ns": sample_emit_monotonic_ns,
         "queue_put_monotonic_ns": queue_put_monotonic_ns,
-        "writer_enqueue_monotonic_ns": None,
+        "queue_put_start_monotonic_ns": queue_put_monotonic_ns,
+        "queue_put_end_monotonic_ns": queue_put_end_monotonic_ns,
+        "writer_enqueue_monotonic_ns": writer_enqueue_monotonic_ns,
         "file_write_start_monotonic_ns": file_write_start_monotonic_ns,
         "file_write_end_monotonic_ns": file_write_end_monotonic_ns,
     }
     metrics = {
         "socket_to_parse_start_ms": _duration_ms(event.socket_recv_monotonic_ns, parse_start_ns),
+        "callback_to_dispatch_ms": _duration_ms(raw_callback_ns, dispatch_start_ns),
+        "dispatch_to_parse_start_ms": _duration_ms(dispatch_start_ns, parse_start_ns),
         "parse_duration_ms": _duration_ms(parse_start_ns, parse_end_ns),
         "parse_to_apply_start_ms": _duration_ms(parse_end_ns, book_apply_start_monotonic_ns),
         "book_apply_duration_ms": _duration_ms(book_apply_start_monotonic_ns, book_apply_end_monotonic_ns),
         "apply_to_sample_emit_ms": _duration_ms(book_apply_end_monotonic_ns, sample_emit_monotonic_ns),
-        "sample_emit_to_queue_put_ms": None,
+        "apply_to_sample_build_ms": _duration_ms(book_apply_end_monotonic_ns, sample_build_start_monotonic_ns),
+        "sample_build_duration_ms": _duration_ms(sample_build_start_monotonic_ns, sample_build_end_monotonic_ns),
+        "sample_emit_to_queue_put_start_ms": _duration_ms(sample_emit_monotonic_ns, queue_put_monotonic_ns),
+        "sample_emit_to_queue_put_ms": _duration_ms(sample_emit_monotonic_ns, queue_put_monotonic_ns),
+        "queue_put_duration_ms": _duration_ms(queue_put_monotonic_ns, queue_put_end_monotonic_ns),
         "queue_wait_ms": queue_wait_ms
         if queue_wait_ms is not None
         else _duration_ms(queue_put_monotonic_ns, queue_dequeue_monotonic_ns),
-        "writer_wait_ms": None,
+        "writer_wait_ms": _duration_ms(writer_enqueue_monotonic_ns, file_write_start_monotonic_ns),
         "file_write_duration_ms": _duration_ms(file_write_start_monotonic_ns, file_write_end_monotonic_ns),
-        "end_to_end_local_hot_path_ms": _duration_ms(
-            event.socket_recv_monotonic_ns or ws_message_received_ns,
-            file_write_end_monotonic_ns,
-        ),
+        "end_to_end_local_hot_path_ms": _duration_ms(earliest_receive_ns, hot_path_end_ns),
     }
+    stage_not_available = [
+        name for name, value in stages.items() if value is None
+    ]
+    earliest_available_receive_stage = _earliest_available_stage(
+        stages,
+        (
+            "socket_recv_monotonic_ns",
+            "raw_ws_callback_monotonic_ns",
+            "ws_message_received_monotonic_ns",
+            "message_dispatch_start_monotonic_ns",
+        ),
+    )
     return {
-        "schema_version": "phase_4_2fg_latency_profile_sample_v1",
+        "schema_version": "phase_4_2h_latency_profile_sample_v1" if batch_writer_enabled else "phase_4_2fg_latency_profile_sample_v1",
         "symbol": snapshot.symbol,
         "source": "binance_ws",
         "event_type": "depthUpdate",
@@ -1385,14 +1479,20 @@ def build_latency_profile_sample(
         "local_recv_monotonic_ns": snapshot.local_recv_monotonic_ns,
         "stages": stages,
         "metrics": metrics,
-        "stage_not_available": [
-            name for name, value in stages.items() if value is None
-        ],
+        "stage_not_available": stage_not_available,
+        "stage_status": {
+            name: ("stage_not_available" if name in stage_not_available else "available")
+            for name in stages
+        },
+        "socket_recv_monotonic_ns": event.socket_recv_monotonic_ns
+        if event.socket_recv_monotonic_ns is not None
+        else "stage_not_available",
+        "earliest_available_receive_stage": earliest_available_receive_stage,
         "queue_size_at_enqueue": queue_size_at_enqueue,
         "queue_dequeue_monotonic_ns": queue_dequeue_monotonic_ns,
-        "disk_write_on_hot_path": True,
-        "debug_logging_on_hot_path": True,
-        "batch_writer_enabled": False,
+        "disk_write_on_hot_path": disk_write_on_hot_path,
+        "debug_logging_on_hot_path": debug_logging_on_hot_path,
+        "batch_writer_enabled": batch_writer_enabled,
     }
 
 
@@ -1604,6 +1704,10 @@ async def run_orderbook_phase41_capture(
     ws_url: str = "wss://stream.binance.com:9443/ws",
     rest_url: str = "https://api.binance.com",
     paths: OrderbookPhase41Paths = OrderbookPhase41Paths(),
+    batch_writer_enabled: bool = False,
+    writer_batch_size: int = 512,
+    writer_flush_interval_ms: float = 100.0,
+    writer_queue_max_size: int = 65_536,
 ) -> dict[str, Any]:
     symbol = symbol.upper()
     processor = OrderbookPhase41Processor(
@@ -1611,6 +1715,10 @@ async def run_orderbook_phase41_capture(
         paths=paths,
         depth_n=depth_n,
         feed_receive_stale_after_ms=60_000.0,
+        batch_writer_enabled=batch_writer_enabled,
+        writer_batch_size=writer_batch_size,
+        writer_flush_interval_ms=writer_flush_interval_ms,
+        writer_queue_max_size=writer_queue_max_size,
     )
     processor.lifecycle.on_connect()
     queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=4096)
@@ -1636,8 +1744,10 @@ async def run_orderbook_phase41_capture(
             )
             try:
                 queue.put_nowait(envelope)
+                queue_put_end_ns = monotonic_now_ns()
+                envelope.queue_put_end_monotonic_ns = queue_put_end_ns
                 processor.queue_monitor.record_queue_put_duration(
-                    (monotonic_now_ns() - queue_put_ns) / 1_000_000.0,
+                    (queue_put_end_ns - queue_put_ns) / 1_000_000.0,
                     blocked=False,
                 )
             except asyncio.QueueFull:
@@ -1680,6 +1790,7 @@ async def run_orderbook_phase41_capture(
                     envelope.payload,
                     queue_lag_ms=queue_lag_ms,
                     queue_put_monotonic_ns=envelope.enqueue_monotonic_ns,
+                    queue_put_end_monotonic_ns=envelope.queue_put_end_monotonic_ns,
                     queue_dequeue_monotonic_ns=dequeue_ns,
                     queue_size_at_enqueue=envelope.queue_size_at_enqueue,
                 )
@@ -1718,6 +1829,7 @@ async def run_orderbook_phase41_capture(
             pass
         processor.lifecycle.on_disconnect()
         processor.set_capture_active(False)
+        processor.close_writer()
     duration = (monotonic_now_ns() - start_mono) / 1_000_000_000.0
     summary = processor.write_reports(duration_sec=duration)
     _write_json(REPO_ROOT / DEFAULT_PHASE411_REPORT_JSON, summary)
@@ -2028,6 +2140,17 @@ def _duration_ms(start_ns: int | None, end_ns: int | None) -> float | None:
     if start_ns is None or end_ns is None:
         return None
     return (end_ns - start_ns) / 1_000_000.0
+
+
+def _earliest_available_stage(
+    stages: dict[str, int | None],
+    stage_order: tuple[str, ...],
+) -> str | None:
+    for stage in stage_order:
+        value = stages.get(stage)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return stage
+    return None
 
 
 def _percentile(values: list[float], pct: float) -> float:

@@ -104,7 +104,9 @@ class RealtimeMarketEvent(EventModel):
     parse_done_monotonic_ns: int | None = None
     state_updated_monotonic_ns: int | None = None
     socket_recv_monotonic_ns: int | None = None
+    raw_ws_callback_monotonic_ns: int | None = None
     ws_message_received_monotonic_ns: int | None = None
+    message_dispatch_start_monotonic_ns: int | None = None
     parse_start_monotonic_ns: int | None = None
     parse_end_monotonic_ns: int | None = None
     latency_ms: float | None = None
