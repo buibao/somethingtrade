@@ -35,15 +35,19 @@ from app.research.hotpath_environment_latency import (  # noqa: E402
     LATENCY_PROFILE_SAMPLES,
     PHASE42H_CAPTURE_DIAGNOSTICS,
     PHASE42H_CLEANUP_REPORT,
+    PHASE42H_ENVIRONMENT_METADATA,
     PHASE42H_FAIL_AUDIT_BUNDLE,
     PHASE42H_PASS_BUNDLE,
     PHASE42H_TYPECHECK_REPORT,
+    PHASE42H_VPS_PREFLIGHT_REPORT,
+    PHASE42H_VPS_SETUP_REPORT,
     build_environment_metadata,
     classify_phase42h_failure,
     cleanup_phase42h_artifacts,
     create_phase42h_bundle,
     create_phase42h_dataset_zip,
     evaluate_phase42h_report,
+    run_phase42h_vps_preflight,
     run_phase42h_analysis,
     validate_gitignore_rules,
     write_phase42h_artifacts,
@@ -62,6 +66,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--environment-name", default="local")
     parser.add_argument("--environment-region", default="unknown")
     parser.add_argument("--machine-profile", default=None)
+    parser.add_argument("--network-notes", default="")
+    parser.add_argument("--run-mode", default="local_final")
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--skip-preflight", action="store_true")
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--skip-capture", action="store_true")
     parser.add_argument("--allow-fixture-mode", action="store_true")
@@ -90,7 +98,20 @@ def main(argv: list[str] | None = None) -> int:
         environment_name=args.environment_name,
         environment_region=args.environment_region,
         machine_profile=args.machine_profile,
+        network_notes=args.network_notes,
+        run_mode=args.run_mode,
     )
+    _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
+    if args.preflight_only:
+        preflight_report = run_phase42h_vps_preflight(root)
+        _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
+        print(f"Phase 4.2H VPS preflight report: {root / PHASE42H_VPS_PREFLIGHT_REPORT}")
+        if preflight_report.get("passed") is not True:
+            print("Phase 4.2H VPS preflight failed")
+            return 1
+        print("Phase 4.2H VPS preflight passed")
+        return 0
+
     cleanup_report: dict[str, Any] = {
         "cleanup_performed": False,
         "deleted_files": [],
@@ -100,15 +121,21 @@ def main(argv: list[str] | None = None) -> int:
     pytest_output = ""
     typecheck_summary = ""
     gitignore_validation = validate_gitignore_rules(root)
+    preflight_report: dict[str, Any] = {"performed": False, "passed": True, "skipped": True}
+    setup_report_text = _read_text(root / PHASE42H_VPS_SETUP_REPORT)
 
     if args.clean:
         cleanup_report = cleanup_phase42h_artifacts(root)
+        _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
+        if setup_report_text and not (root / PHASE42H_VPS_SETUP_REPORT).exists():
+            _write_text(root / PHASE42H_VPS_SETUP_REPORT, setup_report_text)
         if cleanup_report.get("errors"):
             report = _failure_report(
                 args=args,
                 environment=environment,
                 cleanup_report=cleanup_report,
                 gitignore_validation=gitignore_validation,
+                preflight_report=preflight_report,
                 classification="ARTIFACT_CLEANUP_FAILURE",
                 reason=f"artifact cleanup failed: {cleanup_report.get('errors')}",
             )
@@ -117,6 +144,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     else:
         _write_json(root / PHASE42H_CLEANUP_REPORT, cleanup_report)
+
+    if not args.skip_preflight:
+        preflight_report = run_phase42h_vps_preflight(root)
+        if preflight_report.get("passed") is not True:
+            report = _failure_report(
+                args=args,
+                environment=environment,
+                cleanup_report=cleanup_report,
+                gitignore_validation=gitignore_validation,
+                preflight_report=preflight_report,
+                classification="PREFLIGHT_FAILURE",
+                reason=f"VPS preflight failed: {preflight_report.get('hard_fail_reasons', [])}",
+            )
+            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+            print("Phase 4.2H failed: PREFLIGHT_FAILURE")
+            return 1
 
     pytest_output_path = debug_dir / "phase_4_2h_pytest_output.txt"
     if args.skip_pytest:
@@ -132,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 environment=environment,
                 cleanup_report=cleanup_report,
                 gitignore_validation=gitignore_validation,
+                preflight_report=preflight_report,
                 classification="TEST_FAILURE",
                 reason="pytest failed",
                 pytest_passed=False,
@@ -148,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             environment=environment,
             cleanup_report=cleanup_report,
             gitignore_validation=gitignore_validation,
+            preflight_report=preflight_report,
             classification="TYPECHECK_FAILURE",
             reason=typecheck_summary,
             typecheck_passed=False,
@@ -165,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
             environment=environment,
             cleanup_report=cleanup_report,
             gitignore_validation=gitignore_validation,
+            preflight_report=preflight_report,
             classification="FRESH_CAPTURE_NOT_PERFORMED",
             reason="--skip-capture is only allowed with --allow-fixture-mode in tests",
             pytest_passed=pytest_passed,
@@ -174,12 +220,13 @@ def main(argv: list[str] | None = None) -> int:
         _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
         print("Phase 4.2H failed: FRESH_CAPTURE_NOT_PERFORMED")
         return 1
-    if not args.skip_capture and float(args.duration_sec) < 1800.0:
+    if not args.skip_capture and str(args.run_mode) not in {"vps_smoke", "smoke"} and float(args.duration_sec) < 1800.0:
         report = _failure_report(
             args=args,
             environment=environment,
             cleanup_report=cleanup_report,
             gitignore_validation=gitignore_validation,
+            preflight_report=preflight_report,
             classification="FRESH_CAPTURE_DURATION_FAILURE",
             reason="final fresh capture duration_sec < 1800",
             pytest_passed=pytest_passed,
@@ -212,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
                 environment=environment,
                 cleanup_report=cleanup_report,
                 gitignore_validation=gitignore_validation,
+                preflight_report=preflight_report,
                 classification="FRESH_CAPTURE_NOT_PERFORMED",
                 reason=f"capture or server-time sampling failed: {exc}",
                 pytest_passed=pytest_passed,
@@ -273,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
         typecheck_passed=typecheck_passed,
         typecheck_summary=typecheck_summary,
         fresh_capture_required=not args.skip_capture,
+        preflight_report=preflight_report,
     )
     if capture_code != 0:
         report["hard_fail_reasons"].append(f"multi-feed capture exited {capture_code}")
@@ -665,6 +714,7 @@ def _failure_report(
     environment: dict[str, Any],
     cleanup_report: dict[str, Any],
     gitignore_validation: dict[str, Any],
+    preflight_report: dict[str, Any],
     classification: str,
     reason: str,
     pytest_passed: bool = True,
@@ -705,6 +755,7 @@ def _failure_report(
         "environment": environment,
         "cleanup_report": cleanup_report,
         "gitignore_validation": gitignore_validation,
+        "preflight_report": preflight_report,
         "pytest_passed": pytest_passed,
         "typecheck_passed": typecheck_passed,
         "typecheck_summary": typecheck_summary,
@@ -915,6 +966,19 @@ def _write_json(path: str | Path, payload: Any) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_text(path: str | Path, text: str) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+
+
+def _read_text(path: str | Path) -> str:
+    target = Path(path)
+    if not target.exists():
+        return ""
+    return target.read_text(encoding="utf-8", errors="ignore")
 
 
 def _file_size(path: Path) -> int:

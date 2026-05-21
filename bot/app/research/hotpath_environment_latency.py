@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
+import importlib
 from pathlib import Path
 import json
 import math
+import os
 import platform
 import shutil
+import socket
+import subprocess
+import sys
+import time
 from typing import Any
+import urllib.error
+import urllib.request
 import zipfile
 
 from app.research.clock_sync_receive_lag import (
@@ -71,11 +81,25 @@ PHASE42H_CLOCK_SANITY_REPORT = Path("data/debug/phase_4_2h_clock_sanity_report.j
 PHASE42H_LEAKAGE_CHECK = Path("data/debug/phase_4_2h_leakage_check.json")
 PHASE42H_CAPTURE_DIAGNOSTICS = Path("data/debug/phase_4_2h_multifeed_capture_diagnostics.json")
 PHASE42H_ENVIRONMENT_METADATA = Path("data/debug/phase_4_2h_environment_metadata.json")
+PHASE42H_VPS_PREFLIGHT_REPORT = Path("data/debug/phase_4_2h_vps_preflight_report.json")
+PHASE42H_VPS_SETUP_REPORT = Path("data/debug/phase_4_2h_vps_setup_report.txt")
 PHASE42H_TYPECHECK_REPORT = Path("data/debug/phase_4_2h_typecheck_report.txt")
 PHASE42H_PYTEST_OUTPUT = Path("data/debug/phase_4_2h_pytest_output.txt")
 PHASE42H_INVESTIGATION = Path("data/debug/phase42h_failure_investigation.md")
 PHASE42H_PASS_BUNDLE = Path("phase_4_2h_hotpath_environment_latency_bundle.zip")
 PHASE42H_FAIL_AUDIT_BUNDLE = Path("phase_4_2h_hotpath_environment_latency_fail_audit_bundle.zip")
+
+BINANCE_SERVER_TIME_URL = "https://api.binance.com/api/v3/time"
+BINANCE_WS_HOST = "stream.binance.com"
+BINANCE_WS_PORT = 9443
+MIN_PHASE42H_PYTHON = (3, 12)
+PHASE42H_PREFLIGHT_REQUIRED_IMPORTS = (
+    "aiohttp",
+    "pydantic",
+    "websockets",
+    "app.marketdata.orderbook_phase41",
+    "app.research.hotpath_environment_latency",
+)
 
 REQUIRED_STAGE_NAMES = (
     "socket_recv_monotonic_ns",
@@ -164,6 +188,8 @@ PHASE42H_REQUIRED_BUNDLE_FILES = (
     "data/debug/phase_4_2h_leakage_check.json",
     "data/debug/phase_4_2h_multifeed_capture_diagnostics.json",
     "data/debug/phase_4_2h_environment_metadata.json",
+    "data/debug/phase_4_2h_vps_preflight_report.json",
+    "data/debug/phase_4_2h_vps_setup_report.txt",
     "data/debug/phase_4_2h_typecheck_report.txt",
     "data/debug/phase_4_2h_pytest_output.txt",
 )
@@ -221,16 +247,131 @@ def build_environment_metadata(
     environment_region: str,
     machine_profile: str | None,
     network_notes: str = "",
+    run_mode: str = "local",
+    provider: str = "DigitalOcean",
 ) -> dict[str, Any]:
+    hostname = socket.gethostname()
     return {
+        "provider": provider,
         "name": environment_name,
         "region": environment_region,
         "machine_profile": machine_profile or platform.platform(),
-        "python_version": platform.python_version(),
-        "os": platform.platform(),
         "network_notes": network_notes,
+        "os": platform.platform(),
+        "kernel": platform.release(),
+        "python_version": platform.python_version(),
+        "cpu_model": _cpu_model(),
+        "cpu_count": os.cpu_count() or 0,
+        "memory_total_mb": _memory_total_mb(),
+        "timezone": _timezone_name(),
+        "hostname_hash": hashlib.sha256(hostname.encode("utf-8")).hexdigest()[:16],
+        "run_mode": run_mode,
         "schema_version": "phase_4_2h_environment_metadata_v1",
     }
+
+
+def run_phase42h_vps_preflight(
+    root: str | Path,
+    *,
+    required_imports: tuple[str, ...] = PHASE42H_PREFLIGHT_REQUIRED_IMPORTS,
+    binance_time_url: str = BINANCE_SERVER_TIME_URL,
+    websocket_host: str = BINANCE_WS_HOST,
+    websocket_port: int = BINANCE_WS_PORT,
+    check_network: bool = True,
+) -> dict[str, Any]:
+    root_path = Path(root).resolve()
+    checks: dict[str, dict[str, Any]] = {}
+    hard_fail_reasons: list[str] = []
+
+    def record(name: str, passed: bool, **details: Any) -> None:
+        checks[name] = {"passed": passed, **details}
+        if not passed:
+            message = str(details.get("message") or name)
+            hard_fail_reasons.append(message)
+
+    python_version = {
+        "version": platform.python_version(),
+        "executable": sys.executable,
+        "minimum_required": ".".join(str(part) for part in MIN_PHASE42H_PYTHON),
+    }
+    python_ok = sys.version_info[:2] >= MIN_PHASE42H_PYTHON
+    record(
+        "python_version",
+        python_ok,
+        **python_version,
+        message="" if python_ok else f"Python {python_version['minimum_required']}+ is required",
+    )
+
+    import_results: dict[str, str] = {}
+    imports_ok = True
+    for module_name in required_imports:
+        try:
+            importlib.import_module(module_name)
+            import_results[module_name] = "ok"
+        except Exception as exc:  # pragma: no cover - exact import errors vary by host
+            imports_ok = False
+            import_results[module_name] = f"{type(exc).__name__}: {exc}"
+    record("required_imports", imports_ok, imports=import_results, message="" if imports_ok else "required import failed")
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    record("current_utc_time", True, utc_time=now_utc)
+
+    if check_network:
+        rest_result = _check_binance_rest_time(binance_time_url)
+        record(
+            "binance_rest_time",
+            rest_result["passed"],
+            **_without_passed(rest_result),
+            message="" if rest_result["passed"] else "Binance REST /api/v3/time unreachable",
+        )
+        websocket_result = _check_tcp_connect(websocket_host, websocket_port)
+        record(
+            "binance_websocket_connect",
+            websocket_result["passed"],
+            **_without_passed(websocket_result),
+            message="" if websocket_result["passed"] else "Binance websocket host could not be resolved/connected",
+        )
+    else:
+        record("binance_rest_time", True, skipped=True, reason="network checks disabled")
+        record("binance_websocket_connect", True, skipped=True, reason="network checks disabled")
+
+    writable_result = _check_data_directories_writable(root_path)
+    record(
+        "data_directories_writable",
+        writable_result["passed"],
+        **_without_passed(writable_result),
+        message="" if writable_result["passed"] else "one or more data directories are not writable",
+    )
+
+    gitignore_validation = validate_gitignore_rules(root_path)
+    gitignore_present = (root_path / ".gitignore").exists()
+    gitignore_ok = gitignore_present and gitignore_validation.get("passed") is True
+    record(
+        "gitignore_status",
+        gitignore_ok,
+        present=gitignore_present,
+        validation=gitignore_validation,
+        message="" if gitignore_ok else ".gitignore missing generated artifact rules",
+    )
+
+    git_result = _check_no_heavy_git_artifacts(root_path)
+    record(
+        "heavy_generated_artifacts_not_tracked_or_staged",
+        git_result["passed"],
+        **_without_passed(git_result),
+        message="" if git_result["passed"] else "generated heavy artifacts are tracked or staged",
+    )
+
+    report = {
+        "schema_version": "phase_4_2h_vps_preflight_v1",
+        "phase": PHASE,
+        "generated_at_utc": now_utc,
+        "passed": all(check.get("passed") is True for check in checks.values()),
+        "checks": checks,
+        "hard_fail_reasons": [reason for reason in hard_fail_reasons if reason],
+    }
+    _write_json(root_path / PHASE42H_VPS_PREFLIGHT_REPORT, report)
+    return report
 
 
 def run_phase42h_analysis(
@@ -254,6 +395,7 @@ def run_phase42h_analysis(
     typecheck_passed: bool = True,
     typecheck_summary: str = "",
     fresh_capture_required: bool = True,
+    preflight_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root_path = Path(root)
     clean_path = _resolve(root_path, clean_samples_path)
@@ -325,6 +467,7 @@ def run_phase42h_analysis(
         typecheck_passed=typecheck_passed,
         typecheck_summary=typecheck_summary,
         fresh_capture_required=fresh_capture_required,
+        preflight_report=preflight_report,
         labeled_sample_count=len(corrected_rows),
     )
     if clean_validation.failure_classification:
@@ -357,6 +500,7 @@ def build_phase42h_report(
     typecheck_summary: str,
     fresh_capture_required: bool,
     labeled_sample_count: int,
+    preflight_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     protocol_summary = build_protocol_summary(
         {
@@ -422,6 +566,7 @@ def build_phase42h_report(
         "pytest_passed": pytest_passed,
         "typecheck_passed": typecheck_passed,
         "typecheck_summary": typecheck_summary,
+        "preflight_report": preflight_report or {"performed": False, "passed": True, "skipped": True},
         "timestamp_schema": timestamp_schema,
         "clock_offset_samples": clock_offset_samples,
         "clock_offset_summary": clock_offset_summary,
@@ -713,6 +858,9 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
         add("pytest failed", "TEST_FAILURE", implementation=True)
     if evaluated.get("typecheck_passed") is not True:
         add("typecheck/compileall failed", "TYPECHECK_FAILURE", implementation=True)
+    preflight = _dict(evaluated.get("preflight_report"))
+    if preflight and preflight.get("passed") is not True:
+        add("VPS preflight failed", "PREFLIGHT_FAILURE", implementation=True)
     if _dict(evaluated.get("gitignore_validation")).get("passed") is not True:
         add("generated artifact .gitignore rules missing", "GITIGNORE_POLICY_FAILURE", implementation=True)
     cleanup = _dict(evaluated.get("cleanup_report"))
@@ -720,10 +868,12 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
         add("artifact cleanup was not performed", "ARTIFACT_CLEANUP_FAILURE", implementation=True)
     if cleanup.get("errors"):
         add("artifact cleanup failed", "ARTIFACT_CLEANUP_FAILURE", implementation=True)
+    run_mode = str(_dict(evaluated.get("environment")).get("run_mode") or "")
+    final_duration_required = run_mode not in {"vps_smoke", "smoke"}
     if evaluated.get("fresh_capture_required") is True:
         if evaluated.get("fresh_capture_performed") is not True or evaluated.get("fixture_mode") is True or evaluated.get("skip_capture") is True:
             add("fresh 30-minute capture was not performed", "FRESH_CAPTURE_NOT_PERFORMED")
-        if _num(evaluated.get("duration_sec")) < 1800:
+        if final_duration_required and _num(evaluated.get("duration_sec")) < 1800:
             add("fresh capture duration_sec < 1800", "FRESH_CAPTURE_DURATION_FAILURE")
     if evaluated.get("max_future_gap_ms") != REQUIRED_100MS_MAX_FUTURE_GAP_MS:
         add("max_future_gap_ms was relaxed", "HORIZON_100MS_POLICY_RELAXED", implementation=True)
@@ -873,6 +1023,14 @@ def write_phase42h_artifacts(
     _write_json(root_path / PHASE42H_LEAKAGE_CHECK, report.get("leakage_check", {}))
     _write_json(root_path / PHASE42H_CAPTURE_DIAGNOSTICS, _dict(_dict(report.get("capture")).get("capture_diagnostics")))
     _write_json(root_path / PHASE42H_ENVIRONMENT_METADATA, report.get("environment", {}))
+    preflight_path = root_path / PHASE42H_VPS_PREFLIGHT_REPORT
+    if isinstance(report.get("preflight_report"), dict):
+        _write_json(preflight_path, report.get("preflight_report", {}))
+    elif not preflight_path.exists():
+        _write_json(preflight_path, {"performed": False, "passed": False, "skipped": True})
+    setup_path = root_path / PHASE42H_VPS_SETUP_REPORT
+    if not setup_path.exists():
+        _write_text(setup_path, "VPS setup report not present. Run scripts/setup_phase42h_vps_ubuntu.sh on the VPS before benchmark.\n")
     _write_text(root_path / PHASE42H_PYTEST_OUTPUT, pytest_output)
     typecheck_path = root_path / PHASE42H_TYPECHECK_REPORT
     if not typecheck_path.exists():
@@ -911,6 +1069,8 @@ def render_phase42h_markdown(report: dict[str, Any]) -> str:
     latency = _dict(report.get("hot_path_latency_summary"))
     queue = _dict(report.get("queue_backpressure_summary"))
     writer = _dict(report.get("writer_batch_report"))
+    environment = _dict(report.get("environment"))
+    preflight = _dict(report.get("preflight_report"))
     receive_lag = _dict(_dict(_dict(report.get("sources")).get("depth_mid")).get("corrected_receive_lag"))
     hybrid = _dict(_dict(_dict(_dict(report.get("sources")).get("depth_mid")).get("corrected_hybrid")).get("corrected_hybrid_100ms"))
     lines = [
@@ -926,6 +1086,15 @@ def render_phase42h_markdown(report: dict[str, Any]) -> str:
         f"- Low latency ready: `{report.get('low_latency_ready')}`",
         f"- Phase 5 ready: `{report.get('phase5_ready')}`",
         f"- Decision reason: `{report.get('readiness_decision_reason')}`",
+        "",
+        "## Environment",
+        "",
+        f"- Provider: `{environment.get('provider')}`",
+        f"- Name: `{environment.get('name')}`",
+        f"- Region: `{environment.get('region')}`",
+        f"- Machine profile: `{environment.get('machine_profile')}`",
+        f"- Run mode: `{environment.get('run_mode')}`",
+        f"- Preflight passed: `{preflight.get('passed')}`",
         "",
         "## Hot Path",
         "",
@@ -1054,6 +1223,7 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
         "ARTIFACT_CLEANUP_FAILURE",
         "TEST_FAILURE",
         "TYPECHECK_FAILURE",
+        "PREFLIGHT_FAILURE",
         "GITIGNORE_POLICY_FAILURE",
         "FRESH_CAPTURE_NOT_PERFORMED",
         "FRESH_CAPTURE_DURATION_FAILURE",
@@ -1081,6 +1251,176 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
         if classification in classifications:
             return classification
     return "UNKNOWN_PHASE42H_FAILURE"
+
+
+def _cpu_model() -> str:
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    return platform.processor() or platform.machine() or "unknown"
+
+
+def _memory_total_mb() -> int:
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        return int(int(parts[1]) / 1024)
+                    except ValueError:
+                        return 0
+    sysconf = getattr(os, "sysconf", None)
+    if callable(sysconf):
+        try:
+            page_size = int(sysconf("SC_PAGE_SIZE"))
+            page_count = int(sysconf("SC_PHYS_PAGES"))
+        except (OSError, TypeError, ValueError):
+            return 0
+        return int((page_size * page_count) / (1024 * 1024))
+    return 0
+
+
+def _timezone_name() -> str:
+    local = datetime.now().astimezone()
+    return local.tzname() or time.tzname[0] or "unknown"
+
+
+def _check_binance_rest_time(url: str) -> dict[str, Any]:
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            body = response.read()
+            status_code = response.getcode()
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        payload = json.loads(body.decode("utf-8"))
+        server_time = payload.get("serverTime") if isinstance(payload, dict) else None
+        passed = status_code == 200 and isinstance(server_time, (int, float)) and not isinstance(server_time, bool)
+        return {
+            "passed": passed,
+            "url": url,
+            "http_status": status_code,
+            "elapsed_ms": elapsed_ms,
+            "server_time_ms": server_time,
+        }
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+        return {
+            "passed": False,
+            "url": url,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _check_tcp_connect(host: str, port: int) -> dict[str, Any]:
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return {
+            "passed": False,
+            "host": host,
+            "port": port,
+            "resolved_address_count": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    start = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=10):
+            pass
+    except OSError as exc:
+        return {
+            "passed": False,
+            "host": host,
+            "port": port,
+            "resolved_address_count": len(addresses),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "passed": True,
+        "host": host,
+        "port": port,
+        "resolved_address_count": len(addresses),
+        "elapsed_ms": (time.monotonic() - start) * 1000.0,
+    }
+
+
+def _check_data_directories_writable(root: Path) -> dict[str, Any]:
+    directories = (
+        Path("data"),
+        Path("data/dataset"),
+        Path("data/reports"),
+        Path("data/debug"),
+        Path("data/cache"),
+        Path("data/logs"),
+    )
+    results: dict[str, dict[str, Any]] = {}
+    passed = True
+    for relative in directories:
+        directory = root / relative
+        display = _display_path(relative)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if not directory.is_dir():
+                raise NotADirectoryError(str(directory))
+            probe = directory / ".phase42h_write_test"
+            probe.write_text("ok\n", encoding="utf-8")
+            probe.unlink()
+            results[display] = {"passed": True}
+        except OSError as exc:
+            passed = False
+            results[display] = {"passed": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"passed": passed, "directories": results}
+
+
+def _check_no_heavy_git_artifacts(root: Path) -> dict[str, Any]:
+    if shutil.which("git") is None:
+        return {"passed": True, "git_available": False, "inside_work_tree": False, "tracked": [], "staged": []}
+    inside = _run_git(root, "rev-parse", "--is-inside-work-tree")
+    if inside["returncode"] != 0 or inside["stdout"].strip().lower() != "true":
+        return {"passed": True, "git_available": True, "inside_work_tree": False, "tracked": [], "staged": []}
+    tracked = [path for path in _run_git(root, "ls-files")["stdout"].splitlines() if _is_heavy_generated_artifact(path)]
+    staged = [path for path in _run_git(root, "diff", "--name-only", "--cached")["stdout"].splitlines() if _is_heavy_generated_artifact(path)]
+    return {
+        "passed": not tracked and not staged,
+        "git_available": True,
+        "inside_work_tree": True,
+        "tracked": sorted(tracked),
+        "staged": sorted(staged),
+    }
+
+
+def _run_git(root: Path, *args: str) -> dict[str, Any]:
+    try:
+        process = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"returncode": 1, "stdout": "", "stderr": f"{type(exc).__name__}: {exc}"}
+    return {"returncode": process.returncode, "stdout": process.stdout, "stderr": process.stderr}
+
+
+def _is_heavy_generated_artifact(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    generated_prefixes = (
+        "data/dataset/",
+        "data/debug/",
+        "data/cache/",
+        "data/logs/",
+        "data/reports/",
+        "logs/",
+        "reports/",
+        "debug/",
+        "cache/",
+    )
+    generated_suffixes = (".jsonl", ".zip", ".log")
+    return normalized.startswith(generated_prefixes) or normalized.endswith(generated_suffixes)
 
 
 def _select_strict_100ms_candidate(
@@ -1241,6 +1581,10 @@ def _num(value: Any) -> float:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _without_passed(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key != "passed"}
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
