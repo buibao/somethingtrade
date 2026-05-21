@@ -39,6 +39,7 @@ DEFAULT_SEQUENCE_RECOVERY_TRACE = Path("data/debug/sequence_recovery_trace.jsonl
 DEFAULT_CLEAN_SAMPLE_SCHEMA_VIOLATION_CASES = Path("data/debug/clean_sample_schema_violation_cases.jsonl")
 DEFAULT_WS_LIFECYCLE_REPORT = Path("data/debug/ws_lifecycle_report.json")
 DEFAULT_ORDERBOOK_CLEAN_SAMPLES = Path("data/dataset/orderbook_clean_samples.jsonl")
+DEFAULT_LATENCY_PROFILE_SAMPLES = Path("data/dataset/phase_4_2fg_latency_profile_samples.jsonl")
 DEFAULT_ORDERBOOK_MARKDOWN_REPORT = Path("docs/reports/phase_4_1_orderbook_quality_report.md")
 DEFAULT_PHASE411_REPORT_JSON = Path("data/reports/phase_4_1_orderbook_quality_report.json")
 DEFAULT_PHASE411_REPORT_MD = Path("data/reports/phase_4_1_orderbook_quality_report.md")
@@ -62,6 +63,7 @@ class OrderbookPhase41Paths:
     clean_sample_schema_violation_cases: Path = REPO_ROOT / DEFAULT_CLEAN_SAMPLE_SCHEMA_VIOLATION_CASES
     lifecycle_report: Path = REPO_ROOT / DEFAULT_WS_LIFECYCLE_REPORT
     clean_samples: Path = REPO_ROOT / DEFAULT_ORDERBOOK_CLEAN_SAMPLES
+    latency_profile_samples: Path = REPO_ROOT / DEFAULT_LATENCY_PROFILE_SAMPLES
     markdown_report: Path = REPO_ROOT / DEFAULT_ORDERBOOK_MARKDOWN_REPORT
 
 
@@ -139,6 +141,7 @@ class OrderbookDebugRecorder:
             self.paths.sequence_recovery_trace,
             self.paths.clean_sample_schema_violation_cases,
             self.paths.clean_samples,
+            self.paths.latency_profile_samples,
         ):
             _ensure_file(path, reset=reset_files)
 
@@ -328,8 +331,14 @@ class OrderbookDebugRecorder:
     def record_clean_sample(
         self,
         sample: dict[str, Any],
-    ) -> None:
+    ) -> tuple[int, int]:
+        file_write_start_ns = monotonic_now_ns()
         _append_jsonl(self.paths.clean_samples, sample)
+        file_write_end_ns = monotonic_now_ns()
+        return file_write_start_ns, file_write_end_ns
+
+    def record_latency_profile_sample(self, row: dict[str, Any]) -> None:
+        _append_jsonl(self.paths.latency_profile_samples, row)
 
     def record_clean_sample_schema_violation_case(
         self,
@@ -468,6 +477,9 @@ class OrderbookPhase41Processor:
         *,
         raw_message_excerpt: str | None = None,
         queue_lag_ms: float | None = None,
+        queue_put_monotonic_ns: int | None = None,
+        queue_dequeue_monotonic_ns: int | None = None,
+        queue_size_at_enqueue: int | None = None,
     ) -> OrderbookApplyResult:
         self.counters["messages_received"] += 1
         self.counters["messages_parsed"] += 1
@@ -493,6 +505,7 @@ class OrderbookPhase41Processor:
             if queue_lag_ms is not None
             else 0
         )
+        book_apply_start_ns = self.monotonic_clock()
         result = state.apply_delta(
             first_update_id=event.first_update_id,
             final_update_id=event.final_update_id,
@@ -501,6 +514,7 @@ class OrderbookPhase41Processor:
             asks=[(level.price, level.size) for level in event.asks],
             local_recv_monotonic_ns=recv_monotonic_ns,
         )
+        book_apply_end_ns = self.monotonic_clock()
         if result.accepted:
             self.counters["deltas_accepted"] += 1
             self._close_stale_period(event.symbol, now_monotonic_ns=recv_monotonic_ns)
@@ -517,6 +531,13 @@ class OrderbookPhase41Processor:
                 snapshot,
                 quality,
                 exchange_event_ts=event.exchange_event_ts,
+                event=event,
+                book_apply_start_monotonic_ns=book_apply_start_ns,
+                book_apply_end_monotonic_ns=book_apply_end_ns,
+                queue_put_monotonic_ns=queue_put_monotonic_ns,
+                queue_dequeue_monotonic_ns=queue_dequeue_monotonic_ns,
+                queue_wait_ms=queue_lag_ms,
+                queue_size_at_enqueue=queue_size_at_enqueue,
             )
         else:
             self.counters["deltas_rejected"] += 1
@@ -1038,6 +1059,11 @@ class OrderbookPhase41Processor:
             "queue_lag_p50_ms": queue_report["enqueue_to_dequeue_lag_p50_ms"],
             "queue_lag_p95_ms": queue_report["enqueue_to_dequeue_lag_p95_ms"],
             "queue_lag_p99_ms": queue_report["enqueue_to_dequeue_lag_p99_ms"],
+            "queue_depth_p50": queue_report["queue_depth_p50"],
+            "queue_depth_p95": queue_report["queue_depth_p95"],
+            "queue_depth_p99": queue_report["queue_depth_p99"],
+            "queue_put_block_count": queue_report["queue_put_block_count"],
+            "queue_put_block_p95_ms": queue_report["queue_put_block_p95_ms"],
             "processing_lag_p50_ms": queue_report["processing_lag_p50_ms"],
             "processing_lag_p95_ms": queue_report["processing_lag_p95_ms"],
             "processing_lag_p99_ms": queue_report["processing_lag_p99_ms"],
@@ -1082,6 +1108,13 @@ class OrderbookPhase41Processor:
         quality: OrderbookQualityResult,
         *,
         exchange_event_ts: int | None,
+        event: DepthUpdate,
+        book_apply_start_monotonic_ns: int,
+        book_apply_end_monotonic_ns: int,
+        queue_put_monotonic_ns: int | None,
+        queue_dequeue_monotonic_ns: int | None,
+        queue_wait_ms: float | None,
+        queue_size_at_enqueue: int | None,
     ) -> None:
         strict = quality.strict_mismatch_details
         tolerant = quality.tolerant_mismatch_details
@@ -1112,12 +1145,14 @@ class OrderbookPhase41Processor:
                 )
             return
 
+        sample_build_start_ns = self.monotonic_clock()
         sample = clean_sample_from_snapshot(
             snapshot,
             quality,
             depth_n=self.depth_n,
             exchange_event_ts=exchange_event_ts,
         )
+        sample_build_end_ns = self.monotonic_clock()
         violations = validate_clean_sample_schema(sample)
         if violations:
             self.counters["samples_blocked"] += 1
@@ -1138,7 +1173,25 @@ class OrderbookPhase41Processor:
                 }
             )
             return
-        self.debug.record_clean_sample(sample)
+        sample_emit_ns = self.monotonic_clock()
+        file_write_start_ns, file_write_end_ns = self.debug.record_clean_sample(sample)
+        self.debug.record_latency_profile_sample(
+            build_latency_profile_sample(
+                event=event,
+                snapshot=snapshot,
+                book_apply_start_monotonic_ns=book_apply_start_monotonic_ns,
+                book_apply_end_monotonic_ns=book_apply_end_monotonic_ns,
+                sample_build_start_monotonic_ns=sample_build_start_ns,
+                sample_build_end_monotonic_ns=sample_build_end_ns,
+                sample_emit_monotonic_ns=sample_emit_ns,
+                queue_put_monotonic_ns=queue_put_monotonic_ns,
+                queue_dequeue_monotonic_ns=queue_dequeue_monotonic_ns,
+                queue_wait_ms=queue_wait_ms,
+                queue_size_at_enqueue=queue_size_at_enqueue,
+                file_write_start_monotonic_ns=file_write_start_ns,
+                file_write_end_monotonic_ns=file_write_end_ns,
+            )
+        )
         self.counters["samples_emitted"] += 1
 
 
@@ -1264,6 +1317,82 @@ def clean_sample_from_snapshot(
             "warnings": list(quality.warnings),
         },
         "lifecycle": quality.lifecycle_flags,
+    }
+
+
+def build_latency_profile_sample(
+    *,
+    event: DepthUpdate,
+    snapshot: OrderbookSnapshot,
+    book_apply_start_monotonic_ns: int,
+    book_apply_end_monotonic_ns: int,
+    sample_build_start_monotonic_ns: int,
+    sample_build_end_monotonic_ns: int,
+    sample_emit_monotonic_ns: int,
+    queue_put_monotonic_ns: int | None,
+    queue_dequeue_monotonic_ns: int | None,
+    queue_wait_ms: float | None,
+    queue_size_at_enqueue: int | None,
+    file_write_start_monotonic_ns: int,
+    file_write_end_monotonic_ns: int,
+) -> dict[str, Any]:
+    ws_message_received_ns = event.ws_message_received_monotonic_ns or event.recv_monotonic_ns
+    parse_start_ns = event.parse_start_monotonic_ns
+    parse_end_ns = event.parse_end_monotonic_ns or event.parse_done_monotonic_ns
+    stages: dict[str, int | None] = {
+        "socket_recv_monotonic_ns": event.socket_recv_monotonic_ns,
+        "ws_message_received_monotonic_ns": ws_message_received_ns,
+        "parse_start_monotonic_ns": parse_start_ns,
+        "parse_end_monotonic_ns": parse_end_ns,
+        "book_apply_start_monotonic_ns": book_apply_start_monotonic_ns,
+        "book_apply_end_monotonic_ns": book_apply_end_monotonic_ns,
+        "sample_build_start_monotonic_ns": sample_build_start_monotonic_ns,
+        "sample_emit_monotonic_ns": sample_emit_monotonic_ns,
+        "queue_put_monotonic_ns": queue_put_monotonic_ns,
+        "writer_enqueue_monotonic_ns": None,
+        "file_write_start_monotonic_ns": file_write_start_monotonic_ns,
+        "file_write_end_monotonic_ns": file_write_end_monotonic_ns,
+    }
+    metrics = {
+        "socket_to_parse_start_ms": _duration_ms(event.socket_recv_monotonic_ns, parse_start_ns),
+        "parse_duration_ms": _duration_ms(parse_start_ns, parse_end_ns),
+        "parse_to_apply_start_ms": _duration_ms(parse_end_ns, book_apply_start_monotonic_ns),
+        "book_apply_duration_ms": _duration_ms(book_apply_start_monotonic_ns, book_apply_end_monotonic_ns),
+        "apply_to_sample_emit_ms": _duration_ms(book_apply_end_monotonic_ns, sample_emit_monotonic_ns),
+        "sample_emit_to_queue_put_ms": None,
+        "queue_wait_ms": queue_wait_ms
+        if queue_wait_ms is not None
+        else _duration_ms(queue_put_monotonic_ns, queue_dequeue_monotonic_ns),
+        "writer_wait_ms": None,
+        "file_write_duration_ms": _duration_ms(file_write_start_monotonic_ns, file_write_end_monotonic_ns),
+        "end_to_end_local_hot_path_ms": _duration_ms(
+            event.socket_recv_monotonic_ns or ws_message_received_ns,
+            file_write_end_monotonic_ns,
+        ),
+    }
+    return {
+        "schema_version": "phase_4_2fg_latency_profile_sample_v1",
+        "symbol": snapshot.symbol,
+        "source": "binance_ws",
+        "event_type": "depthUpdate",
+        "generation_id": snapshot.generation_id,
+        "state_version": snapshot.state_version,
+        "snapshot_version": snapshot.snapshot_version,
+        "last_update_id": snapshot.last_update_id,
+        "first_update_id": event.first_update_id,
+        "final_update_id": event.final_update_id,
+        "exchange_event_ts": event.exchange_event_ts,
+        "local_recv_monotonic_ns": snapshot.local_recv_monotonic_ns,
+        "stages": stages,
+        "metrics": metrics,
+        "stage_not_available": [
+            name for name, value in stages.items() if value is None
+        ],
+        "queue_size_at_enqueue": queue_size_at_enqueue,
+        "queue_dequeue_monotonic_ns": queue_dequeue_monotonic_ns,
+        "disk_write_on_hot_path": True,
+        "debug_logging_on_hot_path": True,
+        "batch_writer_enabled": False,
     }
 
 
@@ -1499,13 +1628,18 @@ async def run_orderbook_phase41_capture(
                 return
             if not isinstance(event, DepthUpdate):
                 continue
+            queue_put_ns = monotonic_now_ns()
             envelope = processor.queue_monitor.record_enqueue(
                 event,
-                enqueue_monotonic_ns=event.recv_monotonic_ns or monotonic_now_ns(),
+                enqueue_monotonic_ns=queue_put_ns,
                 queue_size=queue.qsize() + 1,
             )
             try:
                 queue.put_nowait(envelope)
+                processor.queue_monitor.record_queue_put_duration(
+                    (monotonic_now_ns() - queue_put_ns) / 1_000_000.0,
+                    blocked=False,
+                )
             except asyncio.QueueFull:
                 processor.queue_monitor.record_drop()
                 processor.lifecycle.on_queue_dropped()
@@ -1545,6 +1679,9 @@ async def run_orderbook_phase41_capture(
                 result = processor.process_depth_update(
                     envelope.payload,
                     queue_lag_ms=queue_lag_ms,
+                    queue_put_monotonic_ns=envelope.enqueue_monotonic_ns,
+                    queue_dequeue_monotonic_ns=dequeue_ns,
+                    queue_size_at_enqueue=envelope.queue_size_at_enqueue,
                 )
                 processing_done_ns = monotonic_now_ns()
                 processor.queue_monitor.record_processing_done(
@@ -1885,6 +2022,12 @@ def _numeric_value(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _duration_ms(start_ns: int | None, end_ns: int | None) -> float | None:
+    if start_ns is None or end_ns is None:
+        return None
+    return (end_ns - start_ns) / 1_000_000.0
 
 
 def _percentile(values: list[float], pct: float) -> float:

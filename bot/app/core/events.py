@@ -103,6 +103,10 @@ class RealtimeMarketEvent(EventModel):
     recv_monotonic_ns: int | None = None
     parse_done_monotonic_ns: int | None = None
     state_updated_monotonic_ns: int | None = None
+    socket_recv_monotonic_ns: int | None = None
+    ws_message_received_monotonic_ns: int | None = None
+    parse_start_monotonic_ns: int | None = None
+    parse_end_monotonic_ns: int | None = None
     latency_ms: float | None = None
     exchange_ts_ns: int | None = None
     sequence: int | None = None

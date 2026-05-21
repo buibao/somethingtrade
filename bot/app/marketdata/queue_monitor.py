@@ -43,6 +43,9 @@ class QueueBackpressureMonitor:
         self._processing_lag_samples: deque[float] = deque(maxlen=sample_capacity)
         self._snapshot_request_duration_samples: deque[float] = deque(maxlen=sample_capacity)
         self._snapshot_apply_duration_samples: deque[float] = deque(maxlen=sample_capacity)
+        self._queue_depth_samples: deque[int] = deque(maxlen=sample_capacity)
+        self._queue_put_block_samples: deque[float] = deque(maxlen=sample_capacity)
+        self.queue_put_block_count = 0
 
     def record_enqueue(
         self,
@@ -53,6 +56,7 @@ class QueueBackpressureMonitor:
     ) -> QueueEnvelope:
         self.queue_current_size = queue_size
         self.queue_max_size = max(self.queue_max_size, queue_size)
+        self._queue_depth_samples.append(queue_size)
         if self._is_backpressured(queue_size):
             self.queue_size_backpressure_events += 1
             self._refresh_backpressure_total()
@@ -118,6 +122,11 @@ class QueueBackpressureMonitor:
     def record_snapshot_apply_duration(self, duration_ms: float) -> None:
         self._snapshot_apply_duration_samples.append(duration_ms)
 
+    def record_queue_put_duration(self, duration_ms: float, *, blocked: bool = False) -> None:
+        self._queue_put_block_samples.append(max(0.0, duration_ms))
+        if blocked:
+            self.queue_put_block_count += 1
+
     def record_snapshot_blocking_lag(self, count: int = 1) -> None:
         self.snapshot_blocking_lag_events += count
         self._refresh_backpressure_total()
@@ -132,6 +141,8 @@ class QueueBackpressureMonitor:
         processing_samples = sorted(self._processing_lag_samples)
         snapshot_request_samples = sorted(self._snapshot_request_duration_samples)
         snapshot_apply_samples = sorted(self._snapshot_apply_duration_samples)
+        queue_depth_samples = sorted(float(value) for value in self._queue_depth_samples)
+        queue_put_block_samples = sorted(self._queue_put_block_samples)
         self._refresh_backpressure_total()
         return {
             "queue_current_size": self.queue_current_size,
@@ -143,6 +154,13 @@ class QueueBackpressureMonitor:
             "queue_lag_backpressure_events": self.queue_lag_backpressure_events,
             "processing_lag_backpressure_events": self.processing_lag_backpressure_events,
             "snapshot_blocking_lag_events": self.snapshot_blocking_lag_events,
+            "queue_depth_p50": _percentile(queue_depth_samples, 0.50),
+            "queue_depth_p95": _percentile(queue_depth_samples, 0.95),
+            "queue_depth_p99": _percentile(queue_depth_samples, 0.99),
+            "queue_put_block_count": self.queue_put_block_count,
+            "queue_put_block_p50_ms": _percentile(queue_put_block_samples, 0.50),
+            "queue_put_block_p95_ms": _percentile(queue_put_block_samples, 0.95),
+            "queue_put_block_p99_ms": _percentile(queue_put_block_samples, 0.99),
             "enqueue_to_dequeue_lag_ms_max": self.enqueue_to_dequeue_lag_ms_max,
             "enqueue_to_dequeue_lag_ms_p50": _percentile(samples, 0.50),
             "enqueue_to_dequeue_lag_ms_p95": _percentile(samples, 0.95),
