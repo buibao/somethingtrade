@@ -24,3 +24,17 @@ phase4_final_report_artifacts.zip
 /data/debug/*.jsonl
 /logs/
 /reports/
+
+# Phase runtime artifacts and benchmark outputs
+*.jsonl
+data/dataset/
+data/debug/
+data/cache/
+data/logs/
+data/reports/
+logs/
+reports/
+debug/
+cache/
+*.zip
+*.log
