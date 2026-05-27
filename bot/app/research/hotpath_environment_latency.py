@@ -19,9 +19,7 @@ import urllib.request
 import zipfile
 
 from app.research.clock_sync_receive_lag import (
-    ARTIFACT_DIRECTORIES,
     MAX_CLOCK_OFFSET_DRIFT_MS,
-    OLD_BUNDLE_PATTERNS,
     SERVER_TIME_RTT_HARD_FAIL_MS,
     SERVER_TIME_RTT_WARNING_MS,
     build_clock_sanity_report,
@@ -56,6 +54,7 @@ from app.research.time_protocol_benchmark import (
 
 
 PHASE = "4.2H"
+REPO_ROOT = Path(__file__).resolve().parents[3]
 STRICT_LAG_P95_MS = 100.0
 STRICT_LAG_P99_MS = 200.0
 QUEUE_DEPTH_NEAR_CAPACITY_RATIO = 0.80
@@ -87,6 +86,51 @@ PHASE42H_PYTEST_OUTPUT = Path("data/debug/phase_4_2h_pytest_output.txt")
 PHASE42H_INVESTIGATION = Path("data/debug/phase42h_failure_investigation.md")
 PHASE42H_PASS_BUNDLE = Path("phase_4_2h_hotpath_environment_latency_bundle.zip")
 PHASE42H_FAIL_AUDIT_BUNDLE = Path("phase_4_2h_hotpath_environment_latency_fail_audit_bundle.zip")
+
+PHASE42H_GENERATED_RELATIVE_FILES = (
+    "data/dataset/orderbook_clean_samples.jsonl",
+    "data/dataset/bookticker_reference_quotes.jsonl",
+    "data/dataset/trade_reference_events.jsonl",
+    "data/dataset/aggtrade_reference_events.jsonl",
+    "data/dataset/orderbook_reference_benchmark_labels.jsonl",
+    "data/dataset/orderbook_time_protocol_benchmark_labels.jsonl",
+    "data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl",
+    "data/dataset/phase_4_2h_latency_profile_samples.jsonl",
+    "data/dataset/phase_4_2h_latency_profile_datasets.zip",
+    "data/reports/phase_4_2h_hotpath_environment_latency_report.json",
+    "data/reports/phase_4_2h_hotpath_environment_latency_report.md",
+    "data/reports/phase42h_self_check.json",
+    "data/debug/phase_4_2h_artifact_cleanup.json",
+    "data/debug/phase_4_2h_clock_offset_samples.json",
+    "data/debug/phase_4_2h_receive_lag_raw_vs_corrected.json",
+    "data/debug/phase_4_2h_corrected_hybrid_summary.json",
+    "data/debug/phase_4_2h_latency_stage_profile.json",
+    "data/debug/phase_4_2h_queue_backpressure_report.json",
+    "data/debug/phase_4_2h_writer_batch_report.json",
+    "data/debug/phase_4_2h_clock_sanity_report.json",
+    "data/debug/phase_4_2h_leakage_check.json",
+    "data/debug/phase_4_2h_multifeed_capture_diagnostics.json",
+    "data/debug/phase_4_2h_environment_metadata.json",
+    "data/debug/phase_4_2h_vps_preflight_report.json",
+    "data/debug/phase_4_2h_vps_setup_report.txt",
+    "data/debug/phase_4_2h_typecheck_report.txt",
+    "data/debug/phase_4_2h_pytest_output.txt",
+    "data/debug/phase42h_failure_investigation.md",
+    "phase_4_2h_hotpath_environment_latency_bundle.zip",
+    "phase_4_2h_hotpath_environment_latency_fail_audit_bundle.zip",
+    "phase_4_2h_bundle_sha256.txt",
+)
+
+PHASE42H_GENERATED_GLOB_PATTERNS = (
+    "data/debug/phase_4_2h_*.json",
+    "data/debug/phase_4_2h_*.txt",
+    "data/debug/phase42h_*.md",
+    "data/reports/phase_4_2h_*.json",
+    "data/reports/phase_4_2h_*.md",
+    "data/reports/phase42h_*.json",
+    "phase_4_2h_*.zip",
+    "phase_4_2h_*sha256*.txt",
+)
 
 BINANCE_SERVER_TIME_URL = "https://api.binance.com/api/v3/time"
 BINANCE_WS_HOST = "stream.binance.com"
@@ -198,50 +242,77 @@ PHASE42H_REQUIRED_BUNDLE_FILES = (
 )
 
 
-def cleanup_phase42h_artifacts(root: str | Path) -> dict[str, Any]:
+def cleanup_phase42h_artifacts(root: str | Path, *, source_root: str | Path | None = None) -> dict[str, Any]:
     root_path = Path(root).resolve()
+    source_root_path = Path(source_root).resolve() if source_root is not None else REPO_ROOT.resolve()
     deleted_files: list[str] = []
     missing_files_skipped: list[str] = []
     errors: list[str] = []
-    for relative in ARTIFACT_DIRECTORIES:
-        directory = root_path / relative
-        if not directory.exists():
-            missing_files_skipped.append(relative)
+    cleanup_started_at_utc = _utc_now()
+    targets: list[dict[str, str]] = [{"role": "actual_capture_write_location", "root": _display_path(source_root_path)}]
+    if root_path != source_root_path:
+        targets.append({"role": "session_root", "root": _display_path(root_path)})
+
+    for target in targets:
+        target_root = Path(target["root"]).resolve()
+        if not target_root.exists():
+            missing_files_skipped.append(f"{target['role']}:{_display_path(target_root)}")
             continue
-        if not _is_within(directory.resolve(), root_path):
-            errors.append(f"refusing to clean outside root: {relative}")
-            continue
-        for child in directory.iterdir():
-            display = _relative_display(root_path, child)
-            try:
-                if child.is_dir():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
-                deleted_files.append(display)
-            except OSError as exc:
-                errors.append(f"{display}: {exc}")
-    for pattern in OLD_BUNDLE_PATTERNS:
-        for path in root_path.glob(pattern):
-            if not path.is_file():
+        for relative in PHASE42H_GENERATED_RELATIVE_FILES:
+            candidate = target_root / relative
+            display = f"{target['role']}:{_relative_display(target_root, candidate)}"
+            if not candidate.exists():
+                missing_files_skipped.append(display)
                 continue
-            if not _is_within(path.resolve(), root_path):
-                errors.append(f"refusing to delete outside root: {path}")
+            if not candidate.is_file():
+                errors.append(f"refusing to delete non-file generated artifact: {display}")
                 continue
-            display = _relative_display(root_path, path)
-            try:
-                path.unlink()
-                deleted_files.append(display)
-            except OSError as exc:
-                errors.append(f"{display}: {exc}")
+            _delete_generated_file(candidate, target_root=target_root, display=display, deleted_files=deleted_files, errors=errors)
+        for pattern in PHASE42H_GENERATED_GLOB_PATTERNS:
+            for candidate in target_root.glob(pattern):
+                if not candidate.exists():
+                    continue
+                display = f"{target['role']}:{_relative_display(target_root, candidate)}"
+                if not candidate.is_file():
+                    errors.append(f"refusing to delete non-file generated artifact: {display}")
+                    continue
+                _delete_generated_file(candidate, target_root=target_root, display=display, deleted_files=deleted_files, errors=errors)
+
+    cleanup_finished_at_utc = _utc_now()
     report = {
         "cleanup_performed": True,
+        "cleanup_targets": targets,
         "deleted_files": sorted(set(deleted_files)),
         "missing_files_skipped": sorted(set(missing_files_skipped)),
         "errors": errors,
+        "cleanup_started_at_utc": cleanup_started_at_utc,
+        "cleanup_finished_at_utc": cleanup_finished_at_utc,
     }
     _write_json(root_path / PHASE42H_CLEANUP_REPORT, report)
     return report
+
+
+def _delete_generated_file(
+    path: Path,
+    *,
+    target_root: Path,
+    display: str,
+    deleted_files: list[str],
+    errors: list[str],
+) -> None:
+    try:
+        resolved = path.resolve()
+    except OSError as exc:
+        errors.append(f"{display}: {exc}")
+        return
+    if not _is_within(resolved, target_root.resolve()):
+        errors.append(f"refusing to delete outside cleanup target: {display}")
+        return
+    try:
+        path.unlink()
+        deleted_files.append(display)
+    except OSError as exc:
+        errors.append(f"{display}: {exc}")
 
 
 def build_environment_metadata(
@@ -1692,6 +1763,10 @@ def _is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:

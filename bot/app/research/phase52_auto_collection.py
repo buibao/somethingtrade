@@ -139,8 +139,7 @@ def run_controlled_capture(
         console_lines.append(subprocess_output)
         source_bundle = _find_phase42h_bundle(session_dir, runtime_report)
         if create_bundle and source_bundle is not None and source_bundle.exists():
-            if not bundle_path.exists():
-                shutil.copy2(source_bundle, bundle_path)
+            shutil.copy2(source_bundle, bundle_path)
     ended = _utc_now()
     actual_duration = max(0.0, time.monotonic() - start_mono)
     if dry_run:
@@ -282,6 +281,10 @@ def run_auto_collection(
             "artifact_paths": result["artifact_paths"],
         }
         sessions.append(session_entry)
+        if fail_session_on_quality_gate and session_entry["research_eligible"] is not True:
+            stopped_early = True
+            stop_reason = f"quality gate failed for {session_id}; fail-session-on-quality-gate stopped auto collection"
+            break
         if stop_file.exists():
             stopped_early = True
             stop_reason = f"stop-after-current-session file observed after {session_id}"
@@ -620,6 +623,7 @@ def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_
         "--run-mode",
         "vps_final",
         "--skip-pytest",
+        "--clean",
     ]
     process = subprocess.run(command, cwd=root_path, text=True, capture_output=True, check=False)
     report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"

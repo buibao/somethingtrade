@@ -1,4 +1,0 @@
-filename: phase_5_2_session_001_sanity_30m_capture_bundle.zip
-sha256: c258c5d5032c5cbae10077738124f460849cb8661167bc2fb0d880bb184fc677
-file_size_bytes: 806
-utc_timestamp: 2026-05-27T14:50:41Z

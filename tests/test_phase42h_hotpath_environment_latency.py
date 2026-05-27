@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+import app.research.hotpath_environment_latency as hotpath
+import scripts.run_phase42h_hotpath_environment_latency as phase42h_cli
 from app.research.clock_sync_receive_lag import build_server_time_sample, compute_clock_offset_summary
 from app.research.hotpath_environment_latency import (
     LATENCY_PROFILE_DATASETS_ZIP,
@@ -18,6 +20,7 @@ from app.research.hotpath_environment_latency import (
     build_queue_backpressure_report,
     build_writer_batch_report,
     compute_readiness_semantics,
+    cleanup_phase42h_artifacts,
     create_phase42h_bundle,
     create_phase42h_dataset_zip,
     evaluate_phase42h_report,
@@ -178,6 +181,29 @@ def _queue_report(*, drops: int = 0, near_capacity: bool = False, put_p95: float
     )
 
 
+def _write_required_gitignore(root: Path) -> None:
+    root.joinpath(".gitignore").write_text(
+        "\n".join(
+            [
+                "*.jsonl",
+                "data/dataset/",
+                "data/debug/",
+                "data/cache/",
+                "data/logs/",
+                "data/reports/",
+                "logs/",
+                "reports/",
+                "debug/",
+                "cache/",
+                "*.zip",
+                "*.log",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _phase41(*, gaps: int = 0, writer: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "sequence_gap_count": gaps,
@@ -239,6 +265,228 @@ def _report(
         fresh_capture_required=fresh_capture_required,
         labeled_sample_count=1,
     )
+
+
+def _fresh_phase42h_report() -> dict[str, Any]:
+    report = _report(h100=0.97, h250=0.98, p95=80.0, p99=120.0, fresh_capture_required=False)
+    report["phase41_runtime_report_source"] = {
+        "source": "current_capture_summary",
+        "path": "capture.capture_diagnostics.phase41_runtime_report",
+        "fresh": True,
+        "artifact_loaded": False,
+    }
+    report["phase41_runtime_report_status"] = "pass"
+    report["capture"] = {**report["capture"], "fresh_capture_performed": True, "skip_capture": False, "fixture_mode": False}
+    report["fresh_capture_performed"] = True
+    report["fresh_capture_required"] = True
+    report["skip_capture"] = False
+    report["fixture_mode"] = False
+    report["status"] = "pass"
+    report["primary_failure"] = None
+    report["failure_classifications"] = []
+    report["hard_fail_reasons"] = []
+    return report
+
+
+def test_phase42h_fresh_capture_without_cleanup_fails() -> None:
+    report = _fresh_phase42h_report()
+    report["cleanup_report"] = {"cleanup_performed": False, "errors": []}
+    evaluated = evaluate_phase42h_report(report)
+    assert evaluated["status"] == "fail"
+    assert evaluated["primary_failure"] == "ARTIFACT_CLEANUP_FAILURE"
+    assert "ARTIFACT_CLEANUP_FAILURE" in evaluated["failure_classifications"]
+    assert "artifact cleanup was not performed" in evaluated["hard_fail_reasons"]
+
+
+def test_phase42h_fresh_capture_with_cleanup_passes_when_runtime_gates_pass() -> None:
+    report = _fresh_phase42h_report()
+    report["cleanup_report"] = {"cleanup_performed": True, "errors": []}
+    evaluated = evaluate_phase42h_report(report)
+    assert evaluated["status"] == "pass"
+    assert evaluated["primary_failure"] is None
+    assert evaluated["strict_100ms_observability_ready"] is True
+    assert evaluated["phase5_ready"] is False
+
+
+def test_phase42h_cleanup_error_fails() -> None:
+    report = _fresh_phase42h_report()
+    report["cleanup_report"] = {"cleanup_performed": True, "errors": ["permission denied"]}
+    evaluated = evaluate_phase42h_report(report)
+    assert evaluated["status"] == "fail"
+    assert evaluated["primary_failure"] == "ARTIFACT_CLEANUP_FAILURE"
+    assert "ARTIFACT_CLEANUP_FAILURE" in evaluated["failure_classifications"]
+
+
+def test_phase42h_cleanup_report_schema_has_targets_and_timestamps(tmp_path: Path) -> None:
+    report = cleanup_phase42h_artifacts(tmp_path, source_root=tmp_path)
+    assert report["cleanup_performed"] is True
+    assert "cleanup_targets" in report
+    assert report["cleanup_targets"][0]["role"] == "actual_capture_write_location"
+    assert report["cleanup_started_at_utc"]
+    assert report["cleanup_finished_at_utc"]
+
+
+def test_phase42h_cleanup_cleans_actual_source_write_location(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    session_root = tmp_path / "sessions/session_001"
+    stale = source_root / "data/dataset/orderbook_clean_samples.jsonl"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("{}\n", encoding="utf-8")
+    cleanup_phase42h_artifacts(session_root, source_root=source_root)
+    assert not stale.exists()
+
+
+def test_phase42h_cleanup_cleans_session_root_when_root_differs(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    session_root = tmp_path / "sessions/session_001"
+    stale = session_root / "data/debug/phase_4_2h_latency_stage_profile.json"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("{}", encoding="utf-8")
+    cleanup_phase42h_artifacts(session_root, source_root=source_root)
+    assert not stale.exists()
+
+
+def test_phase42h_cleanup_does_not_delete_source_code_or_tests(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    session_root = tmp_path / "sessions/session_001"
+    source_file = source_root / "bot/app/research/keep.py"
+    test_file = source_root / "tests/test_keep.py"
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("print('keep')\n", encoding="utf-8")
+    test_file.write_text("def test_keep(): pass\n", encoding="utf-8")
+    cleanup_phase42h_artifacts(session_root, source_root=source_root)
+    assert source_file.exists()
+    assert test_file.exists()
+
+
+def test_phase42h_cleanup_does_not_delete_archived_failed_runs(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    archive = source_root / "data/phase_5_2_failed_before_cleanup_fix/phase_5_2_session_001_capture_bundle.zip"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    archive.write_bytes(b"archive")
+    cleanup_phase42h_artifacts(source_root, source_root=source_root)
+    assert archive.exists()
+
+
+def test_preflight_fails_if_generated_jsonl_tracked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_required_gitignore(tmp_path)
+
+    def fake_run_git(root: Path, *args: str) -> dict[str, Any]:
+        if args == ("rev-parse", "--is-inside-work-tree"):
+            return {"returncode": 0, "stdout": "true\n", "stderr": ""}
+        if args == ("ls-files",):
+            return {"returncode": 0, "stdout": "data/dataset/orderbook_clean_samples.jsonl\n", "stderr": ""}
+        if args == ("diff", "--name-only", "--cached"):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(hotpath, "_run_git", fake_run_git)
+    report = hotpath.run_phase42h_vps_preflight(tmp_path, required_imports=("json",), check_network=False)
+    assert report["passed"] is False
+    assert report["checks"]["heavy_generated_artifacts_not_tracked_or_staged"]["passed"] is False
+    assert "data/dataset/orderbook_clean_samples.jsonl" in report["checks"]["heavy_generated_artifacts_not_tracked_or_staged"]["tracked"]
+
+
+def test_preflight_fails_if_generated_zip_staged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_required_gitignore(tmp_path)
+
+    def fake_run_git(root: Path, *args: str) -> dict[str, Any]:
+        if args == ("rev-parse", "--is-inside-work-tree"):
+            return {"returncode": 0, "stdout": "true\n", "stderr": ""}
+        if args == ("ls-files",):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ("diff", "--name-only", "--cached"):
+            return {"returncode": 0, "stdout": "phase_4_2h_hotpath_environment_latency_bundle.zip\n", "stderr": ""}
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(hotpath, "_run_git", fake_run_git)
+    report = hotpath.run_phase42h_vps_preflight(tmp_path, required_imports=("json",), check_network=False)
+    assert report["passed"] is False
+    assert "phase_4_2h_hotpath_environment_latency_bundle.zip" in report["checks"]["heavy_generated_artifacts_not_tracked_or_staged"]["staged"]
+
+
+def test_gitignore_contains_required_generated_patterns() -> None:
+    patterns = {
+        line.strip()
+        for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    for pattern in (
+        "*.jsonl",
+        "*.zip",
+        "*.log",
+        "data/dataset/",
+        "data/debug/",
+        "data/cache/",
+        "data/logs/",
+        "data/reports/",
+        "logs/",
+        "reports/",
+        "debug/",
+        "cache/",
+    ):
+        assert pattern in patterns
+
+
+def test_runtime_cleanup_does_not_modify_gitignore(tmp_path: Path) -> None:
+    gitignore = tmp_path / ".gitignore"
+    original = "*.jsonl\n*.zip\n"
+    gitignore.write_text(original, encoding="utf-8")
+    cleanup_phase42h_artifacts(tmp_path, source_root=tmp_path)
+    assert gitignore.read_text(encoding="utf-8") == original
+
+
+def test_phase42h_cli_clean_flag_sets_cleanup_performed_true(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_required_gitignore(tmp_path)
+    _patch_phase42h_cli_fixture(monkeypatch, source_root=tmp_path)
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "1800",
+            "--environment-name",
+            "test",
+            "--environment-region",
+            "local",
+            "--run-mode",
+            "vps_final",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--clean",
+            "--no-bundle",
+        ]
+    )
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert report["cleanup_report"]["cleanup_performed"] is True
+
+
+def test_phase42h_cli_without_clean_for_fresh_capture_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_required_gitignore(tmp_path)
+    _patch_phase42h_cli_fixture(monkeypatch, source_root=tmp_path)
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "1800",
+            "--environment-name",
+            "test",
+            "--environment-region",
+            "local",
+            "--run-mode",
+            "vps_final",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--no-bundle",
+        ]
+    )
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert report["status"] == "fail"
+    assert report["primary_failure"] == "ARTIFACT_CLEANUP_FAILURE"
 
 
 def test_hot_path_decoupling_flags_and_batch_writer_enabled() -> None:
@@ -574,3 +822,43 @@ def test_compute_readiness_semantics_direct_future_lag_telemetry_only() -> None:
         for metrics in source_report["corrected_hybrid"].values():
             assert metrics["future_receive_lag_hard_gate_used"] is False
             assert metrics["future_receive_lag_is_telemetry_only"] is True
+
+
+def _patch_phase42h_cli_fixture(monkeypatch: pytest.MonkeyPatch, *, source_root: Path) -> None:
+    async def fake_capture(**kwargs: Any) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+        return (
+            [
+                build_server_time_sample(
+                    sample_id=1,
+                    phase="before_capture",
+                    local_wall_before_request_ms=37_500.0,
+                    local_wall_after_response_ms=37_510.0,
+                    binance_server_time_ms=5.0,
+                ),
+                build_server_time_sample(
+                    sample_id=2,
+                    phase="after_capture",
+                    local_wall_before_request_ms=37_520.0,
+                    local_wall_after_response_ms=37_530.0,
+                    binance_server_time_ms=25.0,
+                ),
+            ],
+            0,
+            {"phase41_runtime_report": _phase41(), "reference_writer_batch_report": _writer_report()},
+        )
+
+    def fake_analysis(**kwargs: Any) -> dict[str, Any]:
+        report = _fresh_phase42h_report()
+        report["cleanup_report"] = kwargs["cleanup_report"]
+        report["fresh_capture_required"] = kwargs["fresh_capture_required"]
+        report["fresh_capture_performed"] = True
+        report["skip_capture"] = False
+        report["fixture_mode"] = False
+        report["capture"] = {**report["capture"], **kwargs["capture"], "fresh_capture_performed": True, "skip_capture": False, "fixture_mode": False}
+        return evaluate_phase42h_report(report)
+
+    monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", source_root)
+    monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
+    monkeypatch.setattr(phase42h_cli, "_run_capture_with_clock_samples", fake_capture)
+    monkeypatch.setattr(phase42h_cli, "run_phase42h_analysis", fake_analysis)
+    monkeypatch.setattr(phase42h_cli, "create_phase42h_dataset_zip", lambda root: root / LATENCY_PROFILE_DATASETS_ZIP)

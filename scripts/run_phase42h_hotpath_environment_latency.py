@@ -114,9 +114,12 @@ def main(argv: list[str] | None = None) -> int:
 
     cleanup_report: dict[str, Any] = {
         "cleanup_performed": False,
+        "cleanup_targets": [],
         "deleted_files": [],
         "missing_files_skipped": [],
         "errors": [],
+        "cleanup_started_at_utc": None,
+        "cleanup_finished_at_utc": None,
     }
     pytest_output = ""
     typecheck_summary = ""
@@ -125,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_report_text = _read_text(root / PHASE42H_VPS_SETUP_REPORT)
 
     if args.clean:
-        cleanup_report = cleanup_phase42h_artifacts(root)
+        cleanup_report = cleanup_phase42h_artifacts(root, source_root=SOURCE_ROOT)
         _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
         if setup_report_text and not (root / PHASE42H_VPS_SETUP_REPORT).exists():
             _write_text(root / PHASE42H_VPS_SETUP_REPORT, setup_report_text)
