@@ -970,7 +970,7 @@ def create_phase42e_dataset_zip(root: str | Path) -> Path:
 def phase42e_bundle_missing_files(bundle_path: str | Path, *, pass_bundle: bool = True) -> list[str]:
     with zipfile.ZipFile(bundle_path) as archive:
         names = set(archive.namelist())
-    required = list(PHASE42E_REQUIRED_BUNDLE_FILES)
+    required: list[str] = list(PHASE42E_REQUIRED_BUNDLE_FILES)
     if not pass_bundle:
         required.append(_display_path(PHASE42E_INVESTIGATION))
     return [name for name in required if name not in names]

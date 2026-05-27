@@ -22,6 +22,8 @@ from app.research.hotpath_environment_latency import (
     create_phase42h_dataset_zip,
     evaluate_phase42h_report,
     phase42h_bundle_missing_files,
+    phase41_runtime_report_status,
+    resolve_phase41_runtime_report,
     validate_phase42h_report_schema,
     write_phase42h_artifacts,
 )
@@ -123,7 +125,7 @@ def _latency_profile() -> dict[str, Any]:
         "metrics": {
             "parse_duration_ms": {"count": 1, "p95": 0.01, "p99": 0.01},
             "book_apply_duration_ms": {"count": 1, "p95": 0.02, "p99": 0.02},
-            "queue_put_duration_ms": {"count": 1, "p95": 0.01, "p99": 0.01},
+            "input_queue_put_duration_ms": {"count": 1, "p95": 0.01, "p99": 0.01},
             "file_write_duration_ms": {"count": 1, "p95": 0.03, "p99": 0.03},
             "end_to_end_local_hot_path_ms": {"count": 1, "p95": 0.10, "p99": 0.10},
         },
@@ -193,6 +195,9 @@ def _phase41(*, gaps: int = 0, writer: dict[str, Any] | None = None) -> dict[str
             "queue_put_block_p99_ms": 0.0,
         },
         "writer_batch_report": writer or _writer_report(),
+        "phase_4_1_pass": True,
+        "phase_4_1_status": "pass",
+        "phase_4_1_failure_reasons": [],
     }
 
 
@@ -262,8 +267,8 @@ def test_latency_stage_profile_schema_and_stage_calculations(tmp_path: Path) -> 
             "book_apply_end_monotonic_ns": 1_800_000,
             "sample_build_start_monotonic_ns": 1_900_000,
             "sample_emit_monotonic_ns": 2_100_000,
-            "queue_put_start_monotonic_ns": 2_200_000,
-            "queue_put_end_monotonic_ns": 2_230_000,
+            "input_queue_put_start_monotonic_ns": 1_900_000,
+            "input_queue_put_end_monotonic_ns": 1_930_000,
             "writer_enqueue_monotonic_ns": 2_240_000,
             "file_write_start_monotonic_ns": 2_500_000,
             "file_write_end_monotonic_ns": 2_800_000,
@@ -276,8 +281,8 @@ def test_latency_stage_profile_schema_and_stage_calculations(tmp_path: Path) -> 
             "book_apply_duration_ms": 0.3,
             "apply_to_sample_build_ms": 0.1,
             "sample_build_duration_ms": 0.2,
-            "sample_emit_to_queue_put_start_ms": 0.1,
-            "queue_put_duration_ms": 0.03,
+            "input_queue_put_to_sample_emit_ms": 0.2,
+            "input_queue_put_duration_ms": 0.03,
             "queue_wait_ms": 0.2,
             "writer_wait_ms": 0.26,
             "file_write_duration_ms": 0.3,
@@ -299,7 +304,9 @@ def test_latency_stage_profile_schema_and_stage_calculations(tmp_path: Path) -> 
     assert profile["earliest_available_receive_stage"] == "raw_ws_callback_monotonic_ns"
     assert profile["metrics"]["parse_duration_ms"]["p95"] == pytest.approx(0.2)
     assert profile["metrics"]["book_apply_duration_ms"]["p95"] == pytest.approx(0.3)
-    assert profile["metrics"]["queue_put_duration_ms"]["p95"] == pytest.approx(0.03)
+    assert profile["metrics"]["input_queue_put_duration_ms"]["p95"] == pytest.approx(0.03)
+    assert profile["metrics"]["input_queue_put_to_sample_emit_ms"]["p95"] == pytest.approx(0.2)
+    assert "sample_emit_to_queue_put_start_ms" not in profile["metrics"]
     assert profile["metrics"]["file_write_duration_ms"]["p95"] == pytest.approx(0.3)
 
 
@@ -357,6 +364,83 @@ def test_readiness_invariants_are_hard_failures() -> None:
     report["phase5_ready"] = True
     evaluated = evaluate_phase42h_report(report)
     assert "PHASE5_READY_FORBIDDEN" in evaluated["failure_classifications"]
+
+
+def test_embedded_phase41_runtime_failure_hard_fails_phase42h() -> None:
+    report = _report()
+    report["phase41_runtime_report"]["phase_4_1_pass"] = False
+    report["phase41_runtime_report"]["phase_4_1_status"] = "fail"
+    report["phase41_runtime_report"]["phase_4_1_failure_reasons"] = ["snapshot_copy_p99_us > snapshot_copy_budget_us"]
+    report["phase41_runtime_report_status"] = phase41_runtime_report_status(report["phase41_runtime_report"])
+    evaluated = evaluate_phase42h_report(report)
+    assert evaluated["status"] == "fail"
+    assert "PHASE41_RUNTIME_FAILURE" in evaluated["failure_classifications"]
+    assert any("snapshot_copy_p99_us" in reason for reason in evaluated["hard_fail_reasons"])
+
+
+def test_phase41_runtime_report_prefers_current_capture_over_stale_artifact(tmp_path: Path) -> None:
+    stale_path = tmp_path / "data/reports/phase_4_1_orderbook_quality_report.json"
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text(
+        json.dumps(
+            {
+                "phase_4_1_pass": False,
+                "phase_4_1_status": "fail",
+                "phase_4_1_failure_reasons": ["stale artifact should not be loaded"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    current = {
+        "phase_4_1_pass": True,
+        "phase_4_1_status": "pass",
+        "phase_4_1_failure_reasons": [],
+    }
+    report, source = resolve_phase41_runtime_report(
+        tmp_path,
+        capture={
+            "fresh_capture_performed": True,
+            "skip_capture": False,
+            "capture_diagnostics": {"phase41_runtime_report": current},
+        },
+    )
+    assert report == current
+    assert source["source"] == "current_capture_summary"
+    assert source["fresh"] is True
+
+
+def test_phase41_runtime_report_does_not_fallback_to_artifact_for_fresh_capture(tmp_path: Path) -> None:
+    stale_path = tmp_path / "data/reports/phase_4_1_orderbook_quality_report.json"
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text(
+        json.dumps(
+            {
+                "phase_4_1_pass": False,
+                "phase_4_1_status": "fail",
+                "phase_4_1_failure_reasons": ["stale artifact"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    report, source = resolve_phase41_runtime_report(
+        tmp_path,
+        capture={"fresh_capture_performed": True, "skip_capture": False, "capture_diagnostics": {}},
+    )
+    assert report == {}
+    assert source["source"] == "missing_current_capture_summary"
+    evaluated = evaluate_phase42h_report(
+        {
+            **_report(),
+            "fresh_capture_required": True,
+            "fresh_capture_performed": True,
+            "skip_capture": False,
+            "phase41_runtime_report": report,
+            "phase41_runtime_report_source": source,
+            "phase41_runtime_report_status": "missing",
+        }
+    )
+    assert "PHASE41_RUNTIME_STALE_RISK" in evaluated["failure_classifications"]
+    assert "PHASE41_RUNTIME_REPORT_MISSING" in evaluated["failure_classifications"]
 
 
 def test_corrected_timing_continuity_and_exchange_time_policy() -> None:

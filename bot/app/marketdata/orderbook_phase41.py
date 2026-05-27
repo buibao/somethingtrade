@@ -1426,8 +1426,8 @@ def build_latency_profile_sample(
         "sample_build_end_monotonic_ns": sample_build_end_monotonic_ns,
         "sample_emit_monotonic_ns": sample_emit_monotonic_ns,
         "queue_put_monotonic_ns": queue_put_monotonic_ns,
-        "queue_put_start_monotonic_ns": queue_put_monotonic_ns,
-        "queue_put_end_monotonic_ns": queue_put_end_monotonic_ns,
+        "input_queue_put_start_monotonic_ns": queue_put_monotonic_ns,
+        "input_queue_put_end_monotonic_ns": queue_put_end_monotonic_ns,
         "writer_enqueue_monotonic_ns": writer_enqueue_monotonic_ns,
         "file_write_start_monotonic_ns": file_write_start_monotonic_ns,
         "file_write_end_monotonic_ns": file_write_end_monotonic_ns,
@@ -1442,9 +1442,8 @@ def build_latency_profile_sample(
         "apply_to_sample_emit_ms": _duration_ms(book_apply_end_monotonic_ns, sample_emit_monotonic_ns),
         "apply_to_sample_build_ms": _duration_ms(book_apply_end_monotonic_ns, sample_build_start_monotonic_ns),
         "sample_build_duration_ms": _duration_ms(sample_build_start_monotonic_ns, sample_build_end_monotonic_ns),
-        "sample_emit_to_queue_put_start_ms": _duration_ms(sample_emit_monotonic_ns, queue_put_monotonic_ns),
-        "sample_emit_to_queue_put_ms": _duration_ms(sample_emit_monotonic_ns, queue_put_monotonic_ns),
-        "queue_put_duration_ms": _duration_ms(queue_put_monotonic_ns, queue_put_end_monotonic_ns),
+        "input_queue_put_to_sample_emit_ms": _duration_ms(queue_put_monotonic_ns, sample_emit_monotonic_ns),
+        "input_queue_put_duration_ms": _duration_ms(queue_put_monotonic_ns, queue_put_end_monotonic_ns),
         "queue_wait_ms": queue_wait_ms
         if queue_wait_ms is not None
         else _duration_ms(queue_put_monotonic_ns, queue_dequeue_monotonic_ns),

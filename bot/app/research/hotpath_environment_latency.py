@@ -31,7 +31,7 @@ from app.research.clock_sync_receive_lag import (
     compute_phase42e_source_report,
     generate_corrected_time_protocol_rows,
 )
-from app.research.orderbook_labeled_dataset import write_jsonl
+from app.research.orderbook_labeled_dataset import validate_clean_samples, write_jsonl
 from app.research.reference_feed_benchmark import (
     AGGTRADE_REFERENCE_EVENTS,
     BENCHMARK_LABELS,
@@ -50,7 +50,6 @@ from app.research.time_protocol_benchmark import (
     build_protocol_summary,
     generate_time_protocol_rows,
     run_phase42d_leakage_check,
-    validate_clean_samples,
     validate_gitignore_rules,
     validate_timestamp_schema,
 )
@@ -112,8 +111,8 @@ REQUIRED_STAGE_NAMES = (
     "book_apply_end_monotonic_ns",
     "sample_build_start_monotonic_ns",
     "sample_emit_monotonic_ns",
-    "queue_put_start_monotonic_ns",
-    "queue_put_end_monotonic_ns",
+    "input_queue_put_start_monotonic_ns",
+    "input_queue_put_end_monotonic_ns",
     "writer_enqueue_monotonic_ns",
     "file_write_start_monotonic_ns",
     "file_write_end_monotonic_ns",
@@ -127,8 +126,8 @@ LATENCY_METRIC_NAMES = (
     "book_apply_duration_ms",
     "apply_to_sample_build_ms",
     "sample_build_duration_ms",
-    "sample_emit_to_queue_put_start_ms",
-    "queue_put_duration_ms",
+    "input_queue_put_to_sample_emit_ms",
+    "input_queue_put_duration_ms",
     "queue_wait_ms",
     "writer_wait_ms",
     "file_write_duration_ms",
@@ -165,6 +164,9 @@ PHASE42H_REQUIRED_REPORT_FIELDS = frozenset(
         "queue_backpressure_summary",
         "writer_batch_report",
         "sources",
+        "phase41_runtime_report_source",
+        "phase41_runtime_report_status",
+        "phase41_runtime_report_gating",
         "selected_protocol_candidate",
         "selected_operational_budget_ms",
         "readiness_decision_reason",
@@ -436,7 +438,7 @@ def run_phase42h_analysis(
     }
     clock_sanity = build_clock_sanity_report(clock_offset_summary=clock_offset_summary, sources=sources)
     latency_profile = build_latency_stage_profile(_resolve(root_path, latency_profile_samples_path))
-    phase41_report = _read_json(root_path / "data/reports/phase_4_1_orderbook_quality_report.json")
+    phase41_report, phase41_source = resolve_phase41_runtime_report(root_path, capture=capture)
     writer_report = build_writer_batch_report(
         phase41_report=phase41_report,
         capture_diagnostics=_dict(capture.get("capture_diagnostics")),
@@ -468,6 +470,7 @@ def run_phase42h_analysis(
         typecheck_summary=typecheck_summary,
         fresh_capture_required=fresh_capture_required,
         preflight_report=preflight_report,
+        phase41_runtime_report_source=phase41_source,
         labeled_sample_count=len(corrected_rows),
     )
     if clean_validation.failure_classification:
@@ -501,6 +504,7 @@ def build_phase42h_report(
     fresh_capture_required: bool,
     labeled_sample_count: int,
     preflight_report: dict[str, Any] | None = None,
+    phase41_runtime_report_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     protocol_summary = build_protocol_summary(
         {
@@ -523,6 +527,13 @@ def build_phase42h_report(
         phase41_report=phase41_report,
     )
     warnings = set(_readiness_warnings(semantics, clock_offset_summary, latency_profile, queue_report, writer_report, sources))
+    phase41_status = phase41_runtime_report_status(phase41_report)
+    phase41_source = phase41_runtime_report_source or {
+        "source": "direct_argument",
+        "path": "data/reports/phase_4_1_orderbook_quality_report.json",
+        "fresh": None,
+        "artifact_loaded": False,
+    }
     report = {
         "phase": PHASE,
         "status": "pass",
@@ -579,6 +590,10 @@ def build_phase42h_report(
         "queue_backpressure_summary": queue_report,
         "writer_batch_report": writer_report,
         "phase41_runtime_report": phase41_report,
+        "phase41_runtime_report_source": phase41_source,
+        "phase41_runtime_report_status": phase41_status,
+        "phase41_runtime_report_failure_reasons": phase41_runtime_failure_reasons(phase41_report),
+        "phase41_runtime_report_gating": "hard_fail_when_current_capture_phase41_fails",
         "dataset_paths": {
             "clean_samples": "data/dataset/orderbook_clean_samples.jsonl",
             "bookticker_reference_quotes": _display_path(BOOKTICKER_REFERENCE_QUOTES),
@@ -756,6 +771,76 @@ def build_queue_backpressure_report(
     }
 
 
+def resolve_phase41_runtime_report(
+    root: str | Path,
+    *,
+    capture: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    root_path = Path(root)
+    report_path = root_path / "data/reports/phase_4_1_orderbook_quality_report.json"
+    capture_diagnostics = _dict(capture.get("capture_diagnostics"))
+    current_capture_report = _dict(capture.get("phase41_runtime_report")) or _dict(capture_diagnostics.get("phase41_runtime_report"))
+    if current_capture_report:
+        return current_capture_report, {
+            "source": "current_capture_summary",
+            "path": "capture.phase41_runtime_report",
+            "fresh": True,
+            "artifact_loaded": False,
+            "stale_artifact_allowed": False,
+        }
+    if capture.get("fresh_capture_performed") is True and capture.get("skip_capture") is not True:
+        return {}, {
+            "source": "missing_current_capture_summary",
+            "path": "capture.phase41_runtime_report",
+            "fresh": False,
+            "artifact_loaded": False,
+            "stale_artifact_allowed": False,
+        }
+    artifact = _read_json(report_path)
+    if artifact:
+        return artifact, {
+            "source": "existing_artifact_fixture_or_manual_analysis",
+            "path": _display_path(report_path.relative_to(root_path)) if _is_within(report_path.resolve(), root_path.resolve()) else _display_path(report_path),
+            "fresh": False,
+            "artifact_loaded": True,
+            "stale_artifact_allowed": bool(capture.get("fixture_mode") is True or capture.get("skip_capture") is True),
+        }
+    return {}, {
+        "source": "missing",
+        "path": _display_path(report_path.relative_to(root_path)) if _is_within(report_path.resolve(), root_path.resolve()) else _display_path(report_path),
+        "fresh": False,
+        "artifact_loaded": False,
+        "stale_artifact_allowed": False,
+    }
+
+
+def phase41_runtime_report_status(report: dict[str, Any]) -> str:
+    if not report:
+        return "missing"
+    status = report.get("phase_4_1_status", report.get("status"))
+    if isinstance(status, str) and status.strip():
+        normalized = status.strip().lower()
+        if normalized in {"pass", "passed"}:
+            return "pass"
+        if normalized in {"fail", "failed"}:
+            return "fail"
+        return normalized
+    if report.get("phase_4_1_pass") is True:
+        return "pass"
+    if report.get("phase_4_1_pass") is False:
+        return "fail"
+    return "unknown"
+
+
+def phase41_runtime_failure_reasons(report: dict[str, Any]) -> list[str]:
+    reasons = report.get("phase_4_1_failure_reasons")
+    if isinstance(reasons, list):
+        return [str(reason) for reason in reasons if str(reason)]
+    if phase41_runtime_report_status(report) == "fail":
+        return ["phase_4_1_status=fail"]
+    return []
+
+
 def compute_readiness_semantics(
     *,
     sources: dict[str, dict[str, Any]],
@@ -861,6 +946,25 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
     preflight = _dict(evaluated.get("preflight_report"))
     if preflight and preflight.get("passed") is not True:
         add("VPS preflight failed", "PREFLIGHT_FAILURE", implementation=True)
+    phase41_source = _dict(evaluated.get("phase41_runtime_report_source"))
+    phase41_status = str(evaluated.get("phase41_runtime_report_status") or phase41_runtime_report_status(_dict(evaluated.get("phase41_runtime_report"))))
+    if (
+        evaluated.get("fresh_capture_required") is True
+        and evaluated.get("fresh_capture_performed") is True
+        and evaluated.get("skip_capture") is not True
+        and phase41_source.get("source") != "current_capture_summary"
+    ):
+        add("Phase 4.1 runtime report did not come from the current capture summary", "PHASE41_RUNTIME_STALE_RISK", implementation=True)
+    if (
+        phase41_status == "missing"
+        and evaluated.get("fresh_capture_required") is True
+        and evaluated.get("fresh_capture_performed") is True
+    ):
+        add("Phase 4.1 runtime report missing for fresh Phase 4.2H capture", "PHASE41_RUNTIME_REPORT_MISSING", implementation=True)
+    if phase41_status == "fail":
+        reasons = phase41_runtime_failure_reasons(_dict(evaluated.get("phase41_runtime_report")))
+        reason_suffix = f": {', '.join(reasons)}" if reasons else ""
+        add(f"embedded Phase 4.1 runtime report failed{reason_suffix}", "PHASE41_RUNTIME_FAILURE")
     if _dict(evaluated.get("gitignore_validation")).get("passed") is not True:
         add("generated artifact .gitignore rules missing", "GITIGNORE_POLICY_FAILURE", implementation=True)
     cleanup = _dict(evaluated.get("cleanup_report"))
@@ -990,6 +1094,12 @@ def validate_phase42h_report_schema(report: dict[str, Any]) -> list[str]:
         errors.append("phase5_ready must be false")
     if not isinstance(report.get("environment"), dict):
         errors.append("environment must be an object")
+    if not isinstance(report.get("phase41_runtime_report_source"), dict):
+        errors.append("phase41_runtime_report_source must be an object")
+    if str(report.get("phase41_runtime_report_status") or "") not in {"pass", "fail", "missing", "unknown"}:
+        errors.append("phase41_runtime_report_status must be pass/fail/missing/unknown")
+    if report.get("phase41_runtime_report_gating") != "hard_fail_when_current_capture_phase41_fails":
+        errors.append("phase41_runtime_report_gating must explain Phase 4.1 hard-fail semantics")
     sources = report.get("sources")
     if not isinstance(sources, dict):
         errors.append("sources must be an object")
@@ -1071,6 +1181,7 @@ def render_phase42h_markdown(report: dict[str, Any]) -> str:
     writer = _dict(report.get("writer_batch_report"))
     environment = _dict(report.get("environment"))
     preflight = _dict(report.get("preflight_report"))
+    phase41_source = _dict(report.get("phase41_runtime_report_source"))
     receive_lag = _dict(_dict(_dict(report.get("sources")).get("depth_mid")).get("corrected_receive_lag"))
     hybrid = _dict(_dict(_dict(_dict(report.get("sources")).get("depth_mid")).get("corrected_hybrid")).get("corrected_hybrid_100ms"))
     lines = [
@@ -1095,6 +1206,14 @@ def render_phase42h_markdown(report: dict[str, Any]) -> str:
         f"- Machine profile: `{environment.get('machine_profile')}`",
         f"- Run mode: `{environment.get('run_mode')}`",
         f"- Preflight passed: `{preflight.get('passed')}`",
+        "",
+        "## Embedded Phase 4.1",
+        "",
+        f"- Runtime report status: `{report.get('phase41_runtime_report_status')}`",
+        f"- Runtime report source: `{phase41_source.get('source')}`",
+        f"- Runtime report fresh: `{phase41_source.get('fresh')}`",
+        f"- Gating: `{report.get('phase41_runtime_report_gating')}`",
+        f"- Failure reasons: `{json.dumps(report.get('phase41_runtime_report_failure_reasons', []), sort_keys=True)}`",
         "",
         "## Hot Path",
         "",
@@ -1180,7 +1299,7 @@ def create_phase42h_bundle(
 def phase42h_bundle_missing_files(bundle_path: str | Path, *, pass_bundle: bool = True) -> list[str]:
     with zipfile.ZipFile(bundle_path) as archive:
         names = set(archive.namelist())
-    required = list(PHASE42H_REQUIRED_BUNDLE_FILES)
+    required: list[str] = list(PHASE42H_REQUIRED_BUNDLE_FILES)
     if not pass_bundle:
         required.append(_display_path(PHASE42H_INVESTIGATION))
     return [name for name in required if name not in names]
@@ -1225,6 +1344,9 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
         "TYPECHECK_FAILURE",
         "PREFLIGHT_FAILURE",
         "GITIGNORE_POLICY_FAILURE",
+        "PHASE41_RUNTIME_FAILURE",
+        "PHASE41_RUNTIME_REPORT_MISSING",
+        "PHASE41_RUNTIME_STALE_RISK",
         "FRESH_CAPTURE_NOT_PERFORMED",
         "FRESH_CAPTURE_DURATION_FAILURE",
         "CLOCK_SYNC_FAILURE",
@@ -1276,8 +1398,12 @@ def _memory_total_mb() -> int:
     sysconf = getattr(os, "sysconf", None)
     if callable(sysconf):
         try:
-            page_size = int(sysconf("SC_PAGE_SIZE"))
-            page_count = int(sysconf("SC_PHYS_PAGES"))
+            page_size_raw = sysconf("SC_PAGE_SIZE")
+            page_count_raw = sysconf("SC_PHYS_PAGES")
+            if not isinstance(page_size_raw, (int, float, str)) or not isinstance(page_count_raw, (int, float, str)):
+                return 0
+            page_size = int(page_size_raw)
+            page_count = int(page_count_raw)
         except (OSError, TypeError, ValueError):
             return 0
         return int((page_size * page_count) / (1024 * 1024))

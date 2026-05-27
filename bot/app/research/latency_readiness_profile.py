@@ -95,7 +95,7 @@ LATENCY_METRIC_NAMES = (
     "parse_to_apply_start_ms",
     "book_apply_duration_ms",
     "apply_to_sample_emit_ms",
-    "sample_emit_to_queue_put_ms",
+    "input_queue_put_to_sample_emit_ms",
     "queue_wait_ms",
     "writer_wait_ms",
     "file_write_duration_ms",
@@ -896,7 +896,7 @@ def create_phase42fg_bundle(
 def phase42fg_bundle_missing_files(bundle_path: str | Path, *, pass_bundle: bool = True) -> list[str]:
     with zipfile.ZipFile(bundle_path) as archive:
         names = set(archive.namelist())
-    required = list(PHASE42FG_REQUIRED_BUNDLE_FILES)
+    required: list[str] = list(PHASE42FG_REQUIRED_BUNDLE_FILES)
     if not pass_bundle:
         required.append(_display_path(PHASE42FG_INVESTIGATION))
     return [name for name in required if name not in names]

@@ -433,7 +433,8 @@ def build_receive_time_label(
     }
     if not isinstance(feature_ts, int) or target_ts is None:
         return {**base, "invalid_reason": "FEATURE_TIMESTAMP_INVALID"}
-    if not _valid_price(feature_mid_price):
+    feature_mid_price_value = _float_or_none(feature_mid_price)
+    if feature_mid_price_value is None or feature_mid_price_value <= 0:
         return {**base, "invalid_reason": "CURRENT_MID_INVALID"}
     if not reference_timestamps_ns or target_ts > reference_timestamps_ns[-1]:
         return {**base, "invalid_reason": "NO_FUTURE_REFERENCE"}
@@ -459,9 +460,10 @@ def build_receive_time_label(
         return {**base, "invalid_reason": "LABEL_LEAKAGE_FUTURE_BEFORE_TARGET"}
     if future_gap_ms > REQUIRED_100MS_MAX_FUTURE_GAP_MS:
         return {**base, "invalid_reason": "FUTURE_REFERENCE_GAP_TOO_LARGE"}
-    if not _valid_price(future_price):
+    future_price_value = _float_or_none(future_price)
+    if future_price_value is None or future_price_value <= 0:
         return {**base, "invalid_reason": "FUTURE_REFERENCE_PRICE_INVALID"}
-    return_bps = compute_return_bps(float(feature_mid_price), float(future_price))
+    return_bps = compute_return_bps(feature_mid_price_value, future_price_value)
     return {
         **base,
         "return_bps": return_bps,
@@ -516,7 +518,8 @@ def build_exchange_time_label(
         return {**base, "invalid_reason": unsupported_reason}
     if feature_exchange_ms is None or target_exchange_ms is None:
         return {**base, "invalid_reason": "FEATURE_EXCHANGE_TIMESTAMP_MISSING"}
-    if not _valid_price(feature_mid_price):
+    feature_mid_price_value = _float_or_none(feature_mid_price)
+    if feature_mid_price_value is None or feature_mid_price_value <= 0:
         return {**base, "invalid_reason": "CURRENT_MID_INVALID"}
     if not reference_exchange_timestamps_ms or target_exchange_ms > reference_exchange_timestamps_ms[-1]:
         return {**base, "invalid_reason": "NO_FUTURE_REFERENCE"}
@@ -554,9 +557,10 @@ def build_exchange_time_label(
         return {**base, "invalid_reason": "LABEL_LEAKAGE_FUTURE_BEFORE_TARGET"}
     if future_gap_ms > REQUIRED_100MS_MAX_FUTURE_GAP_MS:
         return {**base, "invalid_reason": "FUTURE_REFERENCE_GAP_TOO_LARGE"}
-    if not _valid_price(future_price):
+    future_price_value = _float_or_none(future_price)
+    if future_price_value is None or future_price_value <= 0:
         return {**base, "invalid_reason": "FUTURE_REFERENCE_PRICE_INVALID"}
-    return_bps = compute_return_bps(float(feature_mid_price), float(future_price))
+    return_bps = compute_return_bps(feature_mid_price_value, future_price_value)
     return {
         **base,
         "return_bps": return_bps,

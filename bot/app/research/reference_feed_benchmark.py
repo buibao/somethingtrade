@@ -1713,7 +1713,7 @@ def _gap_distribution_summary(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_depth_runtime_quality(quality: dict[str, Any]) -> dict[str, Any]:
-    normalized = {field: int(_num(quality.get(field))) for field in DEPTH_RUNTIME_ZERO_FIELDS}
+    normalized: dict[str, Any] = {field: int(_num(quality.get(field))) for field in DEPTH_RUNTIME_ZERO_FIELDS}
     normalized["snapshot_copy_p99_us"] = _num(quality.get("snapshot_copy_p99_us"))
     return normalized
 

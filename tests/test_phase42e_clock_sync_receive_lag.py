@@ -1,17 +1,16 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from typing import Any
 import zipfile
 
 import pytest
 
 from app.research.clock_sync_receive_lag import (
     CORRECTED_TIME_PROTOCOL_LABELS,
-    HYBRID_BUDGETS_MS,
     PHASE42E_FAIL_AUDIT_BUNDLE,
-    REQUIRED_100MS_MAX_FUTURE_GAP_MS,
     build_clock_sanity_report,
     build_corrected_hybrid_label,
     build_phase42e_report,
@@ -37,6 +36,8 @@ from app.research.reference_feed_benchmark import (
     validate_reference_event_schema,
 )
 from app.research.time_protocol_benchmark import (
+    HYBRID_BUDGETS_MS,
+    REQUIRED_100MS_MAX_FUTURE_GAP_MS,
     build_exchange_time_label,
     source_exchange_ts_ms,
     validate_gitignore_rules,
@@ -55,7 +56,7 @@ def _level(price: float, size: float) -> list[str]:
     return [f"{price:.8f}", f"{size:.8f}"]
 
 
-def _sample(local_ms: int, exchange_ms: int, *, lag_ms: float = 37_500.0, last_update_id: int = 100) -> dict[str, object]:
+def _sample(local_ms: int, exchange_ms: int, *, lag_ms: float = 37_500.0, last_update_id: int = 100) -> dict[str, Any]:
     best_bid = 100.0 + last_update_id / 10_000.0
     best_ask = best_bid + 1.0
     return {
@@ -88,8 +89,8 @@ def _ref(
     lag_ms: float = 37_510.0,
     include_t: bool = True,
     include_e: bool = True,
-) -> dict[str, object]:
-    base: dict[str, object] = {
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
         "symbol": "BTCUSDT",
         "local_recv_monotonic_ns": local_ms * 1_000_000,
         "local_recv_wall_ts": _wall((exchange_ms or 0) + lag_ms),
@@ -142,9 +143,9 @@ def _ref(
     raise AssertionError(source)
 
 
-def _validation(source: str, rows: list[dict[str, object]], *, file_exists: bool = True) -> ReferenceValidationResult:
-    valid: list[dict[str, object]] = []
-    invalid: list[dict[str, object]] = []
+def _validation(source: str, rows: list[dict[str, Any]], *, file_exists: bool = True) -> ReferenceValidationResult:
+    valid: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
     for row in rows:
         errors = validate_reference_event_schema(row, source)
         if errors:
@@ -164,7 +165,7 @@ def _validation(source: str, rows: list[dict[str, object]], *, file_exists: bool
     )
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
@@ -192,7 +193,7 @@ def _write_required_gitignore(root: Path) -> None:
     )
 
 
-def _clock_samples(offset: float = 37_480.0, *, drift: float = 0.0, rtt: float = 10.0) -> list[dict[str, object]]:
+def _clock_samples(offset: float = 37_480.0, *, drift: float = 0.0, rtt: float = 10.0) -> list[dict[str, Any]]:
     return [
         build_server_time_sample(
             sample_id=1,
@@ -211,7 +212,7 @@ def _clock_samples(offset: float = 37_480.0, *, drift: float = 0.0, rtt: float =
     ]
 
 
-def _analysis_fixture(tmp_path: Path, *, feature_lag_ms: float = 37_500.0, offset: float = 37_480.0) -> tuple[dict[str, object], list[dict[str, object]]]:
+def _analysis_fixture(tmp_path: Path, *, feature_lag_ms: float = 37_500.0, offset: float = 37_480.0) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     _write_required_gitignore(tmp_path)
     samples = [
         _sample(index * 100, index * 100, lag_ms=feature_lag_ms, last_update_id=100 + index)
@@ -451,8 +452,12 @@ def test_exchange_time_safety_rules_still_hold() -> None:
     )
     assert label["future_reference_event_id"] == 2
     assert label["selection_time_basis"] == "exchange_ts"
-    assert source_exchange_ts_ms(_ref("trade_price", 100, 100, include_t=True), "trade_price")[0] == "T"
-    assert source_exchange_ts_ms(_ref("aggTrade_price", 100, 100, include_t=True), "aggTrade_price")[0] == "T"
+    trade_ts = source_exchange_ts_ms(_ref("trade_price", 100, 100, include_t=True), "trade_price")
+    aggtrade_ts = source_exchange_ts_ms(_ref("aggTrade_price", 100, 100, include_t=True), "aggTrade_price")
+    assert trade_ts is not None
+    assert aggtrade_ts is not None
+    assert trade_ts[0] == "T"
+    assert aggtrade_ts[0] == "T"
     schema = validate_timestamp_schema([sample], {"bookTicker_mid": [_ref("bookTicker_mid", 100, None, include_e=False)]})
     assert schema["sources"]["bookTicker_mid"]["exchange_time_supported"] is False
     assert REQUIRED_100MS_MAX_FUTURE_GAP_MS == 100
@@ -586,3 +591,4 @@ def test_corrected_lag_negative_beyond_skew_fails() -> None:
     )
     assert within["valid"] is True
     assert beyond["invalid_reason"] == "CORRECTED_LAG_CLOCK_SANITY_FAILURE"
+

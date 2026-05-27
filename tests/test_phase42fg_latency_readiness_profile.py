@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from decimal import Decimal
 import json
 from pathlib import Path
+from typing import Any
 import zipfile
 
 import pytest
@@ -31,7 +32,7 @@ from app.research.reference_feed_benchmark import REFERENCE_SOURCES
 from app.research.time_protocol_benchmark import REQUIRED_100MS_MAX_FUTURE_GAP_MS
 
 
-def _hybrid_metrics(rate: float, *, p95: float = 80.0, p99: float = 120.0, budget: int = 100) -> dict[str, object]:
+def _hybrid_metrics(rate: float, *, p95: float = 80.0, p99: float = 120.0, budget: int = 100) -> dict[str, Any]:
     return {
         "horizon_ms": 100,
         "max_future_gap_ms": REQUIRED_100MS_MAX_FUTURE_GAP_MS,
@@ -48,8 +49,8 @@ def _hybrid_metrics(rate: float, *, p95: float = 80.0, p99: float = 120.0, budge
     }
 
 
-def _sources(*, h100: float = 0.0, h250: float = 0.96, p95: float = 146.0, p99: float = 326.0) -> dict[str, dict[str, object]]:
-    sources: dict[str, dict[str, object]] = {}
+def _sources(*, h100: float = 0.0, h250: float = 0.96, p95: float = 146.0, p99: float = 326.0) -> dict[str, dict[str, Any]]:
+    sources: dict[str, dict[str, Any]] = {}
     for source in REFERENCE_SOURCES:
         supported = source == "depth_mid"
         sources[source] = {
@@ -77,7 +78,7 @@ def _sources(*, h100: float = 0.0, h250: float = 0.96, p95: float = 146.0, p99: 
     return sources
 
 
-def _clock_summary() -> dict[str, object]:
+def _clock_summary() -> dict[str, Any]:
     samples = [
         build_server_time_sample(
             sample_id=1,
@@ -97,7 +98,7 @@ def _clock_summary() -> dict[str, object]:
     return compute_clock_offset_summary(samples)
 
 
-def _clock_sanity() -> dict[str, object]:
+def _clock_sanity() -> dict[str, Any]:
     return {
         "performed": True,
         "clock_sanity_valid": True,
@@ -107,11 +108,11 @@ def _clock_sanity() -> dict[str, object]:
     }
 
 
-def _leakage() -> dict[str, object]:
+def _leakage() -> dict[str, Any]:
     return {"performed": True, "feature_leakage_violations": 0, "label_leakage_violations": 0}
 
 
-def _queue_report(*, drops: int = 0) -> dict[str, object]:
+def _queue_report(*, drops: int = 0) -> dict[str, Any]:
     return {
         "performed": True,
         "queue_max_size": 3,
@@ -134,7 +135,7 @@ def _queue_report(*, drops: int = 0) -> dict[str, object]:
     }
 
 
-def _latency_profile() -> dict[str, object]:
+def _latency_profile() -> dict[str, Any]:
     return {
         "performed": True,
         "sample_count": 1,
@@ -150,7 +151,7 @@ def _latency_profile() -> dict[str, object]:
     }
 
 
-def _phase41(*, sequence_gap_count: int = 0, drops: int = 0) -> dict[str, object]:
+def _phase41(*, sequence_gap_count: int = 0, drops: int = 0) -> dict[str, Any]:
     return {
         "sequence_gap_count": sequence_gap_count,
         "queue": {
@@ -167,7 +168,7 @@ def _phase41(*, sequence_gap_count: int = 0, drops: int = 0) -> dict[str, object
     }
 
 
-def _report(*, h100: float = 0.0, h250: float = 0.96, p95: float = 146.0, p99: float = 326.0, drops: int = 0, gaps: int = 0) -> dict[str, object]:
+def _report(*, h100: float = 0.0, h250: float = 0.96, p95: float = 146.0, p99: float = 326.0, drops: int = 0, gaps: int = 0) -> dict[str, Any]:
     return build_phase42fg_report(
         symbol="BTCUSDT",
         clean_samples=[{"ok": True}],
@@ -279,6 +280,8 @@ def test_latency_stage_profile_schema_and_calculations(tmp_path: Path) -> None:
     )
     assert row["metrics"]["parse_duration_ms"] == pytest.approx(0.2)
     assert row["metrics"]["book_apply_duration_ms"] == pytest.approx(0.5)
+    assert row["metrics"]["input_queue_put_to_sample_emit_ms"] == pytest.approx(1.4)
+    assert "sample_emit_to_queue_put_ms" not in row["metrics"]
     assert row["metrics"]["file_write_duration_ms"] == pytest.approx(0.3)
     assert row["metrics"]["end_to_end_local_hot_path_ms"] == pytest.approx(2.2)
     assert "socket_recv_monotonic_ns" in row["stage_not_available"]

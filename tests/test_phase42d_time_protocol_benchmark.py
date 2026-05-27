@@ -1,10 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 import zipfile
 
 import pytest
@@ -58,7 +59,7 @@ def _sample(
     *,
     lag_ms: int = 5,
     last_update_id: int = 100,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     best_bid = 100.0 + last_update_id / 10_000.0
     best_ask = best_bid + 1.0
     return {
@@ -95,8 +96,8 @@ def _ref(
     lag_ms: int = 5,
     include_t: bool = True,
     include_e: bool = True,
-) -> dict[str, object]:
-    base: dict[str, object] = {
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
         "symbol": "BTCUSDT",
         "local_recv_monotonic_ns": local_ms * 1_000_000,
         "local_recv_wall_ts": _wall((exchange_ms or 0) + lag_ms),
@@ -149,9 +150,9 @@ def _ref(
     raise AssertionError(source)
 
 
-def _validation(source: str, rows: list[dict[str, object]], *, file_exists: bool = True) -> ReferenceValidationResult:
-    valid: list[dict[str, object]] = []
-    invalid: list[dict[str, object]] = []
+def _validation(source: str, rows: list[dict[str, Any]], *, file_exists: bool = True) -> ReferenceValidationResult:
+    valid: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
     for row in rows:
         errors = validate_reference_event_schema(row, source)
         if errors:
@@ -171,7 +172,7 @@ def _validation(source: str, rows: list[dict[str, object]], *, file_exists: bool
     )
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
@@ -199,7 +200,7 @@ def _write_required_gitignore(root: Path) -> None:
     )
 
 
-def _analysis_fixture(tmp_path: Path, *, feature_lag_ms: int = 5) -> dict[str, object]:
+def _analysis_fixture(tmp_path: Path, *, feature_lag_ms: int = 5) -> dict[str, Any]:
     _write_required_gitignore(tmp_path)
     samples = [
         _sample(index * 100, index * 100, lag_ms=feature_lag_ms, last_update_id=100 + index)
@@ -538,3 +539,4 @@ def test_receive_lag_calculation_and_clock_report() -> None:
     rows = generate_time_protocol_rows(samples, {"trade_price": refs}, schema)
     clock = build_clock_sanity_report(rows)
     assert clock["clock_sanity_blocker_by_source"]["trade_price"] is True
+

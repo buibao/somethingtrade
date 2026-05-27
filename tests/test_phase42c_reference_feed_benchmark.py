@@ -1,10 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -50,7 +51,7 @@ def _level(price: float, size: float) -> list[str]:
     return [f"{price:.8f}", f"{size:.8f}"]
 
 
-def _sample_ms(ts_ms: int, *, last_update_id: int = 100) -> dict[str, object]:
+def _sample_ms(ts_ms: int, *, last_update_id: int = 100) -> dict[str, Any]:
     best_bid = 100.0 + last_update_id / 10_000.0
     best_ask = best_bid + 1.0
     return {
@@ -77,8 +78,8 @@ def _sample_ms(ts_ms: int, *, last_update_id: int = 100) -> dict[str, object]:
     }
 
 
-def _ref_ns(source: str, ts_ns: int, *, event_id: int = 1, price: float = 101.0) -> dict[str, object]:
-    base: dict[str, object] = {
+def _ref_ns(source: str, ts_ns: int, *, event_id: int = 1, price: float = 101.0) -> dict[str, Any]:
+    base: dict[str, Any] = {
         "symbol": "BTCUSDT",
         "local_recv_monotonic_ns": ts_ns,
         "local_recv_wall_ts": "2026-05-20T00:00:00.000000+00:00",
@@ -126,13 +127,13 @@ def _ref_ns(source: str, ts_ns: int, *, event_id: int = 1, price: float = 101.0)
     raise AssertionError(source)
 
 
-def _ref_ms(source: str, ts_ms: float, *, event_id: int = 1, price: float = 101.0) -> dict[str, object]:
+def _ref_ms(source: str, ts_ms: float, *, event_id: int = 1, price: float = 101.0) -> dict[str, Any]:
     return _ref_ns(source, int(ts_ms * 1_000_000), event_id=event_id, price=price)
 
 
-def _validation(source: str, rows: list[dict[str, object]], *, file_exists: bool = True) -> ReferenceValidationResult:
-    valid: list[dict[str, object]] = []
-    invalid: list[dict[str, object]] = []
+def _validation(source: str, rows: list[dict[str, Any]], *, file_exists: bool = True) -> ReferenceValidationResult:
+    valid: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
     for row in rows:
         errors = validate_reference_event_schema(row, source)
         if errors:
@@ -153,13 +154,13 @@ def _validation(source: str, rows: list[dict[str, object]], *, file_exists: bool
     )
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
-def _runtime_quality(**overrides: object) -> dict[str, object]:
-    quality: dict[str, object] = {
+def _runtime_quality(**overrides: object) -> dict[str, Any]:
+    quality: dict[str, Any] = {
         "sample_before_ready_count": 0,
         "feed_receive_stale_count": 0,
         "queue_dropped_messages": 0,
@@ -175,8 +176,8 @@ def _runtime_quality(**overrides: object) -> dict[str, object]:
     return quality
 
 
-def _capture(**overrides: object) -> dict[str, object]:
-    capture: dict[str, object] = {
+def _capture(**overrides: object) -> dict[str, Any]:
+    capture: dict[str, Any] = {
         "fresh_capture_performed": False,
         "fixture_mode": True,
         "duration_sec": 10.0,
@@ -194,7 +195,7 @@ def _diagnostics(
     missing_stream: str | None = None,
     message_overrides: dict[str, int] | None = None,
     parsed_overrides: dict[str, int] | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     streams = required_streams(symbol)
     if missing_stream is not None:
         streams = [stream for stream in streams if stream != missing_stream]
@@ -237,7 +238,7 @@ def _diagnostics(
     }
 
 
-def _metrics(source: str, rate: float, *, leakage: int = 0, monotonic: int = 0) -> dict[str, object]:
+def _metrics(source: str, rate: float, *, leakage: int = 0, monotonic: int = 0) -> dict[str, Any]:
     passes = rate >= 0.95 and leakage == 0 and monotonic == 0
     return {
         "reference_source": source,
@@ -275,7 +276,7 @@ def _metrics(source: str, rate: float, *, leakage: int = 0, monotonic: int = 0) 
     }
 
 
-def _report_from_rates(rates: dict[str, float]) -> dict[str, object]:
+def _report_from_rates(rates: dict[str, float]) -> dict[str, Any]:
     metrics = {source: _metrics(source, rates[source]) for source in REFERENCE_SOURCES}
     benchmark_rows = [{"local_recv_monotonic_ns": 0, "reference_labels": {}}]
     return build_phase42c_report(
@@ -766,3 +767,4 @@ def test_phase42c_self_check_skip_capture_fixture_passes_and_creates_bundle(tmp_
     assert self_check["passed"] is True
     assert self_check["bundle_created"] is True
     assert (tmp_path / "phase_4_2c_reference_feed_benchmark_bundle.zip").exists()
+
