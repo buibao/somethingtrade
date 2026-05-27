@@ -738,6 +738,7 @@ def _failure_report(
         "primary_failure": classification,
         "failure_classifications": [classification],
         "market_time_label_ready": False,
+        "phase41_runtime_ready": False,
         "strict_100ms_observability_ready": False,
         "relaxed_250ms_observability_candidate": False,
         "low_latency_ready": False,

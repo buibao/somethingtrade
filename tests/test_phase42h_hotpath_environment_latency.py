@@ -212,6 +212,8 @@ def _report(
     writer_errors: int = 0,
     writer_flushed: bool = True,
     gaps: int = 0,
+    phase41_report: dict[str, Any] | None = None,
+    fresh_capture_required: bool = False,
 ) -> dict[str, Any]:
     writer = _writer_report(dropped=writer_drops, errors=writer_errors, flushed=writer_flushed)
     return build_phase42h_report(
@@ -226,7 +228,7 @@ def _report(
         latency_profile=_latency_profile(),
         queue_report=_queue_report(drops=queue_drops, writer=writer),
         writer_report=writer,
-        phase41_report=_phase41(gaps=gaps, writer=writer),
+        phase41_report=phase41_report if phase41_report is not None else _phase41(gaps=gaps, writer=writer),
         capture={"duration_sec": 1800.0, "fresh_capture_performed": True, "fixture_mode": False, "skip_capture": False},
         cleanup_report={"cleanup_performed": True, "errors": []},
         gitignore_validation={"passed": True},
@@ -234,7 +236,7 @@ def _report(
         pytest_passed=True,
         typecheck_passed=True,
         typecheck_summary="passed",
-        fresh_capture_required=False,
+        fresh_capture_required=fresh_capture_required,
         labeled_sample_count=1,
     )
 
@@ -353,6 +355,40 @@ def test_strict_ready_requires_hybrid_100ms_feature_lag_queue_writer_and_sequenc
     assert _report(h100=0.97, p95=80.0, p99=120.0, queue_drops=1)["strict_100ms_observability_ready"] is False
     assert _report(h100=0.97, p95=80.0, p99=120.0, writer_drops=1)["strict_100ms_observability_ready"] is False
     assert _report(h100=0.97, p95=80.0, p99=120.0, gaps=1)["strict_100ms_observability_ready"] is False
+
+
+def test_phase41_runtime_fail_blocks_low_latency_even_without_sequence_gaps() -> None:
+    phase41 = {
+        **_phase41(gaps=0),
+        "phase_4_1_pass": False,
+        "phase_4_1_status": "fail",
+        "phase_4_1_failure_reasons": ["snapshot_copy_p99_us > snapshot_copy_budget_us"],
+    }
+    report = _report(h100=0.97, h250=0.98, p95=80.0, p99=120.0, phase41_report=phase41)
+    assert report["phase41_runtime_report_status"] == "fail"
+    assert report["phase41_runtime_ready"] is False
+    assert report["strict_100ms_observability_ready"] is False
+    assert report["low_latency_ready"] is False
+    assert report["readiness_decision_reason"] == "phase41_runtime_report_failed"
+    assert report["status"] == "fail"
+    assert "PHASE41_RUNTIME_FAILURE" in report["failure_classifications"]
+
+
+def test_phase41_runtime_missing_blocks_fresh_capture_strict_readiness() -> None:
+    report = _report(
+        h100=0.97,
+        h250=0.98,
+        p95=80.0,
+        p99=120.0,
+        phase41_report={},
+        fresh_capture_required=True,
+    )
+    assert report["phase41_runtime_report_status"] == "missing"
+    assert report["phase41_runtime_ready"] is False
+    assert report["strict_100ms_observability_ready"] is False
+    assert report["low_latency_ready"] is False
+    assert report["readiness_decision_reason"] == "phase41_runtime_report_missing"
+    assert "PHASE41_RUNTIME_REPORT_MISSING" in report["failure_classifications"]
 
 
 def test_readiness_invariants_are_hard_failures() -> None:

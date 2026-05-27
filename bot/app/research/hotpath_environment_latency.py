@@ -150,6 +150,7 @@ PHASE42H_REQUIRED_REPORT_FIELDS = frozenset(
         "primary_failure",
         "failure_classifications",
         "market_time_label_ready",
+        "phase41_runtime_ready",
         "strict_100ms_observability_ready",
         "relaxed_250ms_observability_candidate",
         "low_latency_ready",
@@ -855,6 +856,8 @@ def compute_readiness_semantics(
     queue_ok = _num(queue_report.get("queue_dropped_messages")) == 0
     writer_ok = _num(writer_report.get("writer_dropped_records")) == 0 and _num(writer_report.get("writer_error_count")) == 0 and writer_report.get("writer_shutdown_flush_completed") is True
     sequence_ok = _num(phase41_report.get("sequence_gap_count")) == 0
+    phase41_status = phase41_runtime_report_status(phase41_report)
+    phase41_runtime_ready = phase41_status == "pass" and sequence_ok
     exchange_candidates = [
         (source, report)
         for source, report in sources.items()
@@ -868,7 +871,7 @@ def compute_readiness_semantics(
         clock_ok=clock_ok,
         queue_ok=queue_ok,
         writer_ok=writer_ok,
-        sequence_ok=sequence_ok,
+        phase41_runtime_ready=phase41_runtime_ready,
     )
     strict_ready = strict_candidate is not None
     relaxed_250 = (
@@ -881,6 +884,14 @@ def compute_readiness_semantics(
     )
     if strict_ready:
         reason = "strict_100ms_corrected_hybrid_observability_passed"
+    elif phase41_status == "fail":
+        reason = "phase41_runtime_report_failed"
+    elif phase41_status == "missing":
+        reason = "phase41_runtime_report_missing"
+    elif phase41_status != "pass":
+        reason = "phase41_runtime_report_unknown"
+    elif not sequence_ok:
+        reason = "phase41_runtime_sequence_gap_detected"
     elif relaxed_250:
         reason = "corrected_hybrid_250ms_passed_but_strict_100ms_observability_failed"
     elif market_time_label_ready:
@@ -889,6 +900,7 @@ def compute_readiness_semantics(
         reason = "market_time_label_not_ready"
     return {
         "market_time_label_ready": market_time_label_ready,
+        "phase41_runtime_ready": phase41_runtime_ready,
         "strict_100ms_observability_ready": strict_ready,
         "relaxed_250ms_observability_candidate": relaxed_250,
         "low_latency_ready": strict_ready,
@@ -1057,6 +1069,14 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
         add("low_latency_ready does not equal strict_100ms_observability_ready", "READINESS_SEMANTICS_FAILURE", implementation=True)
     if evaluated.get("low_latency_ready") is True and evaluated.get("strict_100ms_observability_ready") is not True:
         add("low_latency_ready=true while strict_100ms_observability_ready=false", "READINESS_SEMANTICS_FAILURE", implementation=True)
+    sequence_ok = _num(_dict(evaluated.get("phase41_runtime_report")).get("sequence_gap_count")) == 0
+    expected_phase41_runtime_ready = phase41_status == "pass" and sequence_ok
+    if evaluated.get("phase41_runtime_ready") is not expected_phase41_runtime_ready:
+        add("phase41_runtime_ready does not match embedded Phase 4.1 runtime report status and sequence gaps", "READINESS_SEMANTICS_FAILURE", implementation=True)
+    if expected_phase41_runtime_ready is False and (
+        evaluated.get("strict_100ms_observability_ready") is True or evaluated.get("low_latency_ready") is True
+    ):
+        add("strict/low-latency readiness true while embedded Phase 4.1 runtime gate failed", "READINESS_SEMANTICS_FAILURE", implementation=True)
     if evaluated.get("phase5_ready") is not False:
         add("phase5_ready must be false in Phase 4.2H", "PHASE5_READY_FORBIDDEN", implementation=True)
     if not str(evaluated.get("readiness_decision_reason") or "").strip():
@@ -1090,6 +1110,8 @@ def validate_phase42h_report_schema(report: dict[str, Any]) -> list[str]:
         errors.append("max_future_gap_ms must be 100")
     if report.get("low_latency_ready") is not report.get("strict_100ms_observability_ready"):
         errors.append("low_latency_ready must equal strict_100ms_observability_ready")
+    if not isinstance(report.get("phase41_runtime_ready"), bool):
+        errors.append("phase41_runtime_ready must be a boolean")
     if report.get("phase5_ready") is not False:
         errors.append("phase5_ready must be false")
     if not isinstance(report.get("environment"), dict):
@@ -1156,6 +1178,7 @@ def write_phase42h_artifacts(
         "hot_path_decoupling_status": report.get("hot_path_decoupling_status"),
         "writer_status": report.get("writer_status"),
         "strict_100ms_observability_ready": report.get("strict_100ms_observability_ready"),
+        "phase41_runtime_ready": report.get("phase41_runtime_ready"),
         "low_latency_ready": report.get("low_latency_ready"),
         "phase5_ready": report.get("phase5_ready"),
         "relaxed_250ms_observability_candidate": report.get("relaxed_250ms_observability_candidate"),
@@ -1192,6 +1215,7 @@ def render_phase42h_markdown(report: dict[str, Any]) -> str:
         "## Readiness",
         "",
         f"- Market-time label ready: `{report.get('market_time_label_ready')}`",
+        f"- Phase 4.1 runtime ready: `{report.get('phase41_runtime_ready')}`",
         f"- Strict 100ms observability ready: `{report.get('strict_100ms_observability_ready')}`",
         f"- Relaxed 250ms candidate: `{report.get('relaxed_250ms_observability_candidate')}`",
         f"- Low latency ready: `{report.get('low_latency_ready')}`",
@@ -1556,9 +1580,9 @@ def _select_strict_100ms_candidate(
     clock_ok: bool,
     queue_ok: bool,
     writer_ok: bool,
-    sequence_ok: bool,
+    phase41_runtime_ready: bool,
 ) -> dict[str, Any] | None:
-    if not (market_time_label_ready and clock_ok and queue_ok and writer_ok and sequence_ok):
+    if not (market_time_label_ready and clock_ok and queue_ok and writer_ok and phase41_runtime_ready):
         return None
     candidates: list[dict[str, Any]] = []
     for source, report in exchange_candidates:
