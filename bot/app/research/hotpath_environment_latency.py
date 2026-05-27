@@ -937,7 +937,7 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
             implementation_status = "fail"
         if classification in {"FRESH_CAPTURE_NOT_PERFORMED", "FRESH_CAPTURE_DURATION_FAILURE"}:
             fresh_capture_status = "fail"
-        if classification in {"CLOCK_SYNC_FAILURE", "CLOCK_OFFSET_DRIFT_FAILURE", "SERVER_TIME_RTT_FAILURE"}:
+        if classification in {"CLOCK_SYNC_FAILURE", "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE", "CLOCK_OFFSET_DRIFT_FAILURE", "SERVER_TIME_RTT_FAILURE"}:
             clock_sync_status = "fail"
         if classification in {"READINESS_SEMANTICS_FAILURE", "PHASE5_READY_FORBIDDEN"}:
             readiness_semantics_status = "fail"
@@ -996,12 +996,18 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
     if evaluated.get("future_receive_lag_hard_gate_used") is not False:
         add("future_receive_lag used as hard validity gate", "FUTURE_RECEIVE_LAG_GATE_FAILURE", implementation=True)
     clock_summary = _dict(evaluated.get("clock_offset_summary"))
-    if clock_summary.get("estimated_clock_offset_ms") is None:
-        add("clock offset was not computed", "CLOCK_SYNC_FAILURE")
-    if clock_summary.get("offset_drift_ms") is None:
-        add("clock offset drift was not computed", "CLOCK_SYNC_FAILURE")
-    if clock_summary.get("clock_offset_drift_valid") is not True:
-        add("clock offset drift exceeded threshold", "CLOCK_OFFSET_DRIFT_FAILURE")
+    sample_quality_valid = clock_summary.get("clock_offset_sample_quality_valid") is True
+    if not sample_quality_valid:
+        accepted = clock_summary.get("accepted_clock_sample_count")
+        minimum = clock_summary.get("min_accepted_clock_sample_count")
+        add(f"too few low-RTT Binance server-time samples accepted for clock offset: {accepted} < {minimum}", "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE")
+    else:
+        if clock_summary.get("estimated_clock_offset_ms") is None:
+            add("clock offset was not computed", "CLOCK_SYNC_FAILURE")
+        if clock_summary.get("offset_drift_ms") is None:
+            add("clock offset drift was not computed", "CLOCK_SYNC_FAILURE")
+        elif clock_summary.get("clock_offset_drift_valid") is not True:
+            add("clock offset drift exceeded threshold", "CLOCK_OFFSET_DRIFT_FAILURE")
     if _num(clock_summary.get("server_time_rtt_p95_ms")) > SERVER_TIME_RTT_HARD_FAIL_MS:
         add("server-time RTT p95 exceeded hard threshold", "SERVER_TIME_RTT_FAILURE")
     if _num(clock_summary.get("server_time_rtt_p95_ms")) > SERVER_TIME_RTT_WARNING_MS:
@@ -1374,6 +1380,7 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
         "FRESH_CAPTURE_NOT_PERFORMED",
         "FRESH_CAPTURE_DURATION_FAILURE",
         "CLOCK_SYNC_FAILURE",
+        "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE",
         "CLOCK_OFFSET_DRIFT_FAILURE",
         "SERVER_TIME_RTT_FAILURE",
         "LATENCY_PROFILE_MISSING",

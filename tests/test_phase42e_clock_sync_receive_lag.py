@@ -212,6 +212,36 @@ def _clock_samples(offset: float = 37_480.0, *, drift: float = 0.0, rtt: float =
     ]
 
 
+def _clock_sample_from_offset(
+    *,
+    sample_id: int,
+    phase: str,
+    offset_ms: float,
+    rtt_ms: float,
+    server_time_ms: float,
+) -> dict[str, Any]:
+    return build_server_time_sample(
+        sample_id=sample_id,
+        phase=phase,
+        local_wall_before_request_ms=server_time_ms + offset_ms - rtt_ms / 2.0,
+        local_wall_after_response_ms=server_time_ms + offset_ms + rtt_ms / 2.0,
+        binance_server_time_ms=server_time_ms,
+    )
+
+
+def _robust_clock_outlier_samples() -> list[dict[str, Any]]:
+    return [
+        _clock_sample_from_offset(sample_id=1, phase="before_capture", offset_ms=-74.0117, rtt_ms=220.7639, server_time_ms=1_000.0),
+        _clock_sample_from_offset(sample_id=2, phase="during_capture", offset_ms=-3.6, rtt_ms=83.6, server_time_ms=2_000.0),
+        _clock_sample_from_offset(sample_id=3, phase="during_capture", offset_ms=-4.1, rtt_ms=82.0, server_time_ms=3_000.0),
+        _clock_sample_from_offset(sample_id=4, phase="during_capture", offset_ms=-5.0, rtt_ms=84.0, server_time_ms=4_000.0),
+        _clock_sample_from_offset(sample_id=5, phase="during_capture", offset_ms=-5.4, rtt_ms=81.5, server_time_ms=5_000.0),
+        _clock_sample_from_offset(sample_id=6, phase="during_capture", offset_ms=-6.0, rtt_ms=85.0, server_time_ms=6_000.0),
+        _clock_sample_from_offset(sample_id=7, phase="during_capture", offset_ms=-6.5, rtt_ms=83.0, server_time_ms=7_000.0),
+        _clock_sample_from_offset(sample_id=8, phase="after_capture", offset_ms=-4.9, rtt_ms=82.5, server_time_ms=8_000.0),
+    ]
+
+
 def _analysis_fixture(tmp_path: Path, *, feature_lag_ms: float = 37_500.0, offset: float = 37_480.0) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     _write_required_gitignore(tmp_path)
     samples = [
@@ -294,6 +324,104 @@ def test_clock_offset_summary_requires_before_after_and_drift() -> None:
         }
     )
     assert "CLOCK_SYNC_FAILURE" in report["failure_classifications"]
+
+
+def test_clock_offset_robust_estimator_discards_high_rtt_outlier() -> None:
+    samples = _robust_clock_outlier_samples()
+    summary = compute_clock_offset_summary(samples)
+
+    assert summary["clock_offset_estimator_strategy"] == "low_rtt_trimmed_median"
+    assert summary["raw_clock_offset_drift_ms"] > 65.0
+    assert summary["robust_offset_drift_ms"] == pytest.approx(2.9)
+    assert summary["robust_clock_offset_drift_valid"] is True
+    assert summary["clock_offset_drift_valid"] is True
+    assert summary["discarded_clock_sample_count"] == 1
+    assert summary["discarded_clock_sample_reasons"][0]["reason"] == "high_rtt_outlier"
+    assert samples[0]["server_time_rtt_ms"] == pytest.approx(220.7639)
+    assert samples[0]["accepted_for_clock_offset"] is False
+    assert samples[0]["rejection_reason"] == "high_rtt_outlier"
+    assert all(sample["accepted_for_clock_offset"] is True for sample in samples[1:])
+
+
+def test_clock_offset_real_drift_across_low_rtt_samples_still_fails() -> None:
+    samples = [
+        _clock_sample_from_offset(sample_id=1, phase="before_capture", offset_ms=-1.0, rtt_ms=20.0, server_time_ms=1_000.0),
+        _clock_sample_from_offset(sample_id=2, phase="during_capture", offset_ms=25.0, rtt_ms=21.0, server_time_ms=2_000.0),
+        _clock_sample_from_offset(sample_id=3, phase="after_capture", offset_ms=62.0, rtt_ms=19.0, server_time_ms=3_000.0),
+    ]
+    summary = compute_clock_offset_summary(samples)
+    assert summary["clock_offset_sample_quality_valid"] is True
+    assert summary["robust_offset_drift_ms"] == pytest.approx(63.0)
+    assert summary["clock_offset_drift_valid"] is False
+
+    report = evaluate_phase42e_report(
+        {
+            "phase": "4.2E",
+            "status": "pass",
+            "implementation_status": "pass",
+            "fresh_capture_status": "pass",
+            "clock_sync_status": "pass",
+            "exchange_time_coverage_status": "pass",
+            "corrected_hybrid_status": "pass",
+            "protocol_decision_status": "pass",
+            "low_latency_ready": False,
+            "primary_failure": None,
+            "failure_classifications": [],
+            "symbol": "BTCUSDT",
+            "duration_sec": 1800.0,
+            "fresh_capture_required": False,
+            "max_future_gap_ms": REQUIRED_100MS_MAX_FUTURE_GAP_MS,
+            "clock_offset_summary": summary,
+            "clock_sanity_report": build_clock_sanity_report(clock_offset_summary=summary, sources={}),
+            "leakage_check": {"performed": True, "feature_leakage_violations": 0, "label_leakage_violations": 0},
+            "sources": {},
+            "selected_protocol_candidate": None,
+            "hard_fail_reasons": [],
+            "warning_reasons": [],
+        }
+    )
+    assert "CLOCK_OFFSET_DRIFT_FAILURE" in report["failure_classifications"]
+
+
+def test_clock_offset_sample_quality_failure_when_too_few_low_rtt_samples() -> None:
+    samples = [
+        _clock_sample_from_offset(sample_id=1, phase="before_capture", offset_ms=-74.0, rtt_ms=220.0, server_time_ms=1_000.0),
+        _clock_sample_from_offset(sample_id=2, phase="during_capture", offset_ms=-5.0, rtt_ms=221.0, server_time_ms=2_000.0),
+        _clock_sample_from_offset(sample_id=3, phase="after_capture", offset_ms=-4.0, rtt_ms=20.0, server_time_ms=3_000.0),
+    ]
+    summary = compute_clock_offset_summary(samples)
+    assert summary["accepted_clock_sample_count"] == 1
+    assert summary["clock_offset_sample_quality_valid"] is False
+    assert summary["clock_offset_drift_valid"] is False
+
+    report = evaluate_phase42e_report(
+        {
+            "phase": "4.2E",
+            "status": "pass",
+            "implementation_status": "pass",
+            "fresh_capture_status": "pass",
+            "clock_sync_status": "pass",
+            "exchange_time_coverage_status": "pass",
+            "corrected_hybrid_status": "pass",
+            "protocol_decision_status": "pass",
+            "low_latency_ready": False,
+            "primary_failure": None,
+            "failure_classifications": [],
+            "symbol": "BTCUSDT",
+            "duration_sec": 1800.0,
+            "fresh_capture_required": False,
+            "max_future_gap_ms": REQUIRED_100MS_MAX_FUTURE_GAP_MS,
+            "clock_offset_summary": summary,
+            "clock_sanity_report": build_clock_sanity_report(clock_offset_summary=summary, sources={}),
+            "leakage_check": {"performed": True, "feature_leakage_violations": 0, "label_leakage_violations": 0},
+            "sources": {},
+            "selected_protocol_candidate": None,
+            "hard_fail_reasons": [],
+            "warning_reasons": [],
+        }
+    )
+    assert "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE" in report["failure_classifications"]
+    assert "CLOCK_OFFSET_DRIFT_FAILURE" not in report["failure_classifications"]
 
 
 def test_clock_offset_drift_and_rtt_gates() -> None:
@@ -517,6 +645,14 @@ def test_phase42e_artifacts_and_fail_audit_bundle(tmp_path: Path) -> None:
     assert (tmp_path / "data/reports/phase_4_2e_clock_sync_receive_lag_report.md").exists()
     assert (tmp_path / "data/reports/phase42e_self_check.json").exists()
     assert (tmp_path / "data/debug/phase_4_2e_clock_offset_samples.json").exists()
+    clock_payload = json.loads((tmp_path / "data/debug/phase_4_2e_clock_offset_samples.json").read_text(encoding="utf-8"))
+    assert clock_payload["summary"]["clock_offset_estimator_strategy"] == "low_rtt_trimmed_median"
+    assert "raw_estimated_clock_offset_ms_values" in clock_payload["summary"]
+    assert "raw_server_time_rtt_ms_values" in clock_payload["summary"]
+    assert "discarded_clock_sample_reasons" in clock_payload["summary"]
+    assert "server_time_rtt_ms" in clock_payload["samples"][0]
+    assert "accepted_for_clock_offset" in clock_payload["samples"][0]
+    assert "rejection_reason" in clock_payload["samples"][0]
     assert (tmp_path / "data/debug/phase_4_2e_receive_lag_raw_vs_corrected.json").exists()
     assert (tmp_path / "data/debug/phase_4_2e_corrected_hybrid_summary.json").exists()
     assert (tmp_path / "data/debug/phase_4_2e_clock_sanity_report.json").exists()

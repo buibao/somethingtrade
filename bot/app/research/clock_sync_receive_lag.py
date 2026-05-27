@@ -47,6 +47,10 @@ MAX_CLOCK_OFFSET_DRIFT_MS = 50.0
 SERVER_TIME_RTT_WARNING_MS = 250.0
 SERVER_TIME_RTT_HARD_FAIL_MS = 1000.0
 MAX_NEGATIVE_CORRECTED_LAG_RATE = 0.001
+LOW_RTT_CLOCK_SAMPLE_MAX_MS = 150.0
+LOW_RTT_CLOCK_SAMPLE_MIN_COUNT = 2
+LOW_RTT_DYNAMIC_MARGIN_MS = 25.0
+LOW_RTT_DYNAMIC_MAD_MULTIPLIER = 3.0
 
 CORRECTED_TIME_PROTOCOL_LABELS = Path("data/dataset/phase_4_2e_corrected_time_protocol_labels.jsonl")
 CORRECTED_TIME_PROTOCOL_DATASETS_ZIP = Path("data/dataset/phase_4_2e_corrected_time_protocol_datasets.zip")
@@ -187,6 +191,7 @@ def build_server_time_sample(
     binance_server_time_ms: float,
 ) -> dict[str, Any]:
     midpoint = (local_wall_before_request_ms + local_wall_after_response_ms) / 2.0
+    rtt_ms = local_wall_after_response_ms - local_wall_before_request_ms
     return {
         "sample_id": sample_id,
         "phase": phase,
@@ -194,8 +199,11 @@ def build_server_time_sample(
         "local_wall_after_response_ms": local_wall_after_response_ms,
         "local_wall_midpoint_ms": midpoint,
         "binance_server_time_ms": binance_server_time_ms,
-        "round_trip_ms": local_wall_after_response_ms - local_wall_before_request_ms,
+        "round_trip_ms": rtt_ms,
+        "server_time_rtt_ms": rtt_ms,
         "estimated_clock_offset_ms": midpoint - binance_server_time_ms,
+        "accepted_for_clock_offset": None,
+        "rejection_reason": None,
     }
 
 
@@ -203,32 +211,90 @@ def compute_clock_offset_summary(samples: list[dict[str, Any]]) -> dict[str, Any
     before = [sample for sample in samples if sample.get("phase") == "before_capture"]
     after = [sample for sample in samples if sample.get("phase") == "after_capture"]
     offsets = _finite_values(sample.get("estimated_clock_offset_ms") for sample in samples)
-    rtts = _finite_values(sample.get("round_trip_ms") for sample in samples)
+    rtts = _finite_values(_sample_server_time_rtt_ms(sample) for sample in samples)
     offset_before = _float_or_none(before[0].get("estimated_clock_offset_ms")) if before else None
     offset_after = _float_or_none(after[-1].get("estimated_clock_offset_ms")) if after else None
-    drift = offset_after - offset_before if offset_before is not None and offset_after is not None else None
+    raw_drift = (max(offsets) - min(offsets)) if offsets else None
+    raw_before_after_drift = offset_after - offset_before if offset_before is not None and offset_after is not None else None
+    rtt_threshold = _low_rtt_acceptance_threshold(rtts)
+    accepted_samples: list[dict[str, Any]] = []
+    discarded: list[dict[str, Any]] = []
+    discarded_reason_counts: Counter[str] = Counter()
+    for sample in samples:
+        rtt = _sample_server_time_rtt_ms(sample)
+        if rtt is not None:
+            sample["server_time_rtt_ms"] = rtt
+        offset = _float_or_none(sample.get("estimated_clock_offset_ms"))
+        rejection_reason: str | None = None
+        if rtt is None:
+            rejection_reason = "missing_server_time_rtt"
+        elif offset is None:
+            rejection_reason = "missing_estimated_clock_offset"
+        elif rtt_threshold is None:
+            rejection_reason = "clock_sample_threshold_unavailable"
+        elif rtt > rtt_threshold:
+            rejection_reason = "high_rtt_outlier"
+
+        sample["accepted_for_clock_offset"] = rejection_reason is None
+        sample["rejection_reason"] = rejection_reason
+        if rejection_reason is None:
+            accepted_samples.append(sample)
+        else:
+            discarded_reason_counts[rejection_reason] += 1
+            discarded.append(
+                {
+                    "sample_id": sample.get("sample_id"),
+                    "phase": sample.get("phase"),
+                    "server_time_rtt_ms": rtt,
+                    "estimated_clock_offset_ms": offset,
+                    "reason": rejection_reason,
+                }
+            )
+
+    accepted_offsets = _finite_values(sample.get("estimated_clock_offset_ms") for sample in accepted_samples)
+    trimmed_offsets = _trim_offsets_for_median(accepted_offsets)
+    robust_offset = _percentile(trimmed_offsets, 0.50)
+    robust_drift = (max(accepted_offsets) - min(accepted_offsets)) if len(accepted_offsets) >= LOW_RTT_CLOCK_SAMPLE_MIN_COUNT else None
+    sample_quality_valid = len(accepted_offsets) >= LOW_RTT_CLOCK_SAMPLE_MIN_COUNT
+    robust_drift_valid = sample_quality_valid and robust_drift is not None and robust_drift <= MAX_CLOCK_OFFSET_DRIFT_MS
+    rtt_p50 = _percentile(rtts, 0.50)
+    rtt_p95 = _percentile(rtts, 0.95)
     return {
         "sample_count": len(samples),
         "before_sample_count": len(before),
         "after_sample_count": len(after),
         "offset_before_ms": offset_before,
         "offset_after_ms": offset_after,
-        "offset_median_ms": _percentile(offsets, 0.50),
+        "offset_median_ms": robust_offset,
         "offset_min_ms": min(offsets) if offsets else None,
         "offset_max_ms": max(offsets) if offsets else None,
-        "offset_drift_ms": drift,
-        "offset_abs_drift_ms": abs(drift) if drift is not None else None,
-        "server_time_rtt_p50_ms": _percentile(rtts, 0.50),
-        "server_time_rtt_p95_ms": _percentile(rtts, 0.95),
-        "estimated_clock_offset_ms": _percentile(offsets, 0.50),
-        "estimator": "offset_median_ms",
+        "offset_drift_ms": robust_drift,
+        "offset_abs_drift_ms": robust_drift,
+        "server_time_rtt_p50_ms": rtt_p50,
+        "server_time_rtt_p95_ms": rtt_p95,
+        "estimated_clock_offset_ms": robust_offset,
+        "estimator": "low_rtt_trimmed_median",
+        "clock_offset_estimator_strategy": "low_rtt_trimmed_median",
+        "raw_clock_offset_drift_ms": raw_drift,
+        "raw_before_after_offset_drift_ms": raw_before_after_drift,
+        "raw_estimated_clock_offset_ms_values": offsets,
+        "raw_server_time_rtt_ms_values": rtts,
+        "robust_estimated_clock_offset_ms": robust_offset,
+        "robust_offset_drift_ms": robust_drift,
+        "robust_clock_offset_drift_valid": robust_drift_valid,
+        "accepted_clock_sample_count": len(accepted_offsets),
+        "discarded_clock_sample_count": len(discarded),
+        "discarded_clock_sample_reasons": discarded,
+        "discarded_clock_sample_reason_counts": dict(sorted(discarded_reason_counts.items())),
+        "low_rtt_acceptance_threshold_ms": rtt_threshold,
+        "clock_offset_sample_quality_valid": sample_quality_valid,
+        "min_accepted_clock_sample_count": LOW_RTT_CLOCK_SAMPLE_MIN_COUNT,
         "max_clock_offset_drift_ms": MAX_CLOCK_OFFSET_DRIFT_MS,
         "server_time_rtt_warning_ms": SERVER_TIME_RTT_WARNING_MS,
         "server_time_rtt_hard_fail_ms": SERVER_TIME_RTT_HARD_FAIL_MS,
         "before_after_samples_present": bool(before and after),
-        "clock_offset_drift_valid": drift is not None and abs(drift) <= MAX_CLOCK_OFFSET_DRIFT_MS,
-        "server_time_rtt_valid": _percentile(rtts, 0.95) is not None
-        and float(_percentile(rtts, 0.95) or 0.0) <= SERVER_TIME_RTT_HARD_FAIL_MS,
+        "clock_offset_drift_valid": robust_drift_valid,
+        "server_time_rtt_valid": rtt_p95 is not None and float(rtt_p95 or 0.0) <= SERVER_TIME_RTT_HARD_FAIL_MS,
     }
 
 
@@ -335,7 +401,7 @@ def generate_corrected_time_protocol_rows(
                 **row,
                 "schema_version": "phase_4_2e_corrected_time_protocol_v1",
                 "corrected_protocol_labels": corrected_labels_by_source,
-                "clock_offset_estimator": "offset_median_ms",
+                "clock_offset_estimator": "low_rtt_trimmed_median",
                 "estimated_clock_offset_ms": estimated_clock_offset_ms,
                 "future_receive_lag_hard_gate_used": False,
             }
@@ -449,16 +515,18 @@ def build_clock_sanity_report(
         }
     rtt_p95 = _float_or_none(clock_offset_summary.get("server_time_rtt_p95_ms"))
     drift_valid = clock_offset_summary.get("clock_offset_drift_valid") is True
+    sample_quality_valid = clock_offset_summary.get("clock_offset_sample_quality_valid") is True
     rtt_valid = rtt_p95 is not None and rtt_p95 <= SERVER_TIME_RTT_HARD_FAIL_MS
     return {
         "performed": True,
         "allowed_clock_skew_ms": allowed_clock_skew_ms,
         "max_negative_corrected_lag_rate": max_negative_corrected_lag_rate,
         "clock_offset_drift_valid": drift_valid,
+        "clock_offset_sample_quality_valid": sample_quality_valid,
         "server_time_rtt_valid": rtt_valid,
         "server_time_rtt_warning": rtt_p95 is not None and rtt_p95 > SERVER_TIME_RTT_WARNING_MS,
         "corrected_lag_sanity_valid": corrected_lag_sanity_valid,
-        "clock_sanity_valid": drift_valid and rtt_valid and corrected_lag_sanity_valid,
+        "clock_sanity_valid": sample_quality_valid and drift_valid and rtt_valid and corrected_lag_sanity_valid,
         "sources": source_reports,
     }
 
@@ -679,7 +747,7 @@ def evaluate_phase42e_report(report: dict[str, Any]) -> dict[str, Any]:
             implementation_status = "fail"
         if classification in {"FRESH_CAPTURE_NOT_PERFORMED", "FRESH_CAPTURE_DURATION_FAILURE"}:
             fresh_capture_status = "fail"
-        if classification in {"CLOCK_SYNC_FAILURE", "CLOCK_OFFSET_DRIFT_FAILURE", "SERVER_TIME_RTT_FAILURE", "CORRECTED_LAG_CLOCK_SANITY_FAILURE"}:
+        if classification in {"CLOCK_SYNC_FAILURE", "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE", "CLOCK_OFFSET_DRIFT_FAILURE", "SERVER_TIME_RTT_FAILURE", "CORRECTED_LAG_CLOCK_SANITY_FAILURE"}:
             clock_sync_status = "fail"
         if classification == "CORRECTED_HYBRID_FAILURE":
             corrected_hybrid_status = "fail"
@@ -716,12 +784,18 @@ def evaluate_phase42e_report(report: dict[str, Any]) -> dict[str, Any]:
     clock_summary = _dict(evaluated.get("clock_offset_summary"))
     if _num(clock_summary.get("before_sample_count")) <= 0 or _num(clock_summary.get("after_sample_count")) <= 0:
         add("Binance server time before/after samples missing", "CLOCK_SYNC_FAILURE")
-    if clock_summary.get("estimated_clock_offset_ms") is None:
-        add("clock offset was not computed", "CLOCK_SYNC_FAILURE")
-    if clock_summary.get("offset_drift_ms") is None:
-        add("clock offset drift was not computed", "CLOCK_SYNC_FAILURE")
-    if clock_summary.get("clock_offset_drift_valid") is not True:
-        add("clock offset drift exceeded threshold", "CLOCK_OFFSET_DRIFT_FAILURE")
+    sample_quality_valid = clock_summary.get("clock_offset_sample_quality_valid") is True
+    if not sample_quality_valid:
+        accepted = clock_summary.get("accepted_clock_sample_count")
+        minimum = clock_summary.get("min_accepted_clock_sample_count")
+        add(f"too few low-RTT Binance server-time samples accepted for clock offset: {accepted} < {minimum}", "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE")
+    else:
+        if clock_summary.get("estimated_clock_offset_ms") is None:
+            add("clock offset was not computed", "CLOCK_SYNC_FAILURE")
+        if clock_summary.get("offset_drift_ms") is None:
+            add("clock offset drift was not computed", "CLOCK_SYNC_FAILURE")
+        elif clock_summary.get("clock_offset_drift_valid") is not True:
+            add("clock offset drift exceeded threshold", "CLOCK_OFFSET_DRIFT_FAILURE")
     if clock_summary.get("server_time_rtt_valid") is not True:
         add("server-time RTT p95 exceeded hard threshold", "SERVER_TIME_RTT_FAILURE")
 
@@ -1021,6 +1095,7 @@ def classify_phase42e_failure(report: dict[str, Any]) -> str:
         "FRESH_CAPTURE_NOT_PERFORMED",
         "FRESH_CAPTURE_DURATION_FAILURE",
         "CLOCK_SYNC_FAILURE",
+        "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE",
         "CLOCK_OFFSET_DRIFT_FAILURE",
         "SERVER_TIME_RTT_FAILURE",
         "CORRECTED_LAG_CLOCK_SANITY_FAILURE",
@@ -1043,6 +1118,7 @@ def classify_phase42e_failure(report: dict[str, Any]) -> str:
         "FRESH_CAPTURE_NOT_PERFORMED",
         "FRESH_CAPTURE_DURATION_FAILURE",
         "CLOCK_SYNC_FAILURE",
+        "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE",
         "CLOCK_OFFSET_DRIFT_FAILURE",
         "SERVER_TIME_RTT_FAILURE",
         "CORRECTED_LAG_CLOCK_SANITY_FAILURE",
@@ -1248,6 +1324,27 @@ def _num(value: Any) -> float:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _sample_server_time_rtt_ms(sample: dict[str, Any]) -> float | None:
+    return _float_or_none(sample.get("server_time_rtt_ms", sample.get("round_trip_ms")))
+
+
+def _low_rtt_acceptance_threshold(rtts: list[float]) -> float | None:
+    median = _percentile(rtts, 0.50)
+    if median is None:
+        return None
+    deviations = [abs(value - median) for value in rtts if math.isfinite(value)]
+    mad = _percentile(deviations, 0.50) or 0.0
+    dynamic_threshold = median + max(LOW_RTT_DYNAMIC_MARGIN_MS, LOW_RTT_DYNAMIC_MAD_MULTIPLIER * mad)
+    return min(LOW_RTT_CLOCK_SAMPLE_MAX_MS, dynamic_threshold)
+
+
+def _trim_offsets_for_median(offsets: list[float]) -> list[float]:
+    clean = sorted(value for value in offsets if math.isfinite(value))
+    if len(clean) < 5:
+        return clean
+    return clean[1:-1]
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
