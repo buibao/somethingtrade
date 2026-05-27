@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+import app.research.hotpath_environment_latency as hotpath
 import app.research.phase52_auto_collection as phase52
 from app.research.phase52_auto_collection import (
     ALL_SESSIONS_BUNDLE,
@@ -279,6 +280,61 @@ def test_phase52_simulated_session_001_passes_after_cleanup(tmp_path: Path, monk
     assert "--clean" in commands[0]
     assert result["status"] == "pass"
     assert result["research_eligible"] is True
+
+
+def test_phase52_simulated_session_001_uses_source_gitignore_not_session_gitignore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "\n".join(
+            [
+                "*.jsonl",
+                "data/dataset/",
+                "data/debug/",
+                "data/cache/",
+                "data/logs/",
+                "data/reports/",
+                "logs/",
+                "reports/",
+                "debug/",
+                "cache/",
+                "*.zip",
+                "*.log",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_run(command: list[str], **kwargs) -> SimpleNamespace:
+        if command and command[0] == "git":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        session_dir = Path(command[command.index("--root") + 1])
+        assert not (session_dir / ".gitignore").exists()
+        preflight = hotpath.run_phase42h_vps_preflight(session_dir, source_root=tmp_path, required_imports=("json",), check_network=False)
+        report = synthetic_phase42h_runtime_report(requested_duration_sec=1800)
+        report["preflight_report"] = preflight
+        report["gitignore_validation"] = preflight["checks"]["gitignore_status"]["validation"]
+        if preflight["checks"]["gitignore_status"]["passed"] is not True:
+            report["status"] = "fail"
+            report["primary_failure"] = "GITIGNORE_POLICY_FAILURE"
+            report["failure_classifications"] = ["GITIGNORE_POLICY_FAILURE"]
+        report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        (session_dir / "phase_4_2h_hotpath_environment_latency_bundle.zip").write_bytes(b"phase42h bundle")
+        return SimpleNamespace(returncode=0, stdout="mock phase42h\n", stderr="")
+
+    monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
+    result = run_controlled_capture(
+        root=tmp_path,
+        session_id="session_001_sanity_30m",
+        plan_name="test_plan",
+        requested_duration_sec=1800,
+        dry_run=False,
+        create_bundle=True,
+    )
+
+    assert result["research_eligible"] is True
+    assert "GITIGNORE_POLICY_FAILURE" not in result["metadata"]["failure_reasons"]
 
 
 def test_phase52_simulated_session_001_fails_if_cleanup_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

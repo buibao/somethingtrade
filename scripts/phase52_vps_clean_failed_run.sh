@@ -87,7 +87,7 @@ root = Path.cwd()
 
 active_output = root / "data/phase_5_2"
 timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-archive_target = root / f"data/phase_5_2_failed_before_cleanup_fix_{timestamp}"
+archive_target = root / "data/cache/phase_5_2_failed_runs" / f"phase_5_2_failed_before_cleanup_fix_{timestamp}"
 
 stale_phase52 = [
     "data/debug/phase_5_2_auto_collection_nohup.log",
@@ -203,4 +203,3 @@ print(json.dumps(summary, indent=2, sort_keys=True))
 if errors:
     sys.exit(1)
 PY
-

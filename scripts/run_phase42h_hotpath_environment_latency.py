@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
     if args.preflight_only:
-        preflight_report = run_phase42h_vps_preflight(root)
+        preflight_report = run_phase42h_vps_preflight(root, source_root=SOURCE_ROOT)
         _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
         print(f"Phase 4.2H VPS preflight report: {root / PHASE42H_VPS_PREFLIGHT_REPORT}")
         if preflight_report.get("passed") is not True:
@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     pytest_output = ""
     typecheck_summary = ""
-    gitignore_validation = validate_gitignore_rules(root)
+    gitignore_validation = validate_gitignore_rules(SOURCE_ROOT)
     preflight_report: dict[str, Any] = {"performed": False, "passed": True, "skipped": True}
     setup_report_text = _read_text(root / PHASE42H_VPS_SETUP_REPORT)
 
@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(root / PHASE42H_CLEANUP_REPORT, cleanup_report)
 
     if not args.skip_preflight:
-        preflight_report = run_phase42h_vps_preflight(root)
+        preflight_report = run_phase42h_vps_preflight(root, source_root=SOURCE_ROOT)
         if preflight_report.get("passed") is not True:
             report = _failure_report(
                 args=args,

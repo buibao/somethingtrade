@@ -406,6 +406,49 @@ def test_preflight_fails_if_generated_zip_staged(tmp_path: Path, monkeypatch: py
     assert "phase_4_2h_hotpath_environment_latency_bundle.zip" in report["checks"]["heavy_generated_artifacts_not_tracked_or_staged"]["staged"]
 
 
+def test_phase42h_preflight_uses_source_root_gitignore_when_root_is_session_dir(tmp_path: Path) -> None:
+    source_root = tmp_path / "repo"
+    session_root = source_root / "data/phase_5_2/sessions/session_001_sanity_30m"
+    session_root.mkdir(parents=True)
+    _write_required_gitignore(source_root)
+
+    report = hotpath.run_phase42h_vps_preflight(session_root, source_root=source_root, required_imports=("json",), check_network=False)
+
+    gitignore = report["checks"]["gitignore_status"]
+    assert report["passed"] is True
+    assert not (session_root / ".gitignore").exists()
+    assert gitignore["present"] is True
+    assert gitignore["path"] == str((source_root / ".gitignore").resolve()).replace("\\", "/")
+    assert gitignore["source_root"] == str(source_root.resolve()).replace("\\", "/")
+
+
+def test_phase42h_preflight_fails_when_source_root_gitignore_missing(tmp_path: Path) -> None:
+    source_root = tmp_path / "repo"
+    session_root = source_root / "data/phase_5_2/sessions/session_001_sanity_30m"
+    session_root.mkdir(parents=True)
+
+    report = hotpath.run_phase42h_vps_preflight(session_root, source_root=source_root, required_imports=("json",), check_network=False)
+
+    gitignore = report["checks"]["gitignore_status"]
+    assert report["passed"] is False
+    assert gitignore["present"] is False
+    assert gitignore["path"] == str((source_root / ".gitignore").resolve()).replace("\\", "/")
+    assert ".gitignore missing generated artifact rules" in report["hard_fail_reasons"]
+
+
+def test_phase42h_preflight_passes_without_session_gitignore_when_source_root_has_policy(tmp_path: Path) -> None:
+    source_root = tmp_path / "repo"
+    session_root = source_root / "data/phase_5_2/sessions/session_001_sanity_30m"
+    session_root.mkdir(parents=True)
+    _write_required_gitignore(source_root)
+
+    report = hotpath.run_phase42h_vps_preflight(session_root, source_root=source_root, required_imports=("json",), check_network=False)
+
+    assert not (session_root / ".gitignore").exists()
+    assert report["checks"]["gitignore_status"]["passed"] is True
+    assert report["passed"] is True
+
+
 def test_gitignore_contains_required_generated_patterns() -> None:
     patterns = {
         line.strip()
@@ -419,8 +462,10 @@ def test_gitignore_contains_required_generated_patterns() -> None:
         "data/dataset/",
         "data/debug/",
         "data/cache/",
+        "data/cache/phase_5_2_failed_runs/",
         "data/logs/",
         "data/reports/",
+        "data/phase_5_2/",
         "logs/",
         "reports/",
         "debug/",

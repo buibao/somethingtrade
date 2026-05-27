@@ -347,6 +347,7 @@ def build_environment_metadata(
 def run_phase42h_vps_preflight(
     root: str | Path,
     *,
+    source_root: str | Path | None = None,
     required_imports: tuple[str, ...] = PHASE42H_PREFLIGHT_REQUIRED_IMPORTS,
     binance_time_url: str = BINANCE_SERVER_TIME_URL,
     websocket_host: str = BINANCE_WS_HOST,
@@ -354,6 +355,7 @@ def run_phase42h_vps_preflight(
     check_network: bool = True,
 ) -> dict[str, Any]:
     root_path = Path(root).resolve()
+    source_root_path = Path(source_root).resolve() if source_root is not None else root_path
     checks: dict[str, dict[str, Any]] = {}
     hard_fail_reasons: list[str] = []
 
@@ -417,21 +419,25 @@ def run_phase42h_vps_preflight(
         message="" if writable_result["passed"] else "one or more data directories are not writable",
     )
 
-    gitignore_validation = validate_gitignore_rules(root_path)
-    gitignore_present = (root_path / ".gitignore").exists()
+    gitignore_path = source_root_path / ".gitignore"
+    gitignore_validation = validate_gitignore_rules(source_root_path)
+    gitignore_present = gitignore_path.exists()
     gitignore_ok = gitignore_present and gitignore_validation.get("passed") is True
     record(
         "gitignore_status",
         gitignore_ok,
+        path=_display_path(gitignore_path),
+        source_root=_display_path(source_root_path),
         present=gitignore_present,
         validation=gitignore_validation,
         message="" if gitignore_ok else ".gitignore missing generated artifact rules",
     )
 
-    git_result = _check_no_heavy_git_artifacts(root_path)
+    git_result = _check_no_heavy_git_artifacts(source_root_path)
     record(
         "heavy_generated_artifacts_not_tracked_or_staged",
         git_result["passed"],
+        source_root=_display_path(source_root_path),
         **_without_passed(git_result),
         message="" if git_result["passed"] else "generated heavy artifacts are tracked or staged",
     )

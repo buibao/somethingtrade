@@ -67,12 +67,16 @@ if [[ "${RESUME}" != "1" ]]; then
 fi
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  dirty_state="$(git status --short --untracked-files=all)"
   tracked_generated="$(git ls-files | grep -E '(^data/(dataset|debug|cache|logs|reports)/|(^|/).+\.jsonl$|(^|/).+\.zip$|(^|/).+\.log$)' || true)"
   staged_generated="$(git diff --name-only --cached | grep -E '(^data/(dataset|debug|cache|logs|reports)/|(^|/).+\.jsonl$|(^|/).+\.zip$|(^|/).+\.log$)' || true)"
   deleted_runtime="$(git status --short | awk '/^ D|^D / {print $2}' | grep -E '(^data/phase_5_2/|^data/debug/phase_5_2|^data/reports/phase_5_2)' || true)"
+  legacy_unignored_archives="$(find data -maxdepth 1 -type d -name 'phase_5_2_failed_before_cleanup_fix*' -print 2>/dev/null || true)"
+  [[ -z "${dirty_state}" ]] || fail "git working tree is dirty. Commit/stash/remove changes before starting: ${dirty_state}"
   [[ -z "${tracked_generated}" ]] || fail "generated heavy artifacts are tracked: ${tracked_generated}"
   [[ -z "${staged_generated}" ]] || fail "generated heavy artifacts are staged: ${staged_generated}"
   [[ -z "${deleted_runtime}" ]] || fail "tracked runtime artifacts were deleted by cleanup: ${deleted_runtime}"
+  [[ -z "${legacy_unignored_archives}" ]] || fail "unignored legacy Phase 5.2 archive folders exist: ${legacy_unignored_archives}"
 fi
 
 if ! grep -q -- '"--clean"' bot/app/research/phase52_auto_collection.py; then

@@ -38,7 +38,7 @@ def test_phase52_clean_failed_run_removes_active_output_dir(tmp_path: Path) -> N
 
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "data/phase_5_2").exists()
-    assert list((tmp_path / "data").glob("phase_5_2_failed_before_cleanup_fix_*"))
+    assert list((tmp_path / "data/cache/phase_5_2_failed_runs").glob("phase_5_2_failed_before_cleanup_fix_*"))
 
 
 def test_phase52_clean_failed_run_removes_stale_debug_files(tmp_path: Path) -> None:
@@ -99,6 +99,38 @@ def test_phase52_start_allows_clean_start_after_cleanup(tmp_path: Path) -> None:
     assert "--fail-session-on-quality-gate" in result.stdout
 
 
+def test_phase52_clean_failed_run_archive_mode_keeps_git_status_clean(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(CLEAN_SCRIPT, tmp_path)
+    _init_clean_git_repo_with_script(tmp_path, script)
+    active = tmp_path / "data/phase_5_2/sessions/session_001_sanity_30m"
+    active.mkdir(parents=True)
+    (active / "stale.txt").write_text("stale", encoding="utf-8")
+
+    result = subprocess.run([bash, str(script), "--archive-active-output"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+    status = subprocess.run(["git", "status", "--short", "--untracked-files=all"], cwd=tmp_path, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert status.returncode == 0
+    assert status.stdout == ""
+    assert list((tmp_path / "data/cache/phase_5_2_failed_runs").glob("phase_5_2_failed_before_cleanup_fix_*"))
+
+
+def test_phase52_start_refuses_dirty_git_state_including_untracked_archive(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(START_SCRIPT, tmp_path)
+    _write_phase52_runner_marker(tmp_path)
+    _init_clean_git_repo_with_script(tmp_path, script)
+    legacy_archive = tmp_path / "data/phase_5_2_failed_before_cleanup_fix_legacy"
+    legacy_archive.mkdir(parents=True)
+    (legacy_archive / "artifact.txt").write_text("old", encoding="utf-8")
+
+    result = subprocess.run([bash, str(script), "--dry-run"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert result.returncode != 0
+    assert "git working tree is dirty" in result.stderr
+
+
 def test_phase52_cli_clean_start_creates_session_001(tmp_path: Path) -> None:
     result = _run_phase52_cli(tmp_path, test_max_sessions=1)
 
@@ -135,6 +167,7 @@ def test_phase52_all_sessions_sha256_has_exact_gitignore_pattern() -> None:
         if line.strip() and not line.strip().startswith("#")
     }
     assert "phase_5_2_auto_collection_all_sessions_sha256.txt" in patterns
+    assert "data/cache/phase_5_2_failed_runs/" in patterns
 
 
 def _run_phase52_cli(tmp_path: Path, *, test_max_sessions: int) -> subprocess.CompletedProcess[str]:
@@ -178,6 +211,33 @@ def _write_phase52_runner_marker(tmp_path: Path) -> None:
     marker = tmp_path / "bot/app/research/phase52_auto_collection.py"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text('command = ["--clean"]\n', encoding="utf-8")
+
+
+def _init_clean_git_repo_with_script(tmp_path: Path, script: Path) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "\n".join(
+            [
+                "data/phase_5_2/",
+                "data/cache/",
+                "data/cache/phase_5_2_failed_runs/",
+                "phase_5_2_auto_collection_all_sessions_sha256.txt",
+                "*.zip",
+                "*.log",
+                "*.jsonl",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=tmp_path, text=True, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    tracked = [".gitignore", str(script.relative_to(tmp_path)).replace("\\", "/")]
+    marker = tmp_path / "bot/app/research/phase52_auto_collection.py"
+    if marker.exists():
+        tracked.append(str(marker.relative_to(tmp_path)).replace("\\", "/"))
+    subprocess.run(["git", "add", *tracked], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=tmp_path, text=True, capture_output=True, check=True)
 
 
 def _require_bash() -> str:
