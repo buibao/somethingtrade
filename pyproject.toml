@@ -24,5 +24,5 @@ where = ["bot"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["bot"]
+pythonpath = [".", "bot"]
 testpaths = ["tests"]

@@ -789,13 +789,10 @@ def _failure_report(
 
 
 def _run_pytest(output_path: Path) -> tuple[int, str]:
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONPATH"] = str(SOURCE_ROOT / "bot")
     process = subprocess.run(
         [sys.executable, "-X", "utf8", "-m", "pytest", "-q"],
         cwd=SOURCE_ROOT,
-        env=env,
+        env=_subprocess_env(),
         text=True,
         capture_output=True,
     )
@@ -817,10 +814,7 @@ def _run_typecheck(output_path: Path) -> tuple[int, str]:
     else:
         tool = "compileall"
         command = [sys.executable, "-X", "utf8", "-m", "compileall", "bot/app", "scripts", "tests"]
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONPATH"] = str(SOURCE_ROOT / "bot")
-    process = subprocess.run(command, cwd=SOURCE_ROOT, env=env, text=True, capture_output=True)
+    process = subprocess.run(command, cwd=SOURCE_ROOT, env=_subprocess_env(), text=True, capture_output=True)
     output = process.stdout + process.stderr
     summary = "passed" if process.returncode == 0 else "failed"
     report = "\n".join(
@@ -839,6 +833,17 @@ def _run_typecheck(output_path: Path) -> tuple[int, str]:
     sys.stdout.write(process.stdout)
     sys.stderr.write(process.stderr)
     return process.returncode, f"typecheck/compileall {summary} with {tool}"
+
+
+def _subprocess_pythonpath(root: Path = SOURCE_ROOT) -> str:
+    return os.pathsep.join([str(root), str(root / "bot")])
+
+
+def _subprocess_env(root: Path = SOURCE_ROOT) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONPATH"] = _subprocess_pythonpath(root)
+    return env
 
 
 def _mypy_is_configured() -> bool:
