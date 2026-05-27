@@ -1,0 +1,4 @@
+filename: phase_5_2_session_002_short_1h_capture_bundle.zip
+sha256: 17395357e3ec9b08c64249e6b1a2836ed539748c86213f0fb1b2ed3ccc86b827
+file_size_bytes: 806
+utc_timestamp: 2026-05-27T14:50:41Z

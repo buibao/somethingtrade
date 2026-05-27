@@ -1,0 +1,19 @@
+{
+  "bundle_sha256_valid": true,
+  "checks": {
+    "bundle_sha256_valid": true,
+    "clock_offset_drift_valid": true,
+    "clock_offset_sample_quality_valid": true,
+    "clock_sync_status_pass": true,
+    "low_latency_ready": true,
+    "phase41_status_pass": true,
+    "primary_failure_none": true,
+    "status_pass": true,
+    "strict_100ms_observability_ready": true
+  },
+  "failure_reasons": [],
+  "phase": "5.2",
+  "research_eligible": true,
+  "status": "pass",
+  "strict_100ms_hard_requirement": true
+}
