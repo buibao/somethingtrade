@@ -72,6 +72,30 @@ def test_pass_fail_evaluator_clean_report_passes() -> None:
     assert reasons == []
 
 
+def test_pass_fail_evaluator_snapshot_copy_p99_over_budget_fails() -> None:
+    passed, reasons = evaluate_phase_4_1_pass(
+        _report(
+            snapshot_copy_p99_us=201.0,
+            snapshot_copy_budget_us=200.0,
+            snapshot_copy_budget_met=False,
+        )
+    )
+    assert passed is False
+    assert "snapshot_copy_p99_us > snapshot_copy_budget_us" in reasons
+
+
+def test_pass_fail_evaluator_snapshot_copy_p99_at_budget_passes() -> None:
+    passed, reasons = evaluate_phase_4_1_pass(
+        _report(
+            snapshot_copy_p99_us=200.0,
+            snapshot_copy_budget_us=200.0,
+            snapshot_copy_budget_met=True,
+        )
+    )
+    assert passed is True
+    assert reasons == []
+
+
 def test_report_with_sequence_gap_is_false_and_has_failure_reason(tmp_path) -> None:
     processor = make_processor(tmp_path)
     processor.process_depth_update(

@@ -335,19 +335,11 @@ class OrderbookState:
         side: str,
         n: int = 20,
     ) -> tuple[tuple[Decimal, Decimal], ...]:
-        book = self.bids if side == "bid" else self.asks
         self._ensure_price_indexes()
-        if n <= 0:
-            return ()
-        prices = (
-            list(reversed(self._bid_prices_asc[-n:]))
+        return (
+            self._copy_top_bid_levels(n)
             if side == "bid"
-            else self._ask_prices_asc[:n]
-        )
-        return tuple(
-            (price, book[price])
-            for price in prices
-            if book[price] != DECIMAL_ZERO
+            else self._copy_top_ask_levels(n)
         )
 
     def copy_snapshot(
@@ -357,8 +349,9 @@ class OrderbookState:
         local_recv_monotonic_ns: int | None = None,
         local_recv_wall_ts: str | None = None,
     ) -> OrderbookSnapshot:
-        bids_top_n = self.top_n(side="bid", n=top_n)
-        asks_top_n = self.top_n(side="ask", n=top_n)
+        self._ensure_price_indexes()
+        bids_top_n = self._copy_top_bid_levels(top_n)
+        asks_top_n = self._copy_top_ask_levels(top_n)
         bid = bids_top_n[0][0] if bids_top_n else None
         ask = asks_top_n[0][0] if asks_top_n else None
         spread = ask - bid if bid is not None and ask is not None else None
@@ -382,6 +375,34 @@ class OrderbookState:
             local_recv_monotonic_ns=local_recv_monotonic_ns or monotonic_now_ns(),
             local_recv_wall_ts=local_recv_wall_ts or self.last_local_recv_wall_ts or _utc_iso_now(),
         )
+
+    def _copy_top_bid_levels(self, n: int) -> tuple[tuple[Decimal, Decimal], ...]:
+        if n <= 0:
+            return ()
+        book = self.bids
+        prices = self._bid_prices_asc
+        start = max(len(prices) - n, 0)
+        levels: list[tuple[Decimal, Decimal]] = []
+        for index in range(len(prices) - 1, start - 1, -1):
+            price = prices[index]
+            size = book[price]
+            if size != DECIMAL_ZERO:
+                levels.append((price, size))
+        return tuple(levels)
+
+    def _copy_top_ask_levels(self, n: int) -> tuple[tuple[Decimal, Decimal], ...]:
+        if n <= 0:
+            return ()
+        book = self.asks
+        prices = self._ask_prices_asc
+        limit = min(len(prices), n)
+        levels: list[tuple[Decimal, Decimal]] = []
+        for index in range(limit):
+            price = prices[index]
+            size = book[price]
+            if size != DECIMAL_ZERO:
+                levels.append((price, size))
+        return tuple(levels)
 
     def validate(self) -> tuple[str, ...]:
         errors = list(_active_level_errors(self.bids))

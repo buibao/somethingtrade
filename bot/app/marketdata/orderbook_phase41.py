@@ -414,6 +414,8 @@ class OrderbookPhase41Processor:
         self.counters: Counter[str] = Counter()
         self.blocked_by_quality_error: Counter[str] = Counter()
         self.snapshot_copy_us_samples: deque[float] = deque(maxlen=4096)
+        self.snapshot_copied_bid_level_counts: deque[int] = deque(maxlen=4096)
+        self.snapshot_copied_ask_level_counts: deque[int] = deque(maxlen=4096)
         self.stale_periods: deque[dict[str, Any]] = deque(maxlen=256)
         self.processor_apply_stale_warnings: deque[dict[str, Any]] = deque(maxlen=256)
         self.post_capture_age_warnings: deque[dict[str, Any]] = deque(maxlen=256)
@@ -547,7 +549,8 @@ class OrderbookPhase41Processor:
         if result.accepted:
             self.counters["deltas_accepted"] += 1
             self._close_stale_period(event.symbol, now_monotonic_ns=recv_monotonic_ns)
-            snapshot = self.copy_snapshot(state)
+            local_recv_wall_ts = _utc_iso_from_ns(event.local_received_ts) or _utc_iso_now()
+            snapshot = self.copy_snapshot(state, local_recv_wall_ts=local_recv_wall_ts)
             validation_now_ns = max(self.monotonic_clock(), recv_monotonic_ns)
             quality = self.validator.validate(
                 snapshot,
@@ -588,7 +591,8 @@ class OrderbookPhase41Processor:
             elif result.status == "invalid_delta_levels":
                 self.counters["invalid_delta_count"] += 1
                 self.counters["ready_to_emit_disabled_count"] += 1
-                snapshot = self.copy_snapshot(state)
+                local_recv_wall_ts = _utc_iso_from_ns(event.local_received_ts) or _utc_iso_now()
+                snapshot = self.copy_snapshot(state, local_recv_wall_ts=local_recv_wall_ts)
                 self.debug.record_invalid_delta_case(
                     result,
                     symbol=event.symbol,
@@ -679,18 +683,26 @@ class OrderbookPhase41Processor:
             )
         return quality
 
-    def copy_snapshot(self, state: OrderbookState) -> OrderbookSnapshot:
-        start = time.perf_counter_ns()
+    def copy_snapshot(
+        self,
+        state: OrderbookState,
+        *,
+        local_recv_wall_ts: str | None = None,
+    ) -> OrderbookSnapshot:
         now_ns = self.monotonic_clock()
         if state.last_local_recv_monotonic_ns is not None:
             now_ns = max(now_ns, state.last_local_recv_monotonic_ns)
+        wall_ts = local_recv_wall_ts or _utc_iso_now()
+        start = time.perf_counter_ns()
         snapshot = state.copy_snapshot(
             top_n=self.depth_n,
             local_recv_monotonic_ns=now_ns,
-            local_recv_wall_ts=_utc_iso_now(),
+            local_recv_wall_ts=wall_ts,
         )
         elapsed_us = (time.perf_counter_ns() - start) / 1_000.0
         self.snapshot_copy_us_samples.append(elapsed_us)
+        self.snapshot_copied_bid_level_counts.append(len(snapshot.bids_top_n))
+        self.snapshot_copied_ask_level_counts.append(len(snapshot.asks_top_n))
         return snapshot
 
     def cleanup_symbol(self, symbol: str) -> None:
@@ -1032,7 +1044,13 @@ class OrderbookPhase41Processor:
             now_monotonic_ns=self.monotonic_clock(),
             feed_active=self.capture_active,
         )
-        snapshot_copy_p99_us = _percentile(list(self.snapshot_copy_us_samples), 0.99)
+        snapshot_copy_samples = list(self.snapshot_copy_us_samples)
+        snapshot_copy_p50_us = _percentile(snapshot_copy_samples, 0.50)
+        snapshot_copy_p95_us = _percentile(snapshot_copy_samples, 0.95)
+        snapshot_copy_p99_us = _percentile(snapshot_copy_samples, 0.99)
+        snapshot_copy_max_us = max(snapshot_copy_samples) if snapshot_copy_samples else 0.0
+        copied_bid_level_count = max(self.snapshot_copied_bid_level_counts) if self.snapshot_copied_bid_level_counts else 0
+        copied_ask_level_count = max(self.snapshot_copied_ask_level_counts) if self.snapshot_copied_ask_level_counts else 0
         lifecycle_report = self.lifecycle.report()
         queue_report = self.queue_monitor.report()
         lifecycle_report.update(
@@ -1101,9 +1119,16 @@ class OrderbookPhase41Processor:
             "queue_lag_backpressure_events": int(queue_report["queue_lag_backpressure_events"]),
             "processing_lag_backpressure_events": int(queue_report["processing_lag_backpressure_events"]),
             "snapshot_blocking_lag_events": int(queue_report["snapshot_blocking_lag_events"]),
+            "snapshot_copy_p50_us": snapshot_copy_p50_us,
+            "snapshot_copy_p95_us": snapshot_copy_p95_us,
             "snapshot_copy_p99_us": snapshot_copy_p99_us,
+            "snapshot_copy_max_us": snapshot_copy_max_us,
+            "snapshot_copy_sample_count": len(snapshot_copy_samples),
             "snapshot_copy_budget_us": SNAPSHOT_COPY_BUDGET_US,
             "snapshot_copy_budget_met": snapshot_copy_p99_us <= SNAPSHOT_COPY_BUDGET_US,
+            "copied_bid_level_count": copied_bid_level_count,
+            "copied_ask_level_count": copied_ask_level_count,
+            "snapshot_copy_strategy": "top_n_index_slice_immutable_tuples_no_full_book_copy",
             "blocked_by_quality_error": dict(sorted(self.blocked_by_quality_error.items())),
             "queue": queue_report,
             "writer_batch_report": self.writer_report(),
@@ -2006,9 +2031,19 @@ def render_phase41_markdown_report(summary: dict[str, Any]) -> str:
         f"- Queue lag p99 ms: {summary.get('queue_lag_p99_ms')}",
         f"- Processing lag p99 ms: {summary.get('processing_lag_p99_ms')}",
         (
-            "- Snapshot copy p99 us: "
-            f"{summary['snapshot_copy_p99_us']} "
-            f"(budget {summary['snapshot_copy_budget_us']}, met={summary['snapshot_copy_budget_met']})"
+            "- Snapshot copy p50/p95/p99/max us: "
+            f"{summary.get('snapshot_copy_p50_us')} / "
+            f"{summary.get('snapshot_copy_p95_us')} / "
+            f"{summary['snapshot_copy_p99_us']} / "
+            f"{summary.get('snapshot_copy_max_us')} "
+            f"(samples {summary.get('snapshot_copy_sample_count')}, "
+            f"budget {summary['snapshot_copy_budget_us']}, met={summary['snapshot_copy_budget_met']})"
+        ),
+        (
+            "- Snapshot copy strategy: "
+            f"{summary.get('snapshot_copy_strategy')} "
+            f"(copied bids={summary.get('copied_bid_level_count')}, "
+            f"asks={summary.get('copied_ask_level_count')})"
         ),
         (
             "- Binance spot market status mode: "
@@ -2126,6 +2161,12 @@ def _validate_sample_levels(
 
 def _utc_iso_now() -> str:
     return datetime.fromtimestamp(utc_now_ns() / 1_000_000_000, tz=UTC).isoformat()
+
+
+def _utc_iso_from_ns(value: int | None) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    return datetime.fromtimestamp(value / 1_000_000_000, tz=UTC).isoformat()
 
 
 def _numeric_value(value: Any) -> float:
