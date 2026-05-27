@@ -34,6 +34,7 @@ PHASE50_LEAKAGE_CHECK = Path("data/debug/phase_5_0_leakage_check.json")
 PHASE50_BUCKET_EDGE_REPORT = Path("data/debug/phase_5_0_bucket_edge_report.json")
 PHASE50_MODEL_BASELINE_REPORT = Path("data/debug/phase_5_0_model_baseline_report.json")
 PHASE50_RUNNER_COMMAND_LOG = Path("data/debug/phase_5_0_runner_command_log.txt")
+PHASE50_PYTEST_CONSOLE_LOG = Path("data/debug/phase_5_0_pytest_console_log.txt")
 PHASE50_FINAL_REPORT_JSON = Path("data/reports/phase_5_0_empirical_signal_report.json")
 PHASE50_FINAL_REPORT_MD = Path("data/reports/phase_5_0_empirical_signal_report.md")
 PHASE50_BUNDLE = Path("phase_5_0_empirical_signal_research_bundle.zip")
@@ -433,7 +434,11 @@ def build_research_samples(dataset_paths: dict[str, Path]) -> tuple[list[dict[st
     aggtrade_rows = sorted(_read_jsonl(dataset_paths["aggtrade"]), key=lambda row: _int(row.get("local_recv_monotonic_ns")) or 0)
     latency_rows = sorted(_read_jsonl(dataset_paths["latency_profile"]), key=lambda row: _int(row.get("local_recv_monotonic_ns")) or 0)
 
-    clean_by_ts = {_int(row.get("local_recv_monotonic_ns")): row for row in clean_rows if _int(row.get("local_recv_monotonic_ns")) is not None}
+    clean_by_ts: dict[int, dict[str, Any]] = {}
+    for row in clean_rows:
+        row_ts = _int(row.get("local_recv_monotonic_ns"))
+        if row_ts is not None:
+            clean_by_ts[row_ts] = row
     book_ts = [_int(row.get("local_recv_monotonic_ns")) or 0 for row in bookticker_rows]
     trade_ts = [_int(row.get("local_recv_monotonic_ns")) or 0 for row in trade_rows]
     aggtrade_ts = [_int(row.get("local_recv_monotonic_ns")) or 0 for row in aggtrade_rows]
@@ -458,8 +463,10 @@ def build_research_samples(dataset_paths: dict[str, Path]) -> tuple[list[dict[st
         target_spread_bps = _float(label_row.get("feature_spread_bps"))
         if target_spread_bps is None and target_mid and best_bid is not None and best_ask is not None:
             target_spread_bps = (best_ask - best_bid) / target_mid * 10_000.0
-        bids = clean.get("bids") if isinstance(clean.get("bids"), list) else []
-        asks = clean.get("asks") if isinstance(clean.get("asks"), list) else []
+        raw_bids = clean.get("bids")
+        raw_asks = clean.get("asks")
+        bids: list[Any] = raw_bids if isinstance(raw_bids, list) else []
+        asks: list[Any] = raw_asks if isinstance(raw_asks, list) else []
 
         ref_mid = _float(book.get("mid_price")) if book else None
         ref_spread_bps = _float(book.get("spread_bps")) if book else None
@@ -658,14 +665,9 @@ def build_split_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
         for row in rows:
             row["split"] = split
 
-    duplicate_sample_ids = _duplicates([sample["sample_id"] for sample in valid_samples])
-    overlap_pairs = _split_overlap_pairs(split_ids)
-    time_overlap = _time_overlap(assignments)
-    passed = n >= 3 and not duplicate_sample_ids and not overlap_pairs and not time_overlap
-    return {
+    report = {
         "phase": PHASE,
         "schema_version": "phase_5_0_split_report_v1",
-        "status": "pass" if passed else "fail",
         "split_method": "deterministic_chronological_time_based",
         "random_split_used": False,
         "random_split_rejected": True,
@@ -680,9 +682,69 @@ def build_split_report(samples: list[dict[str, Any]]) -> dict[str, Any]:
             }
             for split, rows in assignments.items()
         },
-        "duplicate_sample_ids": duplicate_sample_ids,
-        "overlap_pairs": overlap_pairs,
-        "time_overlap_violations": time_overlap,
+        "duplicate_sample_ids": _duplicates([sample["sample_id"] for sample in valid_samples]),
+        "overlap_pairs": _split_overlap_pairs(split_ids),
+        "time_overlap_violations": _time_overlap(assignments),
+    }
+    validation = validate_split_integrity_report(report)
+    report["status"] = validation["status"]
+    report["integrity_failure_reasons"] = validation["failure_reasons"]
+    return report
+
+
+def validate_split_integrity_report(split_report: dict[str, Any]) -> dict[str, Any]:
+    reasons: list[str] = []
+    if split_report.get("split_method") != "deterministic_chronological_time_based":
+        reasons.append("split_method_not_deterministic_chronological")
+    if split_report.get("random_split_used") is True:
+        reasons.append("random_split_used")
+    if split_report.get("random_split_rejected") is not True:
+        reasons.append("random_split_not_explicitly_rejected")
+    if split_report.get("sample_count", 0) < 3:
+        reasons.append("insufficient_samples_for_three_way_split")
+    if split_report.get("duplicate_sample_ids"):
+        reasons.append("duplicate_sample_ids")
+    if split_report.get("overlap_pairs"):
+        reasons.append("split_sample_id_overlap")
+    if split_report.get("time_overlap_violations"):
+        reasons.append("reported_time_overlap")
+
+    splits = _dict(split_report.get("splits"))
+    for split in ("train", "validation", "test"):
+        payload = _dict(splits.get(split))
+        if int(payload.get("sample_count") or 0) <= 0:
+            reasons.append(f"{split}_split_empty")
+
+    split_ids = {split: list(_dict(splits.get(split)).get("sample_ids") or []) for split in ("train", "validation", "test")}
+    computed_duplicates = _duplicates([sample_id for ids in split_ids.values() for sample_id in ids])
+    if computed_duplicates:
+        reasons.append("computed_duplicate_sample_ids_across_splits")
+    computed_overlap = _split_overlap_pairs(split_ids)
+    if computed_overlap:
+        reasons.append("computed_split_sample_id_overlap")
+
+    ranges = {split: _dict(_dict(splits.get(split)).get("time_range_ns")) for split in ("train", "validation", "test")}
+    train = ranges["train"]
+    validation = ranges["validation"]
+    test = ranges["test"]
+    if _range_has_inversion(train):
+        reasons.append("train_time_range_inverted")
+    if _range_has_inversion(validation):
+        reasons.append("validation_time_range_inverted")
+    if _range_has_inversion(test):
+        reasons.append("test_time_range_inverted")
+    if train.get("max") is not None and validation.get("min") is not None and train["max"] >= validation["min"]:
+        reasons.append("train_validation_time_overlap_or_out_of_order")
+    if validation.get("max") is not None and test.get("min") is not None and validation["max"] >= test["min"]:
+        reasons.append("validation_test_time_overlap_or_out_of_order")
+    if train.get("min") is not None and validation.get("min") is not None and train["min"] > validation["min"]:
+        reasons.append("train_validation_chronology_out_of_order")
+    if validation.get("min") is not None and test.get("min") is not None and validation["min"] > test["min"]:
+        reasons.append("validation_test_chronology_out_of_order")
+
+    return {
+        "status": "pass" if not reasons else "fail",
+        "failure_reasons": sorted(set(reasons)),
     }
 
 
@@ -767,7 +829,12 @@ def validate_primary_horizon_ms(primary_horizon_ms: int) -> None:
         raise ValueError("Phase 5.0 primary label horizon must remain exactly 100ms; 250ms is diagnostic only")
 
 
-def build_leakage_report(samples: list[dict[str, Any]], split_report: dict[str, Any]) -> dict[str, Any]:
+def build_leakage_report(
+    samples: list[dict[str, Any]],
+    split_report: dict[str, Any],
+    *,
+    feature_names: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     feature_after_label_start = [
         sample["sample_id"]
         for sample in samples
@@ -784,15 +851,17 @@ def build_leakage_report(samples: list[dict[str, Any]], split_report: dict[str, 
     feature_source_future = [
         sample["sample_id"]
         for sample in samples
-        if sample.get("feature_source_max_ts_ns") is not None and sample["feature_source_max_ts_ns"] > sample["feature_ts_ns"]
+        if _sample_feature_source_max_ts(sample) is not None and _sample_feature_source_max_ts(sample) > sample["feature_ts_ns"]
     ]
-    feature_names = set(MODEL_FEATURE_NAMES)
+    detected_feature_names = set(feature_names or MODEL_FEATURE_NAMES)
+    for sample in samples:
+        detected_feature_names.update(_dict(sample.get("features")).keys())
     future_price_or_orderbook_fields = sorted(
         name
-        for name in feature_names
-        if any(token in name.lower() for token in ("future", "next_", "ahead", "label", "direction_100ms", "return_100ms"))
+        for name in detected_feature_names
+        if _looks_like_future_price_or_orderbook_feature(name)
     )
-    label_derived_features = sorted(name for name in feature_names if name in LABEL_FIELD_NAMES or "label" in name.lower())
+    label_derived_features = sorted(name for name in detected_feature_names if _looks_like_label_derived_feature(name))
     duplicate_ids: list[str] = list(split_report.get("duplicate_sample_ids", []))
     overlap_pairs: list[list[str]] = list(split_report.get("overlap_pairs", []))
     violation_count = (
@@ -974,6 +1043,51 @@ def build_model_baseline_report(samples: list[dict[str, Any]], split_report: dic
     }
 
 
+def bucket_edge_claim_supported(bucket_edge: dict[str, Any]) -> bool:
+    if bucket_edge.get("status") != "pass" or bucket_edge.get("edge_claim_allowed") is not True:
+        return False
+    if int(bucket_edge.get("stable_edge_bucket_count") or 0) <= 0:
+        return False
+    for bucket in bucket_edge.get("buckets", []):
+        if bucket.get("low_sample_bucket") is True:
+            continue
+        stability = _dict(bucket.get("split_stability"))
+        splits = _dict(bucket.get("splits"))
+        validation = _dict(splits.get("validation"))
+        test = _dict(splits.get("test"))
+        if (
+            stability.get("validation_and_test_support") is True
+            and validation.get("edge_after_cost_bps") is not None
+            and test.get("edge_after_cost_bps") is not None
+            and validation["edge_after_cost_bps"] > 0
+            and test["edge_after_cost_bps"] > 0
+        ):
+            return True
+    return False
+
+
+def model_edge_claim_supported(model_baseline: dict[str, Any]) -> bool:
+    if model_baseline.get("status") != "pass" or model_baseline.get("edge_claim_allowed") is not True:
+        return False
+    metrics = _dict(model_baseline.get("metrics"))
+    validation = _dict(metrics.get("validation"))
+    test = _dict(metrics.get("test"))
+    validation_auc = _float(validation.get("auc"))
+    test_auc = _float(test.get("auc"))
+    validation_top_edge = _top_bucket_edge(validation)
+    test_top_edge = _top_bucket_edge(test)
+    return (
+        validation_auc is not None
+        and test_auc is not None
+        and validation_auc >= 0.52
+        and test_auc >= 0.52
+        and validation_top_edge is not None
+        and test_top_edge is not None
+        and validation_top_edge > 0
+        and test_top_edge > 0
+    )
+
+
 def build_final_report(
     *,
     source_gate: dict[str, Any],
@@ -986,11 +1100,14 @@ def build_final_report(
     bucket_edge: dict[str, Any],
     model_baseline: dict[str, Any],
 ) -> dict[str, Any]:
+    split_validation = validate_split_integrity_report(split_report)
+    bucket_claim_supported = bucket_edge_claim_supported(bucket_edge)
+    model_claim_supported = model_edge_claim_supported(model_baseline)
     gates = {
         "source_reproducibility_gate": source_gate.get("status") == "pass",
         "phase42h_evidence_integrity_gate": evidence.get("status") == "pass",
         "dataset_manifest_gate": manifest.get("status") == "pass",
-        "time_based_split_gate": split_report.get("status") == "pass",
+        "time_based_split_gate": split_report.get("status") == "pass" and split_validation["status"] == "pass",
         "feature_schema_gate": feature_schema.get("status") == "pass",
         "strict_100ms_label_gate": label_report.get("status") == "pass" and label_report.get("primary_horizon_ms") == PRIMARY_LABEL_HORIZON_MS,
         "leakage_gate": leakage.get("status") == "pass",
@@ -1000,13 +1117,13 @@ def build_final_report(
     }
     blockers = [name for name, passed in gates.items() if not passed]
     warnings: list[str] = []
-    if bucket_edge.get("edge_claim_allowed") is not True:
+    if not bucket_claim_supported:
         warnings.append("No bucket edge survived conservative costs with validation and test support.")
-    if model_baseline.get("edge_claim_allowed") is not True:
+    if not model_claim_supported:
         warnings.append("Baseline model did not provide validation and test support after conservative costs.")
     if blockers:
         conclusion = "EDGE_FAILED"
-    elif bucket_edge.get("edge_claim_allowed") is True and model_baseline.get("edge_claim_allowed") is True:
+    elif bucket_claim_supported and model_claim_supported:
         conclusion = "EDGE_PROVEN"
     else:
         conclusion = "EDGE_INCONCLUSIVE"
@@ -1021,6 +1138,11 @@ def build_final_report(
         "gates": gates,
         "blockers": blockers,
         "warnings": warnings,
+        "audit_validation": {
+            "split_integrity": split_validation,
+            "bucket_edge_claim_supported": bucket_claim_supported,
+            "model_edge_claim_supported": model_claim_supported,
+        },
         "research_scope_confirmation": {
             "live_trading": False,
             "order_execution": False,
@@ -1115,6 +1237,8 @@ def create_phase50_bundle(root_path: Path) -> dict[str, Any]:
         Path("bot/app/research/microstructure_signal_research.py"),
         Path("pyproject.toml"),
     ]
+    if (root_path / PHASE50_PYTEST_CONSOLE_LOG).exists():
+        required.append(PHASE50_PYTEST_CONSOLE_LOG)
     required.extend(sorted(Path("tests").glob("test_phase50_*.py")))
     required.append(Path("tests/phase50_test_utils.py"))
     missing = [path.as_posix() for path in required if not (root_path / path).exists()]
@@ -1154,7 +1278,11 @@ def _fit_logistic_regression(train: list[dict[str, Any]], feature_names: tuple[s
     means: list[float] = []
     stds: list[float] = []
     for column_index in range(len(feature_names)):
-        values = [row[column_index] for row in matrix if row[column_index] is not None and not _is_null(row[column_index])]
+        values: list[float] = []
+        for row in matrix:
+            value = row[column_index]
+            if value is not None and not _is_null(value):
+                values.append(float(value))
         mean = statistics.fmean(values) if values else 0.0
         std = statistics.pstdev(values) if len(values) > 1 else 1.0
         means.append(mean)
@@ -1317,6 +1445,40 @@ def _top_bucket_edge(metrics: dict[str, Any]) -> float | None:
     return buckets[-1].get("edge_after_cost_bps")
 
 
+def _range_has_inversion(time_range: dict[str, Any]) -> bool:
+    return time_range.get("min") is not None and time_range.get("max") is not None and time_range["min"] > time_range["max"]
+
+
+def _sample_feature_source_max_ts(sample: dict[str, Any]) -> int | None:
+    explicit = _int(sample.get("feature_source_max_ts_ns"))
+    if explicit is not None:
+        return explicit
+    values: list[int] = []
+    for value in _dict(sample.get("feature_source_ts_ns")).values():
+        parsed = _int(value)
+        if parsed is not None:
+            values.append(parsed)
+    return max(values) if values else None
+
+
+def _looks_like_future_price_or_orderbook_feature(name: str) -> bool:
+    lowered = name.lower()
+    has_future_marker = any(marker in lowered for marker in ("future", "next_", "ahead", "lookahead"))
+    has_market_field = any(marker in lowered for marker in ("price", "mid", "bid", "ask", "book", "orderbook", "quote"))
+    return has_future_marker and has_market_field
+
+
+def _looks_like_label_derived_feature(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        name in LABEL_FIELD_NAMES
+        or "label" in lowered
+        or "direction_100ms" in lowered
+        or "return_100ms" in lowered
+        or "valid_100ms" in lowered
+    )
+
+
 def _bucket_stats(samples: list[dict[str, Any]], *, signal_direction: int, low_sample_threshold: int) -> dict[str, Any]:
     returns = [_float(sample.get("future_return_100ms_bps")) for sample in samples]
     clean_returns = [float(value) for value in returns if value is not None]
@@ -1389,12 +1551,12 @@ def _window_rows(rows: list[dict[str, Any]], ts_values: list[int], end_ts: int, 
 
 
 def _window_max_ts(*row_groups: list[dict[str, Any]]) -> int | None:
-    values = [
-        _int(row.get("local_recv_monotonic_ns"))
-        for rows in row_groups
-        for row in rows
-        if _int(row.get("local_recv_monotonic_ns")) is not None
-    ]
+    values: list[int] = []
+    for rows in row_groups:
+        for row in rows:
+            parsed = _int(row.get("local_recv_monotonic_ns"))
+            if parsed is not None:
+                values.append(parsed)
     return max(values) if values else None
 
 
