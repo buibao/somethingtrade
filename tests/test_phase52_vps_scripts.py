@@ -14,6 +14,17 @@ ROOT = Path(__file__).resolve().parents[1]
 CLEAN_SCRIPT = ROOT / "scripts/phase52_vps_clean_failed_run.sh"
 START_SCRIPT = ROOT / "scripts/phase52_vps_24h_start.sh"
 RUN_AUTO_SCRIPT = ROOT / "scripts/run_phase52_auto_collection.py"
+GENERATED_ARTIFACT_PATTERNS_THAT_MUST_NOT_BE_TRACKED = (
+    "phase_5_2_auto_collection_all_sessions_sha256.txt",
+    "phase_4_2h_bundle_sha256.txt",
+    "phase_5_2_auto_collection_all_sessions_bundle.zip",
+    "phase_4_2h_hotpath_environment_latency_bundle.zip",
+    "phase_4_2h_hotpath_environment_latency_fail_audit_bundle.zip",
+    "data/phase_5_2",
+    "data/dataset/*.jsonl",
+    "data/debug/*.json",
+    "data/reports/*.json",
+)
 
 
 def test_phase52_clean_failed_run_removes_active_output_dir(tmp_path: Path) -> None:
@@ -103,6 +114,27 @@ def test_phase52_cli_does_not_start_at_session_002_after_clean(tmp_path: Path) -
     status = json.loads((tmp_path / "data/debug/phase_5_2_auto_collection_status.json").read_text(encoding="utf-8"))
     assert status["current_session"] == "session_001_sanity_30m"
     assert status["completed_session_count"] == 1
+
+
+def test_phase52_generated_artifacts_are_not_tracked_by_git() -> None:
+    result = subprocess.run(
+        ["git", "ls-files", "--", *GENERATED_ARTIFACT_PATTERNS_THAT_MUST_NOT_BE_TRACKED],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == []
+
+
+def test_phase52_all_sessions_sha256_has_exact_gitignore_pattern() -> None:
+    patterns = {
+        line.strip()
+        for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert "phase_5_2_auto_collection_all_sessions_sha256.txt" in patterns
 
 
 def _run_phase52_cli(tmp_path: Path, *, test_max_sessions: int) -> subprocess.CompletedProcess[str]:

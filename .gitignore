@@ -32,6 +32,7 @@ data/debug/
 data/cache/
 data/logs/
 data/reports/
+data/phase_5_2/
 logs/
 reports/
 debug/
@@ -39,3 +40,4 @@ cache/
 *.zip
 *.log
 phase_4_2h_bundle_sha256.txt
+phase_5_2_auto_collection_all_sessions_sha256.txt
