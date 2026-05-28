@@ -97,6 +97,10 @@ stale_phase52 = [
     "data/debug/phase_5_2_stop_after_current_session",
     "data/reports/phase_5_2_auto_collection_report.json",
     "data/reports/phase_5_2_auto_collection_report.md",
+    "phase_5_2_audit_bundle.zip",
+    "phase_5_2_audit_bundle_sha256.txt",
+    "phase_5_2_full_dataset_bundle.zip",
+    "phase_5_2_full_dataset_bundle_sha256.txt",
     "phase_5_2_auto_collection_all_sessions_bundle.zip",
     "phase_5_2_auto_collection_all_sessions_sha256.txt",
 ]

@@ -14,7 +14,9 @@ if str(BOT_PATH) not in sys.path:
 
 from app.research.phase52_auto_collection import (  # noqa: E402
     ALL_SESSIONS_BUNDLE,
+    AUDIT_BUNDLE,
     DEFAULT_COLLECTION_ROOT,
+    FULL_DATASET_BUNDLE,
     MANIFEST_PATH,
     REPORT_JSON_PATH,
     STATUS_PATH,
@@ -38,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stop-after-current-session-file", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--test-max-sessions", type=int, default=None)
+    parser.add_argument("--include-large-datasets", action="store_true")
+    parser.add_argument("--allow-nested-zip", action="store_true")
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
@@ -56,15 +60,19 @@ def main(argv: list[str] | None = None) -> int:
         stop_after_current_session_file=args.stop_after_current_session_file,
         dry_run=args.dry_run,
         test_max_sessions=args.test_max_sessions,
+        include_large_datasets=args.include_large_datasets,
+        allow_nested_zip=args.allow_nested_zip,
     )
     print(f"Phase 5.2 manifest: {root / MANIFEST_PATH}")
     print(f"Phase 5.2 status: {root / STATUS_PATH}")
     print(f"Phase 5.2 report: {root / REPORT_JSON_PATH}")
-    print(f"Phase 5.2 all sessions bundle: {root / ALL_SESSIONS_BUNDLE}")
+    print(f"Phase 5.2 audit bundle: {root / AUDIT_BUNDLE}")
+    if args.include_large_datasets:
+        print(f"Phase 5.2 full dataset bundle: {root / FULL_DATASET_BUNDLE}")
+    print(f"Phase 5.2 all sessions bundle alias: {root / ALL_SESSIONS_BUNDLE}")
     print(f"Research eligible sessions: {report['manifest']['research_eligible_session_count']}")
     return 0 if report.get("status") == "pass" else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

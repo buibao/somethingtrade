@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -13,11 +14,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 CLEAN_SCRIPT = ROOT / "scripts/phase52_vps_clean_failed_run.sh"
 START_SCRIPT = ROOT / "scripts/phase52_vps_24h_start.sh"
+COLLECT_SCRIPT = ROOT / "scripts/phase52_vps_collect_artifacts.sh"
 RUN_AUTO_SCRIPT = ROOT / "scripts/run_phase52_auto_collection.py"
 GENERATED_ARTIFACT_PATTERNS_THAT_MUST_NOT_BE_TRACKED = (
-    "phase_5_2_auto_collection_all_sessions_sha256.txt",
+    "phase_5_2_audit_bundle_sha256.txt",
+    "phase_5_2_full_dataset_bundle_sha256.txt",
     "phase_4_2h_bundle_sha256.txt",
-    "phase_5_2_auto_collection_all_sessions_bundle.zip",
+    "phase_5_2_audit_bundle.zip",
+    "phase_5_2_full_dataset_bundle.zip",
     "phase_4_2h_hotpath_environment_latency_bundle.zip",
     "phase_4_2h_hotpath_environment_latency_fail_audit_bundle.zip",
     "data/phase_5_2",
@@ -97,6 +101,21 @@ def test_phase52_start_allows_clean_start_after_cleanup(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "Phase 5.2 start validation passed" in result.stdout
     assert "--fail-session-on-quality-gate" in result.stdout
+
+
+def test_phase52_start_prints_bundle_mode(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(START_SCRIPT, tmp_path)
+    _write_phase52_runner_marker(tmp_path)
+
+    result = subprocess.run([bash, str(script), "--dry-run"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "total RAM bytes:" in result.stdout
+    assert "swap total bytes:" in result.stdout
+    assert "memory guard decision: pass" in result.stdout
+    assert "bundle mode: audit-light" in result.stdout
+    assert "large datasets included in bundles: false" in result.stdout
 
 
 def test_phase52_start_warns_or_refuses_known_memory_risk(tmp_path: Path) -> None:
@@ -196,6 +215,39 @@ def test_phase52_start_refuses_dirty_git_state_including_untracked_archive(tmp_p
     assert "git working tree is dirty" in result.stderr
 
 
+def test_phase52_start_refuses_missing_gitignore_rules(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(START_SCRIPT, tmp_path)
+    _write_phase52_runner_marker(tmp_path)
+    (tmp_path / ".gitignore").write_text(
+        "\n".join(
+            [
+                "data/phase_5_2/",
+                "data/cache/phase_5_2_failed_runs/",
+                "data/dataset/",
+                "data/debug/",
+                "data/reports/",
+                "*.jsonl",
+                "*.zip",
+                "*.log",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=tmp_path, text=True, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", ".gitignore", str(script.relative_to(tmp_path)).replace("\\", "/"), "bot/app/research/phase52_auto_collection.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=tmp_path, text=True, capture_output=True, check=True)
+
+    result = subprocess.run([bash, str(script), "--dry-run"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert result.returncode != 0
+    assert ".gitignore is missing generated artifact rules" in result.stderr
+    assert "phase_5_2_audit_bundle_sha256.txt" in result.stderr
+
+
 def test_phase52_cli_clean_start_creates_session_001(tmp_path: Path) -> None:
     result = _run_phase52_cli(tmp_path, test_max_sessions=1)
 
@@ -231,8 +283,41 @@ def test_phase52_all_sessions_sha256_has_exact_gitignore_pattern() -> None:
         for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     }
-    assert "phase_5_2_auto_collection_all_sessions_sha256.txt" in patterns
+    assert "phase_5_2_audit_bundle_sha256.txt" in patterns
+    assert "phase_5_2_full_dataset_bundle_sha256.txt" in patterns
     assert "data/cache/phase_5_2_failed_runs/" in patterns
+
+
+def test_phase52_collect_artifacts_defaults_to_audit_light(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(COLLECT_SCRIPT, tmp_path)
+    _seed_collect_artifacts(tmp_path)
+
+    result = subprocess.run([bash, str(script)], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(tmp_path / "phase_5_2_vps_downloadable_artifacts.zip") as archive:
+        names = archive.namelist()
+    assert "file_size_manifest.json" in names
+    assert not any(name.endswith(".jsonl") for name in names)
+    assert not any(name.endswith(".zip") for name in names)
+
+
+def test_phase52_collect_artifacts_full_mode_includes_datasets_only_when_requested(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(COLLECT_SCRIPT, tmp_path)
+    _seed_collect_artifacts(tmp_path)
+
+    default_result = subprocess.run([bash, str(script)], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+    assert default_result.returncode == 0, default_result.stderr
+    assert not (tmp_path / "phase_5_2_vps_full_dataset_artifacts.zip").exists()
+
+    full_result = subprocess.run([bash, str(script), "--include-large-datasets"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+    assert full_result.returncode == 0, full_result.stderr
+    with zipfile.ZipFile(tmp_path / "phase_5_2_vps_full_dataset_artifacts.zip") as archive:
+        names = archive.namelist()
+    assert "data/phase_5_2/sessions/session_001_sanity_30m/data/dataset/large.jsonl" in names
+    assert not any(name.endswith(".zip") for name in names)
 
 
 def _run_phase52_cli(tmp_path: Path, *, test_max_sessions: int) -> subprocess.CompletedProcess[str]:
@@ -278,6 +363,24 @@ def _write_phase52_runner_marker(tmp_path: Path) -> None:
     marker.write_text('command = ["--clean"]\n', encoding="utf-8")
 
 
+def _seed_collect_artifacts(tmp_path: Path) -> None:
+    session = tmp_path / "data/phase_5_2/sessions/session_001_sanity_30m"
+    (session / "data/dataset").mkdir(parents=True, exist_ok=True)
+    (session / "data/reports").mkdir(parents=True, exist_ok=True)
+    (session / "data/debug").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data/debug").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data/reports").mkdir(parents=True, exist_ok=True)
+    (session / "phase_5_2_session_001_sanity_30m_metadata.json").write_text("{}", encoding="utf-8")
+    (session / "phase_5_2_session_001_sanity_30m_quality_report.json").write_text("{}", encoding="utf-8")
+    (session / "phase_5_2_session_001_sanity_30m_console.log").write_text("console\n", encoding="utf-8")
+    (session / "data/dataset/large.jsonl").write_text("{}\n", encoding="utf-8")
+    (session / "data/dataset/phase_4_2h_latency_profile_datasets.zip").write_bytes(b"zip")
+    (session / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").write_text("{}", encoding="utf-8")
+    (session / "data/debug/phase_4_2h_artifact_cleanup.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "data/debug/phase_5_2_auto_collection_status.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "data/reports/phase_5_2_auto_collection_report.json").write_text("{}", encoding="utf-8")
+
+
 def _init_clean_git_repo_with_script(tmp_path: Path, script: Path) -> None:
     (tmp_path / ".gitignore").write_text(
         "\n".join(
@@ -285,7 +388,11 @@ def _init_clean_git_repo_with_script(tmp_path: Path, script: Path) -> None:
                 "data/phase_5_2/",
                 "data/cache/",
                 "data/cache/phase_5_2_failed_runs/",
-                "phase_5_2_auto_collection_all_sessions_sha256.txt",
+                "data/dataset/",
+                "data/debug/",
+                "data/reports/",
+                "phase_5_2_audit_bundle_sha256.txt",
+                "phase_5_2_full_dataset_bundle_sha256.txt",
                 "*.zip",
                 "*.log",
                 "*.jsonl",

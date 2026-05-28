@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import gc
+import hashlib
 import json
 from pathlib import Path
 import zipfile
@@ -1174,6 +1175,55 @@ def test_bundle_records_file_sizes_and_sha256_streaming(tmp_path: Path) -> None:
     assert any(item["path"] == "data/debug/phase_4_2h_latency_stage_profile.json" for item in manifest["files"])
 
 
+def test_write_and_bundle_creates_phase42h_bundle_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Path] = []
+
+    def fake_bundle(*, root: str | Path, pass_bundle: bool, bundle_path: str | Path | None = None) -> Path:
+        target = Path(bundle_path) if bundle_path is not None else Path(root) / PHASE42H_PASS_BUNDLE
+        calls.append(target)
+        target.write_bytes(b"bundle")
+        return target
+
+    monkeypatch.setattr(phase42h_cli, "create_phase42h_bundle", fake_bundle)
+    phase42h_cli._write_and_bundle(_report(), root=tmp_path, pytest_output="ok", no_bundle=False, memory_telemetry=hotpath.new_memory_telemetry())
+    assert len(calls) == 1
+
+
+def test_write_and_bundle_preserves_bundle_memory_stages(tmp_path: Path) -> None:
+    phase42h_cli._write_and_bundle(_report(), root=tmp_path, pytest_output="ok", no_bundle=True, memory_telemetry=hotpath.new_memory_telemetry())
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    samples = report["memory_telemetry"]["samples"]
+    assert "bundle_start" in samples
+    assert "bundle_end" in samples
+
+
+def test_write_and_bundle_final_report_has_memory_telemetry(tmp_path: Path) -> None:
+    phase42h_cli._write_and_bundle(_report(), root=tmp_path, pytest_output="ok", no_bundle=True, memory_telemetry=hotpath.new_memory_telemetry())
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert report["memory_telemetry"]["schema_version"] == "phase_4_2h_memory_telemetry_v1"
+
+
+def test_write_and_bundle_does_not_use_read_bytes_for_large_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report = _report()
+    large = tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl"
+    large.parent.mkdir(parents=True, exist_ok=True)
+    large.write_bytes(b"x" * 1024 * 1024)
+
+    def blocked_read_bytes(self: Path) -> bytes:
+        raise AssertionError(f"read_bytes should not be used while bundling {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", blocked_read_bytes)
+    phase42h_cli._write_and_bundle(report, root=tmp_path, pytest_output="ok", no_bundle=False, memory_telemetry=hotpath.new_memory_telemetry())
+    assert (tmp_path / PHASE42H_PASS_BUNDLE).exists()
+
+
+def test_phase42h_bundle_sha256_still_valid_after_single_bundle_creation(tmp_path: Path) -> None:
+    phase42h_cli._write_and_bundle(_report(), root=tmp_path, pytest_output="ok", no_bundle=False, memory_telemetry=hotpath.new_memory_telemetry())
+    bundle = tmp_path / PHASE42H_PASS_BUNDLE
+    first = _sha256(bundle)
+    assert first == _sha256(bundle)
+
+
 def test_compute_readiness_semantics_direct_future_lag_telemetry_only() -> None:
     semantics = compute_readiness_semantics(
         sources=_sources(h100=0.97, h250=0.98, p95=80.0, p99=120.0),
@@ -1415,6 +1465,14 @@ def _iso_ms(epoch_ms: float) -> str:
 def _count_jsonl(path: Path) -> int:
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _rss_bytes() -> int:

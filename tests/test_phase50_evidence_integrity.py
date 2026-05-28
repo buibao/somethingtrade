@@ -5,8 +5,13 @@ import json
 from pathlib import Path
 import zipfile
 
-from app.research.microstructure_signal_research import PHASE42H_REPORT_MEMBER, verify_phase42h_evidence
-from phase50_test_utils import ROOT, load_json
+from app.research.microstructure_signal_research import (
+    MISSING_REQUIRED_DATASET_PATH,
+    PHASE42H_DATASET_ZIP_MEMBER,
+    PHASE42H_REPORT_MEMBER,
+    verify_phase42h_evidence,
+)
+from phase50_test_utils import ROOT, load_json, phase42h_fixture_paths
 
 
 def test_phase50_evidence_integrity_uses_passed_phase42h_bundle() -> None:
@@ -29,9 +34,10 @@ def test_phase50_evidence_integrity_uses_passed_phase42h_bundle() -> None:
 
 
 def test_phase50_evidence_integrity_fails_on_corrupted_sha256(tmp_path: Path) -> None:
+    bundle, _ = phase42h_fixture_paths()
     sha_path = tmp_path / "bad_sha256.txt"
     sha_path.write_text("sha256: " + ("0" * 64) + "\n", encoding="utf-8")
-    report, _ = verify_phase42h_evidence(ROOT, ROOT / "phase_4_2h_hotpath_environment_latency_bundle.zip", sha_path)
+    report, _ = verify_phase42h_evidence(ROOT, bundle, sha_path)
     assert report["status"] == "fail"
     assert report["bundle_sha256_valid"] is False
 
@@ -50,6 +56,16 @@ def test_phase50_evidence_integrity_fails_when_runtime_report_missing(tmp_path: 
     report, _ = verify_phase42h_evidence(ROOT, bundle, sha_path)
     assert report["status"] == "fail"
     assert report["runtime_status"] is None
+
+
+def test_phase50_evidence_integrity_reports_missing_dataset_paths(tmp_path: Path) -> None:
+    bundle = _bundle_without_member(tmp_path, PHASE42H_DATASET_ZIP_MEMBER)
+    sha_path = _sha_file_for_bundle(tmp_path, bundle)
+    report, _ = verify_phase42h_evidence(ROOT, bundle, sha_path)
+    assert report["status"] == "fail"
+    assert report["error"] == MISSING_REQUIRED_DATASET_PATH
+    assert report["primary_failure"] == MISSING_REQUIRED_DATASET_PATH
+    assert "clean_samples" in report["missing_keys"]
 
 
 def test_phase50_evidence_integrity_fails_when_strict_100ms_ready_false(tmp_path: Path) -> None:
@@ -75,7 +91,7 @@ def test_phase50_evidence_integrity_accepts_phase5_ready_false_explicitly() -> N
 
 
 def _mutated_runtime_bundle(tmp_path: Path, updates: dict) -> Path:
-    source = ROOT / "phase_4_2h_hotpath_environment_latency_bundle.zip"
+    source, _ = phase42h_fixture_paths()
     target = tmp_path / "mutated_phase42h_bundle.zip"
     with zipfile.ZipFile(source) as incoming, zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as outgoing:
         for name in incoming.namelist():
@@ -89,7 +105,7 @@ def _mutated_runtime_bundle(tmp_path: Path, updates: dict) -> Path:
 
 
 def _bundle_without_member(tmp_path: Path, omitted_member: str) -> Path:
-    source = ROOT / "phase_4_2h_hotpath_environment_latency_bundle.zip"
+    source, _ = phase42h_fixture_paths()
     target = tmp_path / "missing_runtime_report.zip"
     with zipfile.ZipFile(source) as incoming, zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as outgoing:
         for name in incoming.namelist():

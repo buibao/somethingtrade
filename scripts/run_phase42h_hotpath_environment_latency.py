@@ -707,6 +707,7 @@ def _write_and_bundle(
     if memory_telemetry is not None:
         record_memory_stage(memory_telemetry, "bundle_start")
         refresh_generated_file_sizes(root, memory_telemetry)
+        record_memory_stage(memory_telemetry, "bundle_end")
         report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
     write_phase42h_artifacts(
         report,
@@ -716,30 +717,9 @@ def _write_and_bundle(
         bundle_path=bundle_path,
     )
     if no_bundle:
-        if memory_telemetry is not None:
-            record_memory_stage(memory_telemetry, "bundle_end")
-            report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
-            write_phase42h_artifacts(
-                report,
-                root=root,
-                pytest_output=pytest_output,
-                bundle_created=False,
-                bundle_path=bundle_path,
-            )
         return
     try:
         create_phase42h_bundle(root=root, pass_bundle=pass_bundle, bundle_path=bundle_path)
-        if memory_telemetry is not None:
-            record_memory_stage(memory_telemetry, "bundle_end")
-            report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
-            write_phase42h_artifacts(
-                report,
-                root=root,
-                pytest_output=pytest_output,
-                bundle_created=True,
-                bundle_path=bundle_path,
-            )
-            create_phase42h_bundle(root=root, pass_bundle=pass_bundle, bundle_path=bundle_path)
     except Exception as exc:
         report["status"] = "fail"
         report["primary_failure"] = "BUNDLE_FAILURE"

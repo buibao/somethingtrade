@@ -14,6 +14,9 @@ import app.research.phase52_auto_collection as phase52
 from app.research.phase52_auto_collection import (
     ALL_SESSIONS_BUNDLE,
     ALL_SESSIONS_SHA256,
+    AUDIT_BUNDLE,
+    FILE_SIZE_MANIFEST,
+    FULL_DATASET_BUNDLE,
     MANIFEST_PATH,
     STATUS_PATH,
     build_auto_collection_manifest,
@@ -62,6 +65,96 @@ def test_phase52_all_real_sessions_use_clean(tmp_path: Path, monkeypatch: pytest
         phase52._run_real_phase42h_capture(root_path=tmp_path, session_dir=session_dir, requested_duration_sec=float(item["requested_duration_sec"]))
     assert len(commands) == len(default_session_plan())
     assert all("--clean" in command for command in commands)
+
+
+def test_phase52_real_capture_does_not_use_capture_output_true(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        observed.update(kwargs)
+        session_dir = Path(list(command)[list(command).index("--root") + 1])
+        report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(synthetic_phase42h_runtime_report(requested_duration_sec=1)), encoding="utf-8")
+        stdout_handle = kwargs.get("stdout")
+        if stdout_handle is not None:
+            stdout_handle.write("streamed stdout\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
+    phase52._run_real_phase42h_capture(root_path=tmp_path, session_dir=tmp_path / "data/phase_5_2/sessions/s1", requested_duration_sec=1)
+    assert observed.get("capture_output") is not True
+    assert observed.get("stderr") is phase52.subprocess.STDOUT
+
+
+def test_phase52_real_capture_streams_child_output_to_console_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        session_dir = Path(list(command)[list(command).index("--root") + 1])
+        report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(synthetic_phase42h_runtime_report(requested_duration_sec=1)), encoding="utf-8")
+        kwargs["stdout"].write("child stdout line\n")
+        kwargs["stdout"].write("child stderr line redirected\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
+    session_dir = tmp_path / "data/phase_5_2/sessions/s1"
+    phase52._run_real_phase42h_capture(root_path=tmp_path, session_dir=session_dir, requested_duration_sec=1)
+    console = (session_dir / "phase_5_2_s1_console.log").read_text(encoding="utf-8")
+    assert "child stdout line" in console
+    assert "child stderr line redirected" in console
+    assert "child_exit_code=0" in console
+
+
+def test_phase52_long_child_output_does_not_accumulate_in_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        session_dir = Path(list(command)[list(command).index("--root") + 1])
+        report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(synthetic_phase42h_runtime_report(requested_duration_sec=1)), encoding="utf-8")
+        assert kwargs.get("capture_output") is not True
+        assert kwargs.get("stdout") is not None
+        kwargs["stdout"].write("x" * 1_000_000)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
+    exit_code, _report, output = phase52._run_real_phase42h_capture(root_path=tmp_path, session_dir=tmp_path / "data/phase_5_2/sessions/s1", requested_duration_sec=1)
+    assert exit_code == 0
+    assert len(output) < 300
+
+
+def test_phase52_exit_code_preserved_when_streaming_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        session_dir = Path(list(command)[list(command).index("--root") + 1])
+        report = synthetic_phase42h_runtime_report(requested_duration_sec=1)
+        report["status"] = "fail"
+        report["primary_failure"] = "PROCESS_FAILED"
+        report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        kwargs["stdout"].write("failed child output\n")
+        return SimpleNamespace(returncode=7, stdout="", stderr="")
+
+    monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
+    exit_code, report, _output = phase52._run_real_phase42h_capture(root_path=tmp_path, session_dir=tmp_path / "data/phase_5_2/sessions/s1", requested_duration_sec=1)
+    assert exit_code == 7
+    assert report["exit_code"] == 7
+
+
+def test_phase52_oom_classification_still_works_after_streaming_output_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        kwargs["stdout"].write("killed child output\n")
+        return SimpleNamespace(returncode=-9, stdout="", stderr="")
+
+    monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        phase52,
+        "_collect_kernel_log_text",
+        lambda **_kwargs: "Out of memory: Killed process 22259 (python)\n",
+    )
+    exit_code, report, _output = phase52._run_real_phase42h_capture(root_path=tmp_path, session_dir=tmp_path / "data/phase_5_2/sessions/s1", requested_duration_sec=1)
+    assert exit_code == -9
+    assert report["primary_failure"] == "OOM_KILLED"
 
 
 def test_phase52_resume_retry_still_uses_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -262,6 +355,139 @@ def test_phase52_all_sessions_bundle_created(tmp_path: Path) -> None:
     assert (tmp_path / ALL_SESSIONS_BUNDLE).exists()
     assert (tmp_path / ALL_SESSIONS_SHA256).exists()
     assert parse_sha256_file(tmp_path / ALL_SESSIONS_SHA256) == _sha256(tmp_path / ALL_SESSIONS_BUNDLE)
+    assert (tmp_path / AUDIT_BUNDLE).exists()
+
+
+def test_phase52_default_audit_bundle_excludes_jsonl(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    dataset = collection_root / "sessions/session_001_sanity_30m/data/dataset/large_capture.jsonl"
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    dataset.write_text("{}\n", encoding="utf-8")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    with zipfile.ZipFile(tmp_path / AUDIT_BUNDLE) as archive:
+        assert not any(name.endswith(".jsonl") for name in archive.namelist())
+
+
+def test_phase52_default_audit_bundle_excludes_nested_zip(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    nested = collection_root / "sessions/session_001_sanity_30m/phase_4_2h_latency_profile_datasets.zip"
+    nested.write_bytes(b"nested zip placeholder")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    with zipfile.ZipFile(tmp_path / AUDIT_BUNDLE) as archive:
+        assert not any(name.endswith(".zip") for name in archive.namelist())
+
+
+def test_phase52_default_audit_bundle_includes_reports_logs_metadata(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    with zipfile.ZipFile(tmp_path / AUDIT_BUNDLE) as archive:
+        names = set(archive.namelist())
+    assert "file_size_manifest.json" in names
+    assert any(name.endswith("_metadata.json") for name in names)
+    assert any(name.endswith("_quality_report.json") for name in names)
+    assert any(name.endswith("_console.log") for name in names)
+    assert any(name.endswith("phase_4_2h_hotpath_environment_latency_report.json") for name in names)
+    assert "data/debug/phase_5_2_auto_collection_status.json" in names
+
+
+def test_phase52_full_dataset_bundle_requires_explicit_flag(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    dataset = collection_root / "sessions/session_001_sanity_30m/data/dataset/large_capture.jsonl"
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    dataset.write_text("{}\n", encoding="utf-8")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root, include_large_datasets=False)
+    assert not (tmp_path / FULL_DATASET_BUNDLE).exists()
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root, include_large_datasets=True)
+    with zipfile.ZipFile(tmp_path / FULL_DATASET_BUNDLE) as archive:
+        assert "data/phase_5_2/sessions/session_001_sanity_30m/data/dataset/large_capture.jsonl" in archive.namelist()
+
+
+def test_phase52_bundle_file_size_manifest_present(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+    assert (tmp_path / FILE_SIZE_MANIFEST).exists()
+    with zipfile.ZipFile(tmp_path / AUDIT_BUNDLE) as archive:
+        assert "file_size_manifest.json" in archive.namelist()
+
+
+def test_phase52_file_size_manifest_marks_large_files_excluded_from_audit_bundle(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    dataset = collection_root / "sessions/session_001_sanity_30m/data/dataset/large_capture.jsonl"
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    dataset.write_text("{}\n", encoding="utf-8")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    manifest = _read_json(tmp_path / FILE_SIZE_MANIFEST)
+    item = next(file for file in manifest["files"] if file["path"].endswith("large_capture.jsonl"))
+    assert item["artifact_type"] == "large_dataset"
+    assert item["included_in_audit_bundle"] is False
+    assert item["included_in_full_bundle"] is False
+
+
+def test_phase52_no_zip_inside_zip_by_default(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    (collection_root / "sessions/session_001_sanity_30m/phase_4_2h_hotpath_environment_latency_bundle.zip").write_bytes(b"nested")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    with zipfile.ZipFile(tmp_path / AUDIT_BUNDLE) as archive:
+        assert not any(name.endswith(".zip") for name in archive.namelist())
+
+
+def test_phase52_bundle_creation_streaming_no_read_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+
+    def blocked_read_bytes(self: Path) -> bytes:
+        raise AssertionError(f"read_bytes should not be used while bundling {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", blocked_read_bytes)
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+    assert (tmp_path / AUDIT_BUNDLE).exists()
+
+
+def test_phase52_all_sessions_bundle_does_not_duplicate_session_dataset_files_by_default(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    dataset = collection_root / "sessions/session_001_sanity_30m/data/dataset/large_capture.jsonl"
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    dataset.write_text("{}\n", encoding="utf-8")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    with zipfile.ZipFile(tmp_path / AUDIT_BUNDLE) as archive:
+        assert "data/phase_5_2/sessions/session_001_sanity_30m/data/dataset/large_capture.jsonl" not in archive.namelist()
+
+
+def test_phase42h_latency_profile_datasets_zip_not_included_in_default_audit_bundle(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    nested = collection_root / "sessions/session_001_sanity_30m/data/dataset/phase_4_2h_latency_profile_datasets.zip"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_bytes(b"nested")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    with zipfile.ZipFile(tmp_path / AUDIT_BUNDLE) as archive:
+        assert nested.relative_to(tmp_path).as_posix() not in archive.namelist()
+
+
+def test_phase52_bundle_manifest_lists_omitted_large_files(tmp_path: Path) -> None:
+    collection_root = _seed_phase52_bundle_inputs(tmp_path)
+    dataset = collection_root / "sessions/session_001_sanity_30m/data/dataset/large_capture.jsonl"
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    dataset.write_text("{}\n", encoding="utf-8")
+
+    phase52.create_all_sessions_bundle(tmp_path, collection_root)
+
+    manifest = _read_json(tmp_path / FILE_SIZE_MANIFEST)
+    assert any(file["path"].endswith("large_capture.jsonl") and file["included_in_audit_bundle"] is False for file in manifest["files"])
 
 
 def test_phase52_no_live_trading_execution_wallet_logic_flags(tmp_path: Path) -> None:
@@ -311,6 +537,9 @@ def test_phase52_simulated_session_001_uses_source_gitignore_not_session_gitigno
     )
 
     def fake_run(command: list[str], **kwargs) -> SimpleNamespace:
+        command = list(command)
+        if command[:2] == ["uname", "-p"]:
+            return SimpleNamespace(returncode=0, stdout="x86_64\n", stderr="")
         if command and command[0] == "git":
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         session_dir = Path(command[command.index("--root") + 1])
@@ -327,7 +556,10 @@ def test_phase52_simulated_session_001_uses_source_gitignore_not_session_gitigno
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report), encoding="utf-8")
         (session_dir / "phase_4_2h_hotpath_environment_latency_bundle.zip").write_bytes(b"phase42h bundle")
-        return SimpleNamespace(returncode=0, stdout="mock phase42h\n", stderr="")
+        stdout_handle = kwargs.get("stdout")
+        if stdout_handle is not None:
+            stdout_handle.write("mock phase42h\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
     result = run_controlled_capture(
@@ -727,13 +959,39 @@ def _seed_manifest(tmp_path: Path, *, retry_count: int, research_eligible: bool,
     (tmp_path / MANIFEST_PATH).write_text(json.dumps(manifest), encoding="utf-8")
 
 
+def _seed_phase52_bundle_inputs(tmp_path: Path) -> Path:
+    collection_root = tmp_path / "data/phase_5_2"
+    session_dir = collection_root / "sessions/session_001_sanity_30m"
+    (session_dir / "data/reports").mkdir(parents=True, exist_ok=True)
+    (session_dir / "data/debug").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data/debug").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data/reports").mkdir(parents=True, exist_ok=True)
+    (session_dir / "phase_5_2_session_001_sanity_30m_metadata.json").write_text("{}", encoding="utf-8")
+    (session_dir / "phase_5_2_session_001_sanity_30m_quality_report.json").write_text("{}", encoding="utf-8")
+    (session_dir / "phase_5_2_session_001_sanity_30m_console.log").write_text("console\n", encoding="utf-8")
+    (session_dir / "phase_5_2_session_001_sanity_30m_sha256.txt").write_text("sha256: abc\n", encoding="utf-8")
+    (session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").write_text("{}", encoding="utf-8")
+    (session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.md").write_text("# report\n", encoding="utf-8")
+    (session_dir / "data/debug/phase_4_2h_artifact_cleanup.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "data/debug/phase_5_2_auto_collection_status.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "data/reports/phase_5_2_auto_collection_report.json").write_text("{}", encoding="utf-8")
+    return collection_root
+
+
 def _mock_phase42h_subprocess(monkeypatch: pytest.MonkeyPatch, *, commands: list[list[str]], report_status: str) -> None:
     def fake_run(command: list[str], **kwargs) -> SimpleNamespace:
+        command = list(command)
+        if command[:2] == ["uname", "-p"]:
+            return SimpleNamespace(returncode=0, stdout="x86_64\n", stderr="")
         if command and command[0] == "git":
             if command[1:3] == ["rev-parse", "HEAD"]:
                 return SimpleNamespace(returncode=0, stdout="test-commit\n", stderr="")
             if command[1:2] == ["status"]:
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if not any("run_phase42h_hotpath_environment_latency.py" in str(part) for part in command):
+            raise AssertionError(f"Unexpected subprocess command in test mock: {command}")
+        if "--root" not in command:
+            raise AssertionError(f"Phase 4.2H test command missing --root: {command}")
         commands.append(command)
         session_dir = Path(command[command.index("--root") + 1])
         report = synthetic_phase42h_runtime_report(requested_duration_sec=float(command[command.index("--duration-sec") + 1]))
@@ -750,7 +1008,10 @@ def _mock_phase42h_subprocess(monkeypatch: pytest.MonkeyPatch, *, commands: list
         report_path.write_text(json.dumps(report), encoding="utf-8")
         bundle = session_dir / "phase_4_2h_hotpath_environment_latency_bundle.zip"
         bundle.write_bytes(b"phase42h bundle")
-        return SimpleNamespace(returncode=0 if report["status"] == "pass" else 1, stdout="mock phase42h\n", stderr="")
+        stdout_handle = kwargs.get("stdout")
+        if stdout_handle is not None:
+            stdout_handle.write("mock phase42h\n")
+        return SimpleNamespace(returncode=0 if report["status"] == "pass" else 1, stdout="", stderr="")
 
     monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
 

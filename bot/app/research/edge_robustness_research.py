@@ -804,6 +804,15 @@ def _input_entries_for_mode(
     sha256_paths: list[Path],
 ) -> list[dict[str, Any]]:
     if input_mode == "phase50_existing_dataset":
+        if bundle_paths:
+            sha_path = sha256_paths[0] if sha256_paths else root_path / PHASE42H_SHA256_NAME
+            return [
+                {
+                    "bundle_id": "phase50_existing_dataset",
+                    "bundle_path": bundle_paths[0],
+                    "sha256_path": sha_path,
+                }
+            ]
         return [
             {
                 "bundle_id": "phase50_existing_dataset",
@@ -1155,4 +1164,3 @@ def _dict(value: Any) -> dict[str, Any]:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-

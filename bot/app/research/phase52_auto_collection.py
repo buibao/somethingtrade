@@ -22,8 +22,15 @@ MANIFEST_PATH = Path("data/debug/phase_5_2_auto_collection_manifest.json")
 STATUS_PATH = Path("data/debug/phase_5_2_auto_collection_status.json")
 REPORT_JSON_PATH = Path("data/reports/phase_5_2_auto_collection_report.json")
 REPORT_MD_PATH = Path("data/reports/phase_5_2_auto_collection_report.md")
-ALL_SESSIONS_BUNDLE = Path("phase_5_2_auto_collection_all_sessions_bundle.zip")
-ALL_SESSIONS_SHA256 = Path("phase_5_2_auto_collection_all_sessions_sha256.txt")
+AUDIT_BUNDLE = Path("phase_5_2_audit_bundle.zip")
+AUDIT_SHA256 = Path("phase_5_2_audit_bundle_sha256.txt")
+FULL_DATASET_BUNDLE = Path("phase_5_2_full_dataset_bundle.zip")
+FULL_DATASET_SHA256 = Path("phase_5_2_full_dataset_bundle_sha256.txt")
+FILE_SIZE_MANIFEST = Path("data/debug/phase_5_2_file_size_manifest.json")
+ALL_SESSIONS_BUNDLE = AUDIT_BUNDLE
+ALL_SESSIONS_SHA256 = AUDIT_SHA256
+LEGACY_ALL_SESSIONS_BUNDLE = Path("phase_5_2_auto_collection_all_sessions_bundle.zip")
+LEGACY_ALL_SESSIONS_SHA256 = Path("phase_5_2_auto_collection_all_sessions_sha256.txt")
 STOP_FILE_DEFAULT = Path("data/debug/phase_5_2_stop_after_current_session")
 
 REQUIRED_SESSION_METADATA_FIELDS = (
@@ -147,12 +154,14 @@ def run_controlled_capture(
         console_lines.append("dry-run synthetic capture completed")
         exit_code = 0 if runtime_report.get("status") == "pass" else 1
     else:
+        _write_text(console_path, "\n".join(console_lines) + "\n")
         exit_code, runtime_report, subprocess_output = _run_real_phase42h_capture(
             root_path=root_path,
             session_dir=session_dir,
             requested_duration_sec=requested_duration_sec,
         )
-        console_lines.append(subprocess_output)
+        if subprocess_output:
+            _append_text(console_path, subprocess_output.rstrip() + "\n")
         source_bundle = _find_phase42h_bundle(session_dir, runtime_report)
         if create_bundle and source_bundle is not None and source_bundle.exists():
             shutil.copy2(source_bundle, bundle_path)
@@ -162,7 +171,10 @@ def run_controlled_capture(
         actual_duration = min(float(requested_duration_sec), actual_duration)
     console_lines.append(f"Phase 5.2 controlled capture ended: {ended}")
     console_lines.append(f"exit_code={exit_code}")
-    _write_text(console_path, "\n".join(console_lines) + "\n")
+    if dry_run:
+        _write_text(console_path, "\n".join(console_lines) + "\n")
+    else:
+        _append_text(console_path, f"Phase 5.2 controlled capture ended: {ended}\nexit_code={exit_code}\n")
 
     if create_bundle and not bundle_path.exists():
         _write_synthetic_phase42h_bundle(bundle_path, runtime_report, dry_run=dry_run)
@@ -229,6 +241,8 @@ def run_auto_collection(
     stop_after_current_session_file: str | Path | None = None,
     dry_run: bool = False,
     test_max_sessions: int | None = None,
+    include_large_datasets: bool = False,
+    allow_nested_zip: bool = False,
 ) -> dict[str, Any]:
     root_path = Path(root).resolve()
     collection_root = _resolve(root_path, output_dir)
@@ -320,13 +334,23 @@ def run_auto_collection(
         stopped_early=stopped_early,
         stop_reason=stop_reason,
     )
-    report = build_auto_collection_report(manifest=manifest, strict_100ms=strict_100ms)
+    report = build_auto_collection_report(
+        manifest=manifest,
+        strict_100ms=strict_100ms,
+        include_large_datasets=include_large_datasets,
+        allow_nested_zip=allow_nested_zip,
+    )
     _write_json(root_path / MANIFEST_PATH, manifest)
     _write_json(root_path / STATUS_PATH, build_status(plan_name=plan_name, current_session=current_session, sessions=sessions, running=False, stopped_early=stopped_early, stop_reason=stop_reason))
     _write_json(root_path / REPORT_JSON_PATH, report)
     _write_text(root_path / REPORT_MD_PATH, render_auto_collection_markdown(report))
     if create_bundles:
-        create_all_sessions_bundle(root_path, collection_root)
+        create_all_sessions_bundle(
+            root_path,
+            collection_root,
+            include_large_datasets=include_large_datasets,
+            allow_nested_zip=allow_nested_zip,
+        )
     return report
 
 
@@ -512,7 +536,14 @@ def build_status(
     }
 
 
-def build_auto_collection_report(*, manifest: dict[str, Any], strict_100ms: bool) -> dict[str, Any]:
+def build_auto_collection_report(
+    *,
+    manifest: dict[str, Any],
+    strict_100ms: bool,
+    include_large_datasets: bool = False,
+    allow_nested_zip: bool = False,
+) -> dict[str, Any]:
+    bundle_mode = "full_dataset_explicit" if include_large_datasets else "audit_light"
     return {
         "phase": PHASE,
         "schema_version": "phase_5_2_auto_collection_report_v1",
@@ -524,6 +555,15 @@ def build_auto_collection_report(*, manifest: dict[str, Any], strict_100ms: bool
         "manifest": manifest,
         "artifact_manifest_path": MANIFEST_PATH.as_posix(),
         "status_path": STATUS_PATH.as_posix(),
+        "artifact_bundle_mode": bundle_mode,
+        "audit_bundle_path": AUDIT_BUNDLE.as_posix(),
+        "audit_sha256_path": AUDIT_SHA256.as_posix(),
+        "full_dataset_bundle_path": FULL_DATASET_BUNDLE.as_posix(),
+        "full_dataset_sha256_path": FULL_DATASET_SHA256.as_posix(),
+        "file_size_manifest_path": FILE_SIZE_MANIFEST.as_posix(),
+        "include_large_datasets": include_large_datasets,
+        "allow_nested_zip": allow_nested_zip,
+        "no_nested_zip_by_default": allow_nested_zip is False,
         "all_sessions_bundle_path": ALL_SESSIONS_BUNDLE.as_posix(),
         "all_sessions_sha256_path": ALL_SESSIONS_SHA256.as_posix(),
         "no_live_trading": True,
@@ -534,38 +574,182 @@ def build_auto_collection_report(*, manifest: dict[str, Any], strict_100ms: bool
     }
 
 
-def create_all_sessions_bundle(root_path: Path, collection_root: Path) -> dict[str, Any]:
-    bundle_path = root_path / ALL_SESSIONS_BUNDLE
-    if bundle_path.exists():
-        bundle_path.unlink()
-    manifest_files: list[dict[str, Any]] = []
-    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for base in (collection_root, root_path / "data/debug", root_path / "data/reports"):
-            if not base.exists():
-                continue
-            for path in base.rglob("*"):
-                if path.is_file() and ("phase_5_2" in path.name or "phase_5_2" in path.as_posix()):
-                    arcname = _relative(root_path, path)
-                    archive.write(path, arcname)
-                    manifest_files.append({"path": arcname, "size_bytes": path.stat().st_size, "included_in_bundle": True})
-        archive.writestr(
-            "data/debug/phase_5_2_all_sessions_bundle_file_manifest.json",
-            json.dumps({"files": manifest_files}, indent=2, sort_keys=True) + "\n",
+def create_all_sessions_bundle(
+    root_path: Path,
+    collection_root: Path,
+    *,
+    include_large_datasets: bool = False,
+    allow_nested_zip: bool = False,
+) -> dict[str, Any]:
+    audit_path = root_path / AUDIT_BUNDLE
+    audit_sha_path = root_path / AUDIT_SHA256
+    full_path = root_path / FULL_DATASET_BUNDLE
+    full_sha_path = root_path / FULL_DATASET_SHA256
+    for stale in (audit_path, audit_sha_path):
+        if stale.exists():
+            stale.unlink()
+    if not include_large_datasets:
+        for stale in (full_path, full_sha_path):
+            if stale.exists():
+                stale.unlink()
+
+    files = _phase52_artifact_file_records(
+        root_path,
+        collection_root,
+        include_large_datasets=include_large_datasets,
+        allow_nested_zip=allow_nested_zip,
+    )
+    manifest_payload = {
+        "schema_version": "phase_5_2_file_size_manifest_v1",
+        "created_at_utc": _utc_now(),
+        "bundle_policy": {
+            "default_bundle": "audit_light",
+            "include_large_datasets": include_large_datasets,
+            "allow_nested_zip": allow_nested_zip,
+            "large_jsonl_excluded_from_audit_bundle": True,
+            "zip_inside_zip_excluded_by_default": allow_nested_zip is False,
+        },
+        "audit_bundle_path": AUDIT_BUNDLE.as_posix(),
+        "full_dataset_bundle_path": FULL_DATASET_BUNDLE.as_posix() if include_large_datasets else None,
+        "files": files,
+    }
+    _write_json(root_path / FILE_SIZE_MANIFEST, manifest_payload)
+    manifest_text = json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n"
+
+    audit_files = [item for item in files if item["included_in_audit_bundle"] is True]
+    with zipfile.ZipFile(audit_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in audit_files:
+            archive.write(root_path / item["path"], item["path"])
+        archive.write(root_path / FILE_SIZE_MANIFEST, FILE_SIZE_MANIFEST.as_posix())
+        archive.writestr("file_size_manifest.json", manifest_text)
+    audit_sha = _sha256_file(audit_path)
+    _write_bundle_sha(audit_sha_path, bundle_path=audit_path, sha256=audit_sha)
+
+    result = {
+        "path": AUDIT_BUNDLE.as_posix(),
+        "sha256": audit_sha,
+        "size_bytes": audit_path.stat().st_size,
+        "file_size_manifest_path": FILE_SIZE_MANIFEST.as_posix(),
+        "bundle_mode": "audit_light",
+        "include_large_datasets": include_large_datasets,
+        "allow_nested_zip": allow_nested_zip,
+    }
+    if include_large_datasets:
+        for stale in (full_path, full_sha_path):
+            if stale.exists():
+                stale.unlink()
+        full_files = [item for item in files if item["included_in_full_bundle"] is True]
+        with zipfile.ZipFile(full_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for item in full_files:
+                archive.write(root_path / item["path"], item["path"])
+            archive.write(root_path / FILE_SIZE_MANIFEST, FILE_SIZE_MANIFEST.as_posix())
+            archive.writestr("file_size_manifest.json", manifest_text)
+        full_sha = _sha256_file(full_path)
+        _write_bundle_sha(full_sha_path, bundle_path=full_path, sha256=full_sha)
+        result.update(
+            {
+                "full_dataset_bundle_path": FULL_DATASET_BUNDLE.as_posix(),
+                "full_dataset_sha256": full_sha,
+                "full_dataset_size_bytes": full_path.stat().st_size,
+                "bundle_mode": "audit_light_plus_full_dataset",
+            }
         )
-    sha = _sha256_file(bundle_path)
+    return result
+
+
+def _phase52_artifact_file_records(
+    root_path: Path,
+    collection_root: Path,
+    *,
+    include_large_datasets: bool,
+    allow_nested_zip: bool,
+) -> list[dict[str, Any]]:
+    output_names = {
+        AUDIT_BUNDLE.as_posix(),
+        AUDIT_SHA256.as_posix(),
+        FULL_DATASET_BUNDLE.as_posix(),
+        FULL_DATASET_SHA256.as_posix(),
+        LEGACY_ALL_SESSIONS_BUNDLE.as_posix(),
+        LEGACY_ALL_SESSIONS_SHA256.as_posix(),
+    }
+    bases = (collection_root, root_path / "data/debug", root_path / "data/reports")
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for base in bases:
+        if not base.exists():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = _relative(root_path, path)
+            if relative in seen or relative in output_names or relative == FILE_SIZE_MANIFEST.as_posix():
+                continue
+            if not _is_phase52_bundle_candidate(root_path=root_path, collection_root=collection_root, path=path, relative=relative):
+                continue
+            suffix = path.suffix.lower()
+            is_large_dataset = suffix == ".jsonl"
+            is_zip = suffix == ".zip"
+            included_in_audit = not is_large_dataset and (not is_zip or allow_nested_zip)
+            included_in_full = include_large_datasets and (is_large_dataset or (is_zip and allow_nested_zip))
+            records.append(
+                {
+                    "path": relative,
+                    "size_bytes": path.stat().st_size,
+                    "artifact_type": _phase52_artifact_type(relative),
+                    "included_in_audit_bundle": included_in_audit,
+                    "included_in_full_bundle": included_in_full,
+                }
+            )
+            seen.add(relative)
+    return sorted(records, key=lambda item: item["path"])
+
+
+def _is_phase52_bundle_candidate(*, root_path: Path, collection_root: Path, path: Path, relative: str) -> bool:
+    try:
+        path.resolve().relative_to(collection_root.resolve())
+        return True
+    except ValueError:
+        pass
+    normalized = relative.replace("\\", "/")
+    return "phase_5_2" in normalized or "phase52" in normalized
+
+
+def _phase52_artifact_type(relative: str) -> str:
+    normalized = relative.replace("\\", "/")
+    suffix = Path(normalized).suffix.lower()
+    name = Path(normalized).name.lower()
+    if suffix == ".jsonl":
+        return "large_dataset"
+    if suffix == ".zip":
+        return "archive"
+    if suffix == ".log":
+        return "console_log" if "console" in name else "log"
+    if "metadata" in name:
+        return "metadata"
+    if "quality" in name:
+        return "quality_report"
+    if "sha256" in name:
+        return "sha256"
+    if "/reports/" in normalized or normalized.startswith("data/reports/"):
+        return "report"
+    if "/debug/" in normalized or normalized.startswith("data/debug/"):
+        return "debug"
+    return "artifact"
+
+
+def _write_bundle_sha(path: Path, *, bundle_path: Path, sha256: str) -> None:
     _write_text(
-        root_path / ALL_SESSIONS_SHA256,
+        path,
         "\n".join(
             [
                 f"filename: {bundle_path.name}",
-                f"sha256: {sha}",
+                f"sha256: {sha256}",
                 f"file_size_bytes: {bundle_path.stat().st_size}",
                 f"utc_timestamp: {_utc_now()}",
             ]
         )
         + "\n",
     )
-    return {"path": ALL_SESSIONS_BUNDLE.as_posix(), "sha256": sha, "size_bytes": bundle_path.stat().st_size}
 
 
 def render_auto_collection_markdown(report: dict[str, Any]) -> str:
@@ -651,6 +835,8 @@ def parse_sha256_file(path: Path) -> str:
 
 
 def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_duration_sec: float) -> tuple[int, dict[str, Any], str]:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    console_path = session_dir / f"phase_5_2_{session_dir.name}_console.log"
     command = [
         sys.executable,
         "-X",
@@ -670,8 +856,38 @@ def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_
         "--clean",
     ]
     started_at_utc = _utc_now()
-    process = subprocess.run(command, cwd=root_path, text=True, capture_output=True, check=False)
+    _append_text(
+        console_path,
+        "\n".join(
+            [
+                f"Phase 4.2H child command started: {started_at_utc}",
+                "command=" + " ".join(str(part) for part in command),
+                "--- child output ---",
+            ]
+        )
+        + "\n",
+    )
+    with console_path.open("a", encoding="utf-8", errors="replace") as console_handle:
+        process = subprocess.run(
+            command,
+            cwd=root_path,
+            text=True,
+            stdout=console_handle,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
     ended_at_utc = _utc_now()
+    _append_text(
+        console_path,
+        "\n".join(
+            [
+                "--- child output ended ---",
+                f"Phase 4.2H child command ended: {ended_at_utc}",
+                f"child_exit_code={process.returncode}",
+            ]
+        )
+        + "\n",
+    )
     report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"
     if report_path.exists():
         report = _read_json(report_path)
@@ -692,7 +908,9 @@ def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_
             started_at_utc=started_at_utc,
             ended_at_utc=ended_at_utc,
         )
-    return process.returncode, report, process.stdout + process.stderr
+    duration_sec = max(0.0, (_parse_utc(ended_at_utc) - _parse_utc(started_at_utc)).total_seconds())
+    summary = f"Phase 4.2H child output streamed to {_relative(root_path, console_path)}; duration_sec={duration_sec:.3f}; exit_code={process.returncode}"
+    return process.returncode, report, summary
 
 
 def phase42h_process_failure_report(
@@ -941,7 +1159,14 @@ def _is_runtime_artifact_path(path: str) -> bool:
         or normalized.endswith(".jsonl")
         or normalized.endswith(".zip")
         or normalized.endswith(".log")
-        or normalized in {ALL_SESSIONS_BUNDLE.as_posix(), ALL_SESSIONS_SHA256.as_posix()}
+        or normalized in {
+            AUDIT_BUNDLE.as_posix(),
+            AUDIT_SHA256.as_posix(),
+            FULL_DATASET_BUNDLE.as_posix(),
+            FULL_DATASET_SHA256.as_posix(),
+            LEGACY_ALL_SESSIONS_BUNDLE.as_posix(),
+            LEGACY_ALL_SESSIONS_SHA256.as_posix(),
+        }
     )
 
 
@@ -950,8 +1175,12 @@ def _runtime_artifacts_present(root_path: Path) -> bool:
         root_path / "data/phase_5_2",
         root_path / "data/debug/phase_5_2_auto_collection_status.json",
         root_path / "data/reports/phase_5_2_auto_collection_report.json",
-        root_path / ALL_SESSIONS_BUNDLE,
-        root_path / ALL_SESSIONS_SHA256,
+        root_path / AUDIT_BUNDLE,
+        root_path / AUDIT_SHA256,
+        root_path / FULL_DATASET_BUNDLE,
+        root_path / FULL_DATASET_SHA256,
+        root_path / LEGACY_ALL_SESSIONS_BUNDLE,
+        root_path / LEGACY_ALL_SESSIONS_SHA256,
     )
     return any(path.exists() for path in candidates)
 
@@ -984,6 +1213,12 @@ def _write_json(path: Path, payload: Any) -> None:
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _append_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", errors="replace") as handle:
+        handle.write(text)
 
 
 def _sha256_file(path: Path) -> str:

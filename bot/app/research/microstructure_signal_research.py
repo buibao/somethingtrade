@@ -50,6 +50,8 @@ DATASET_MEMBERS = {
     "corrected_labels": "data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl",
     "latency_profile": "data/dataset/phase_4_2h_latency_profile_samples.jsonl",
 }
+REQUIRED_DATASET_KEYS = tuple(DATASET_MEMBERS)
+MISSING_REQUIRED_DATASET_PATH = "MISSING_REQUIRED_DATASET_PATH"
 
 CONSERVATIVE_COST_ASSUMPTIONS = {
     "fee_bps": 2.0,
@@ -262,7 +264,14 @@ def run_phase50(
     evidence, extracted = verify_phase42h_evidence(root_path, bundle, sha_file)
     _write_json(root_path / PHASE50_EVIDENCE_INTEGRITY_REPORT, evidence)
 
-    samples, dataset_summary = build_research_samples(extracted["dataset_paths"])
+    if evidence.get("status") == "pass":
+        samples, dataset_summary = build_research_samples(extracted["dataset_paths"])
+    else:
+        samples = []
+        dataset_summary = _empty_dataset_summary(
+            extracted.get("dataset_paths", {}),
+            missing_keys=list(evidence.get("missing_keys") or []),
+        )
     label_report = build_label_validation_report(samples)
     _write_json(root_path / PHASE50_LABEL_VALIDATION_REPORT, label_report)
 
@@ -373,6 +382,10 @@ def verify_phase42h_evidence(root_path: Path, bundle_path: Path, sha256_path: Pa
     except Exception as exc:  # pragma: no cover - defensive audit detail
         errors.append(f"{type(exc).__name__}: {exc}")
 
+    missing_keys = _missing_required_dataset_keys(dataset_paths)
+    if missing_keys and MISSING_REQUIRED_DATASET_PATH not in " ".join(errors):
+        errors.append(f"{MISSING_REQUIRED_DATASET_PATH}: {', '.join(missing_keys)}")
+
     phase41 = _dict(runtime_report.get("phase41_runtime_report"))
     clock_summary = _dict(runtime_report.get("clock_offset_summary"))
     clock_sanity = _dict(runtime_report.get("clock_sanity_report"))
@@ -394,7 +407,9 @@ def verify_phase42h_evidence(root_path: Path, bundle_path: Path, sha256_path: Pa
         "strict_100ms_observability_ready": runtime_report.get("strict_100ms_observability_ready") is True,
         "low_latency_ready": runtime_report.get("low_latency_ready") is True,
     }
-    passed = all(checks.values()) and not errors
+    primary_failure = runtime_report.get("primary_failure")
+    error = MISSING_REQUIRED_DATASET_PATH if missing_keys else None
+    passed = all(checks.values()) and not errors and not missing_keys
     report = {
         "phase": PHASE,
         "schema_version": "phase_5_0_evidence_integrity_v1",
@@ -406,7 +421,10 @@ def verify_phase42h_evidence(root_path: Path, bundle_path: Path, sha256_path: Pa
         "bundle_sha256_valid": checks["bundle_sha256_valid"],
         "bundle_extractable": bundle_extractable,
         "runtime_status": runtime_report.get("status"),
-        "primary_failure": runtime_report.get("primary_failure"),
+        "primary_failure": primary_failure if primary_failure is not None else error,
+        "error": error,
+        "missing_keys": missing_keys,
+        "input_dataset_status": "pass" if not missing_keys else "fail",
         "phase41_status": phase41_status,
         "clock_sync_status": runtime_report.get("clock_sync_status"),
         "clock_offset_drift_valid": checks["clock_offset_drift_valid"],
@@ -427,6 +445,10 @@ def verify_phase42h_evidence(root_path: Path, bundle_path: Path, sha256_path: Pa
 
 
 def build_research_samples(dataset_paths: dict[str, Path]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    missing_keys = _missing_required_dataset_keys(dataset_paths)
+    if missing_keys:
+        raise ValueError(f"{MISSING_REQUIRED_DATASET_PATH}: {', '.join(missing_keys)}")
+
     clean_rows = _read_jsonl(dataset_paths["clean_samples"])
     label_rows = _read_jsonl(dataset_paths["corrected_labels"])
     bookticker_rows = sorted(_read_jsonl(dataset_paths["bookticker"]), key=lambda row: _int(row.get("local_recv_monotonic_ns")) or 0)
@@ -607,6 +629,36 @@ def build_research_samples(dataset_paths: dict[str, Path]) -> tuple[list[dict[st
         },
     }
     return samples, dataset_summary
+
+
+def _missing_required_dataset_keys(dataset_paths: dict[str, Path]) -> list[str]:
+    missing: list[str] = []
+    for key in REQUIRED_DATASET_KEYS:
+        path = dataset_paths.get(key)
+        if path is None or not path.exists() or not path.is_file():
+            missing.append(key)
+    return missing
+
+
+def _empty_dataset_summary(dataset_paths: dict[str, Path], *, missing_keys: list[str]) -> dict[str, Any]:
+    return {
+        "schema_version": "phase_5_0_research_dataset_summary_v1",
+        "input_counts": {key: 0 for key in REQUIRED_DATASET_KEYS},
+        "sample_count": 0,
+        "valid_100ms_label_count": 0,
+        "feature_time_range_ns": {"min": None, "max": None},
+        "input_files": {
+            name: {
+                "path": str(path),
+                "size_bytes": path.stat().st_size if path.exists() else 0,
+                "sha256": _sha256_file(path) if path.exists() else "",
+            }
+            for name, path in sorted(dataset_paths.items())
+        },
+        "status": "fail",
+        "error": MISSING_REQUIRED_DATASET_PATH,
+        "missing_keys": missing_keys,
+    }
 
 
 def build_dataset_manifest(

@@ -7,6 +7,8 @@ cd "${ROOT_DIR}"
 RESUME=0
 DRY_RUN=0
 ALLOW_LOW_MEMORY_VPS=0
+INCLUDE_LARGE_DATASETS=0
+ALLOW_NESTED_ZIP=0
 
 usage() {
   cat <<'EOF'
@@ -15,6 +17,8 @@ Usage:
   bash scripts/phase52_vps_24h_start.sh --resume
   bash scripts/phase52_vps_24h_start.sh --dry-run
   bash scripts/phase52_vps_24h_start.sh --allow-low-memory-vps
+  bash scripts/phase52_vps_24h_start.sh --include-large-datasets
+  bash scripts/phase52_vps_24h_start.sh --include-large-datasets --allow-nested-zip
 
 Clean reruns must start with no active data/phase_5_2 directory. Use:
   bash scripts/phase52_vps_clean_failed_run.sh --archive-active-output
@@ -31,6 +35,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allow-low-memory-vps)
       ALLOW_LOW_MEMORY_VPS=1
+      ;;
+    --include-large-datasets)
+      INCLUDE_LARGE_DATASETS=1
+      ;;
+    --allow-nested-zip)
+      ALLOW_NESTED_ZIP=1
       ;;
     -h|--help)
       usage
@@ -73,15 +83,34 @@ fi
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   dirty_state="$(git status --short --untracked-files=all)"
-  tracked_generated="$(git ls-files | grep -E '(^data/(dataset|debug|cache|logs|reports)/|(^|/).+\.jsonl$|(^|/).+\.zip$|(^|/).+\.log$)' || true)"
-  staged_generated="$(git diff --name-only --cached | grep -E '(^data/(dataset|debug|cache|logs|reports)/|(^|/).+\.jsonl$|(^|/).+\.zip$|(^|/).+\.log$)' || true)"
+  tracked_generated="$(git ls-files | grep -E '(^data/(dataset|debug|cache|logs|reports)/|(^|/).+\.jsonl$|(^|/).+\.zip$|(^|/).+\.log$|^phase_5_2_.*sha256.*\.txt$|^phase_4_2h_.*sha256.*\.txt$)' || true)"
+  staged_generated="$(git diff --name-only --cached | grep -E '(^data/(dataset|debug|cache|logs|reports)/|(^|/).+\.jsonl$|(^|/).+\.zip$|(^|/).+\.log$|^phase_5_2_.*sha256.*\.txt$|^phase_4_2h_.*sha256.*\.txt$)' || true)"
   deleted_runtime="$(git status --short | awk '/^ D|^D / {print $2}' | grep -E '(^data/phase_5_2/|^data/debug/phase_5_2|^data/reports/phase_5_2)' || true)"
   legacy_unignored_archives="$(find data -maxdepth 1 -type d -name 'phase_5_2_failed_before_cleanup_fix*' -print 2>/dev/null || true)"
+  missing_gitignore_rules=""
+  required_gitignore_rules=(
+    "data/phase_5_2/"
+    "data/cache/phase_5_2_failed_runs/"
+    "data/dataset/"
+    "data/debug/"
+    "data/reports/"
+    "*.jsonl"
+    "*.zip"
+    "*.log"
+    "phase_5_2_audit_bundle_sha256.txt"
+    "phase_5_2_full_dataset_bundle_sha256.txt"
+  )
+  for rule in "${required_gitignore_rules[@]}"; do
+    if [[ ! -f .gitignore ]] || ! grep -qxF "${rule}" .gitignore; then
+      missing_gitignore_rules="${missing_gitignore_rules}${rule}"$'\n'
+    fi
+  done
   [[ -z "${dirty_state}" ]] || fail "git working tree is dirty. Commit/stash/remove changes before starting: ${dirty_state}"
   [[ -z "${tracked_generated}" ]] || fail "generated heavy artifacts are tracked: ${tracked_generated}"
   [[ -z "${staged_generated}" ]] || fail "generated heavy artifacts are staged: ${staged_generated}"
   [[ -z "${deleted_runtime}" ]] || fail "tracked runtime artifacts were deleted by cleanup: ${deleted_runtime}"
   [[ -z "${legacy_unignored_archives}" ]] || fail "unignored legacy Phase 5.2 archive folders exist: ${legacy_unignored_archives}"
+  [[ -z "${missing_gitignore_rules}" ]] || fail ".gitignore is missing generated artifact rules: ${missing_gitignore_rules}"
 fi
 
 if ! grep -q -- '"--clean"' bot/app/research/phase52_auto_collection.py; then
@@ -107,11 +136,14 @@ memory_total_bytes="${memory_total_bytes%.*}"
 memory_available_bytes="${memory_available_bytes%.*}"
 swap_total_bytes="${swap_total_bytes%.*}"
 low_memory_threshold_bytes=$((4 * 1024 * 1024 * 1024))
+memory_guard_decision="pass"
 if [[ "${ALLOW_LOW_MEMORY_VPS}" != "1" ]]; then
   if [[ "${memory_total_bytes:-0}" -lt "${low_memory_threshold_bytes}" || "${swap_total_bytes:-0}" -le 0 ]]; then
+    memory_guard_decision="refuse"
     fail "planned 1h+ Phase 5.2 sessions need streaming finalization plus a safe memory budget. Detected memory_total_bytes=${memory_total_bytes:-0}, memory_available_bytes=${memory_available_bytes:-0}, swap_total_bytes=${swap_total_bytes:-0}. Add swap or rerun with --allow-low-memory-vps."
   fi
 else
+  memory_guard_decision="override"
   echo "Warning: low-memory VPS guard overridden. memory_total_bytes=${memory_total_bytes:-0} memory_available_bytes=${memory_available_bytes:-0} swap_total_bytes=${swap_total_bytes:-0}" >&2
 fi
 
@@ -127,11 +159,31 @@ command=(
   --stop-after-current-session-file "${STOP_FILE}"
 )
 
+if [[ "${INCLUDE_LARGE_DATASETS}" == "1" ]]; then
+  command+=(--include-large-datasets)
+fi
+
+if [[ "${ALLOW_NESTED_ZIP}" == "1" ]]; then
+  command+=(--allow-nested-zip)
+fi
+
 if [[ "${RESUME}" == "1" ]]; then
   command+=(--resume)
 fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
+  printf 'total RAM bytes: %s\n' "${memory_total_bytes:-0}"
+  printf 'available RAM bytes: %s\n' "${memory_available_bytes:-0}"
+  printf 'swap total bytes: %s\n' "${swap_total_bytes:-0}"
+  printf 'memory guard decision: %s\n' "${memory_guard_decision}"
+  if [[ "${INCLUDE_LARGE_DATASETS}" == "1" ]]; then
+    printf 'bundle mode: audit-light plus explicit full dataset bundle\n'
+    printf 'large datasets included in bundles: true\n'
+  else
+    printf 'bundle mode: audit-light\n'
+    printf 'large datasets included in bundles: false\n'
+  fi
+  printf 'nested zip allowed: %s\n' "$([[ "${ALLOW_NESTED_ZIP}" == "1" ]] && echo true || echo false)"
   printf 'Phase 5.2 start validation passed. Command would be:\n'
   printf ' %q' "${command[@]}"
   printf '\n'

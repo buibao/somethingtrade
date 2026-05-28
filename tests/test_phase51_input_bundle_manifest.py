@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.research.edge_robustness_research import build_input_bundle_manifest_and_samples
+from phase50_test_utils import phase42h_fixture_paths
 from phase51_test_utils import ROOT, load_json, write_json
 
 
@@ -38,13 +39,14 @@ def test_multi_bundle_manifest_created(tmp_path: Path) -> None:
 
 
 def test_invalid_bundle_sha256_fails_or_excludes(tmp_path: Path) -> None:
+    bundle, _ = phase42h_fixture_paths()
     bad_sha = tmp_path / "bad_sha.txt"
     bad_sha.write_text("sha256: " + ("0" * 64), encoding="utf-8")
     manifest, _ = build_input_bundle_manifest_and_samples(
         root_path=ROOT,
         phase50_bundle_path=ROOT / "phase_5_0_empirical_signal_research_bundle.zip",
         input_mode="single_bundle",
-        bundle_paths=[ROOT / "phase_4_2h_hotpath_environment_latency_bundle.zip"],
+        bundle_paths=[bundle],
         sha256_paths=[bad_sha],
     )
     assert manifest["status"] == "fail"
@@ -67,4 +69,3 @@ def test_all_bundles_valid_required_for_expanded_dataset(tmp_path: Path) -> None
     )
     assert manifest["all_bundles_valid"] is False
     assert manifest["status"] == "fail"
-
