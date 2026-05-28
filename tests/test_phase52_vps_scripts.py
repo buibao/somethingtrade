@@ -99,6 +99,67 @@ def test_phase52_start_allows_clean_start_after_cleanup(tmp_path: Path) -> None:
     assert "--fail-session-on-quality-gate" in result.stdout
 
 
+def test_phase52_start_warns_or_refuses_known_memory_risk(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(START_SCRIPT, tmp_path)
+    _write_phase52_runner_marker(tmp_path)
+    env = {
+        **_bash_env(),
+        "PHASE52_MEMORY_TOTAL_BYTES": str(3 * 1024 * 1024 * 1024),
+        "PHASE52_MEMORY_AVAILABLE_BYTES": str(2 * 1024 * 1024 * 1024),
+        "PHASE52_SWAP_TOTAL_BYTES": "0",
+    }
+
+    result = subprocess.run([bash, str(script), "--dry-run"], cwd=tmp_path, env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode != 0
+    assert "memory_total_bytes" in result.stderr
+    assert "--allow-low-memory-vps" in result.stderr
+
+
+def test_phase52_start_memory_guard_can_be_overridden_explicitly(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(START_SCRIPT, tmp_path)
+    _write_phase52_runner_marker(tmp_path)
+    env = {
+        **_bash_env(),
+        "PHASE52_MEMORY_TOTAL_BYTES": str(3 * 1024 * 1024 * 1024),
+        "PHASE52_MEMORY_AVAILABLE_BYTES": str(2 * 1024 * 1024 * 1024),
+        "PHASE52_SWAP_TOTAL_BYTES": "0",
+    }
+
+    result = subprocess.run([bash, str(script), "--dry-run", "--allow-low-memory-vps"], cwd=tmp_path, env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "low-memory VPS guard overridden" in result.stderr
+
+
+def test_phase52_status_reports_last_failure_oom(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(ROOT / "scripts/phase52_vps_status.sh", tmp_path)
+    status = tmp_path / "data/debug/phase_5_2_auto_collection_status.json"
+    status.parent.mkdir(parents=True)
+    status.write_text(
+        json.dumps(
+            {
+                "current_session": "session_002_short_1h",
+                "completed_session_count": 2,
+                "passed_session_count": 1,
+                "failed_session_count": 1,
+                "research_eligible_session_count": 1,
+                "last_failure": "OOM_KILLED",
+                "stopped_early": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run([bash, str(script)], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "last_failure: OOM_KILLED" in result.stdout
+
+
 def test_phase52_clean_failed_run_archive_mode_keeps_git_status_clean(tmp_path: Path) -> None:
     bash = _require_bash()
     script = _copy_script(CLEAN_SCRIPT, tmp_path)
@@ -114,6 +175,10 @@ def test_phase52_clean_failed_run_archive_mode_keeps_git_status_clean(tmp_path: 
     assert status.returncode == 0
     assert status.stdout == ""
     assert list((tmp_path / "data/cache/phase_5_2_failed_runs").glob("phase_5_2_failed_before_cleanup_fix_*"))
+
+
+def test_cleanup_archive_mode_keeps_git_status_clean(tmp_path: Path) -> None:
+    test_phase52_clean_failed_run_archive_mode_keeps_git_status_clean(tmp_path)
 
 
 def test_phase52_start_refuses_dirty_git_state_including_untracked_archive(tmp_path: Path) -> None:
@@ -254,4 +319,7 @@ def _bash_env() -> dict[str, str]:
     git_usr_bin = Path(r"C:\Program Files\Git\usr\bin")
     if git_usr_bin.exists():
         env["PATH"] = str(git_usr_bin) + os.pathsep + env.get("PATH", "")
+    env.setdefault("PHASE52_MEMORY_TOTAL_BYTES", str(8 * 1024 * 1024 * 1024))
+    env.setdefault("PHASE52_MEMORY_AVAILABLE_BYTES", str(6 * 1024 * 1024 * 1024))
+    env.setdefault("PHASE52_SWAP_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024))
     return env

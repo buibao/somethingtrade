@@ -26,10 +26,12 @@ from app.research.clock_sync_receive_lag import (
     build_corrected_hybrid_summary,
     build_receive_lag_raw_vs_corrected,
     compute_clock_offset_summary,
-    compute_phase42e_source_report,
-    generate_corrected_time_protocol_rows,
 )
 from app.research.orderbook_labeled_dataset import validate_clean_samples, write_jsonl
+from app.research.phase42h_streaming import (
+    build_latency_stage_profile_streaming,
+    run_phase42h_streaming_finalization,
+)
 from app.research.reference_feed_benchmark import (
     AGGTRADE_REFERENCE_EVENTS,
     BENCHMARK_LABELS,
@@ -37,8 +39,6 @@ from app.research.reference_feed_benchmark import (
     REFERENCE_SOURCES,
     REQUIRED_100MS_VALID_RATE,
     TRADE_REFERENCE_EVENTS,
-    ReferenceValidationResult,
-    generate_benchmark_rows,
     validate_depth_reference_events,
     validate_reference_events,
 )
@@ -46,7 +46,6 @@ from app.research.time_protocol_benchmark import (
     REQUIRED_100MS_MAX_FUTURE_GAP_MS,
     TIME_PROTOCOL_LABELS,
     build_protocol_summary,
-    generate_time_protocol_rows,
     run_phase42d_leakage_check,
     validate_gitignore_rules,
     validate_timestamp_schema,
@@ -241,6 +240,17 @@ PHASE42H_REQUIRED_BUNDLE_FILES = (
     "data/debug/phase_4_2h_pytest_output.txt",
 )
 
+MEMORY_TELEMETRY_STAGES = (
+    "process_start",
+    "preflight_end",
+    "capture_start",
+    "capture_end",
+    "finalization_start",
+    "finalization_end",
+    "bundle_start",
+    "bundle_end",
+)
+
 
 def cleanup_phase42h_artifacts(root: str | Path, *, source_root: str | Path | None = None) -> dict[str, Any]:
     root_path = Path(root).resolve()
@@ -419,6 +429,14 @@ def run_phase42h_vps_preflight(
         message="" if writable_result["passed"] else "one or more data directories are not writable",
     )
 
+    memory_status = _system_memory_status()
+    record(
+        "memory_and_swap",
+        True,
+        **memory_status,
+        message="",
+    )
+
     gitignore_path = source_root_path / ".gitignore"
     gitignore_validation = validate_gitignore_rules(source_root_path)
     gitignore_present = gitignore_path.exists()
@@ -476,44 +494,27 @@ def run_phase42h_analysis(
     typecheck_summary: str = "",
     fresh_capture_required: bool = True,
     preflight_report: dict[str, Any] | None = None,
+    memory_telemetry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     root_path = Path(root)
     clean_path = _resolve(root_path, clean_samples_path)
-    clean_validation = validate_clean_samples(clean_path)
-    clean_samples = clean_validation.samples if clean_validation.valid else []
-    validations: dict[str, ReferenceValidationResult] = {
-        "depth_mid": validate_depth_reference_events(clean_samples),
-        "bookTicker_mid": validate_reference_events(_resolve(root_path, bookticker_path), reference_source="bookTicker_mid"),
-        "trade_price": validate_reference_events(_resolve(root_path, trade_path), reference_source="trade_price"),
-        "aggTrade_price": validate_reference_events(_resolve(root_path, aggtrade_path), reference_source="aggTrade_price"),
-    }
-    references_by_source = {source: validation.valid_events for source, validation in validations.items()}
-    timestamp_schema = validate_timestamp_schema(clean_samples, references_by_source)
-    receive_rows = generate_benchmark_rows(clean_samples, references_by_source) if clean_samples else []
-    write_jsonl(_resolve(root_path, receive_labels_path), receive_rows)
-    time_rows = generate_time_protocol_rows(clean_samples, references_by_source, timestamp_schema) if clean_samples else []
-    write_jsonl(_resolve(root_path, time_protocol_labels_path), time_rows)
     clock_offset_summary = compute_clock_offset_summary(clock_offset_samples)
-    corrected_rows = generate_corrected_time_protocol_rows(
-        time_rows,
+    streaming = run_phase42h_streaming_finalization(
+        root=root_path,
+        clean_samples_path=clean_path,
+        bookticker_path=bookticker_path,
+        trade_path=trade_path,
+        aggtrade_path=aggtrade_path,
+        receive_labels_path=receive_labels_path,
+        time_protocol_labels_path=time_protocol_labels_path,
+        corrected_labels_path=corrected_labels_path,
+        leakage_output_path=PHASE42H_LEAKAGE_CHECK,
         estimated_clock_offset_ms=_float_or_none(clock_offset_summary.get("estimated_clock_offset_ms")),
         clock_offset_drift_valid=clock_offset_summary.get("clock_offset_drift_valid") is True,
     )
-    for row in corrected_rows:
-        row["schema_version"] = "phase_4_2h_corrected_time_protocol_v1"
-    write_jsonl(_resolve(root_path, corrected_labels_path), corrected_rows)
-    leakage = run_phase42d_leakage_check(time_rows, output_path=root_path / PHASE42H_LEAKAGE_CHECK)
-    sources = {
-        source: compute_phase42e_source_report(
-            source=source,
-            validation=validations[source],
-            time_rows=time_rows,
-            corrected_rows=corrected_rows,
-            timestamp_schema=timestamp_schema,
-            leakage_result=leakage,
-        )
-        for source in REFERENCE_SOURCES
-    }
+    timestamp_schema = streaming.timestamp_schema
+    leakage = streaming.leakage_result
+    sources = streaming.sources
     clock_sanity = build_clock_sanity_report(clock_offset_summary=clock_offset_summary, sources=sources)
     latency_profile = build_latency_stage_profile(_resolve(root_path, latency_profile_samples_path))
     phase41_report, phase41_source = resolve_phase41_runtime_report(root_path, capture=capture)
@@ -528,7 +529,7 @@ def run_phase42h_analysis(
     )
     report = build_phase42h_report(
         symbol=symbol,
-        clean_samples=clean_samples,
+        clean_samples=[],
         sources=sources,
         timestamp_schema=timestamp_schema,
         leakage_result=leakage,
@@ -549,12 +550,24 @@ def run_phase42h_analysis(
         fresh_capture_required=fresh_capture_required,
         preflight_report=preflight_report,
         phase41_runtime_report_source=phase41_source,
-        labeled_sample_count=len(corrected_rows),
+        labeled_sample_count=streaming.labeled_sample_count,
+        clean_sample_count=streaming.clean_sample_count,
+        memory_telemetry=memory_telemetry,
     )
-    if clean_validation.failure_classification:
-        report["hard_fail_reasons"].append(f"clean sample validation failed: {clean_validation.failure_classification}")
+    clean_failure = _dict(streaming.clean_validation).get("failure_classification")
+    if clean_failure:
+        report["hard_fail_reasons"].append(f"clean sample validation failed: {clean_failure}")
         report["primary_failure"] = report.get("primary_failure") or "INPUT_DATASET_FAILURE"
+        report["streaming_finalization"] = {
+            "clean_validation": streaming.clean_validation,
+            "stream_reports": streaming.stream_reports,
+        }
         report = evaluate_phase42h_report(report)
+    else:
+        report["streaming_finalization"] = {
+            "clean_validation": streaming.clean_validation,
+            "stream_reports": streaming.stream_reports,
+        }
     return report
 
 
@@ -581,8 +594,10 @@ def build_phase42h_report(
     typecheck_summary: str,
     fresh_capture_required: bool,
     labeled_sample_count: int,
+    clean_sample_count: int | None = None,
     preflight_report: dict[str, Any] | None = None,
     phase41_runtime_report_source: dict[str, Any] | None = None,
+    memory_telemetry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     protocol_summary = build_protocol_summary(
         {
@@ -683,9 +698,10 @@ def build_phase42h_report(
             "latency_profile_samples": _display_path(LATENCY_PROFILE_SAMPLES),
             "latency_profile_datasets_zip": _display_path(LATENCY_PROFILE_DATASETS_ZIP),
         },
-        "clean_sample_count": len(clean_samples),
+        "clean_sample_count": int(clean_sample_count if clean_sample_count is not None else len(clean_samples)),
         "labeled_sample_count": labeled_sample_count,
         "sources": sources,
+        "memory_telemetry": memory_telemetry or _empty_memory_telemetry(),
         "hard_fail_reasons": [],
         "warning_reasons": sorted(warnings),
     }
@@ -693,65 +709,11 @@ def build_phase42h_report(
 
 
 def build_latency_stage_profile(samples_path: str | Path) -> dict[str, Any]:
-    rows = _read_jsonl(samples_path)
-    stage_counts: dict[str, dict[str, int]] = {}
-    metric_values: dict[str, list[float]] = {name: [] for name in LATENCY_METRIC_NAMES}
-    queue_depth_values: list[float] = []
-    disk_hot_path = False
-    debug_hot_path = False
-    batch_writer_enabled = False
-    earliest_stage_counts: dict[str, int] = {}
-    for row in rows:
-        stages = _dict(row.get("stages"))
-        metrics = _dict(row.get("metrics"))
-        for stage in REQUIRED_STAGE_NAMES:
-            value = stages.get(stage)
-            stats = stage_counts.setdefault(stage, {"available_count": 0, "stage_not_available_count": 0})
-            if isinstance(value, bool) or not isinstance(value, int):
-                stats["stage_not_available_count"] += 1
-            else:
-                stats["available_count"] += 1
-        earliest = str(row.get("earliest_available_receive_stage") or "")
-        if earliest:
-            earliest_stage_counts[earliest] = earliest_stage_counts.get(earliest, 0) + 1
-        for metric in LATENCY_METRIC_NAMES:
-            value = _float_or_none(metrics.get(metric))
-            if value is not None:
-                metric_values[metric].append(value)
-        queue_depth = _float_or_none(row.get("queue_size_at_enqueue"))
-        if queue_depth is not None:
-            queue_depth_values.append(queue_depth)
-        disk_hot_path = disk_hot_path or row.get("disk_write_on_hot_path") is True
-        debug_hot_path = debug_hot_path or row.get("debug_logging_on_hot_path") is True
-        batch_writer_enabled = batch_writer_enabled or row.get("batch_writer_enabled") is True
-    unavailable = {
-        stage: "stage_not_available"
-        for stage, stats in stage_counts.items()
-        if int(stats["available_count"]) == 0
-    }
-    earliest_available = _mode(earliest_stage_counts) or (
-        "raw_ws_callback_monotonic_ns"
-        if "raw_ws_callback_monotonic_ns" not in unavailable
-        else "stage_not_available"
+    return build_latency_stage_profile_streaming(
+        samples_path,
+        required_stage_names=REQUIRED_STAGE_NAMES,
+        latency_metric_names=LATENCY_METRIC_NAMES,
     )
-    return {
-        "performed": bool(rows),
-        "sample_count": len(rows),
-        "stage_availability": stage_counts,
-        "unavailable_stages": unavailable,
-        "socket_recv_monotonic_ns": "stage_not_available"
-        if "socket_recv_monotonic_ns" in unavailable
-        else "available",
-        "earliest_available_receive_stage": earliest_available,
-        "metrics": {metric: _series_summary(values) for metric, values in metric_values.items()},
-        "missing_metrics": sorted(metric for metric, values in metric_values.items() if not values),
-        "queue_depth_from_latency_samples": _series_summary(queue_depth_values),
-        "disk_write_on_hot_path": disk_hot_path,
-        "debug_logging_on_hot_path": debug_hot_path,
-        "batch_writer_enabled": batch_writer_enabled,
-        "queue_backpressure_detected": False,
-        "stage_profile_path": _display_path(samples_path),
-    }
 
 
 def build_writer_batch_report(
@@ -1367,11 +1329,17 @@ def create_phase42h_dataset_zip(root: str | Path) -> Path:
         "data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl",
         "data/dataset/phase_4_2h_latency_profile_samples.jsonl",
     )
+    manifest: list[dict[str, Any]] = []
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for relative in dataset_paths:
             path = root_path / relative
             if path.exists() and path.is_file():
                 archive.write(path, relative)
+                manifest.append({"path": relative, "size_bytes": path.stat().st_size, "included_in_bundle": True})
+        archive.writestr(
+            "data/debug/phase_4_2h_dataset_zip_file_manifest.json",
+            json.dumps({"files": manifest}, indent=2, sort_keys=True) + "\n",
+        )
     return target
 
 
@@ -1386,17 +1354,25 @@ def create_phase42h_bundle(
     if target.exists():
         target.unlink()
     target.parent.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict[str, Any]] = []
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for relative in PHASE42H_REQUIRED_BUNDLE_FILES:
             path = root_path / relative
             if path.exists() and path.is_file():
                 archive.write(path, relative)
+                manifest.append({"path": relative, "size_bytes": path.stat().st_size, "included_in_bundle": True})
         investigation = root_path / PHASE42H_INVESTIGATION
         if investigation.exists():
             archive.write(investigation, _display_path(PHASE42H_INVESTIGATION))
+            manifest.append({"path": _display_path(PHASE42H_INVESTIGATION), "size_bytes": investigation.stat().st_size, "included_in_bundle": True})
         dataset_zip = root_path / LATENCY_PROFILE_DATASETS_ZIP
         if dataset_zip.exists() and dataset_zip.is_file():
             archive.write(dataset_zip, _display_path(LATENCY_PROFILE_DATASETS_ZIP))
+            manifest.append({"path": _display_path(LATENCY_PROFILE_DATASETS_ZIP), "size_bytes": dataset_zip.stat().st_size, "included_in_bundle": True})
+        archive.writestr(
+            "data/debug/phase_4_2h_bundle_file_manifest.json",
+            json.dumps({"files": manifest}, indent=2, sort_keys=True) + "\n",
+        )
     missing = phase42h_bundle_missing_files(target, pass_bundle=pass_bundle)
     if missing:
         raise RuntimeError(f"Phase 4.2H bundle missing required files: {missing}")
@@ -1446,6 +1422,9 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
     primary = str(report.get("primary_failure") or "")
     classifications = [str(item) for item in report.get("failure_classifications", []) if item]
     known = (
+        "OOM_KILLED",
+        "PROCESS_SIGKILL",
+        "PROCESS_KILLED",
         "ARTIFACT_CLEANUP_FAILURE",
         "TEST_FAILURE",
         "TYPECHECK_FAILURE",
@@ -1483,6 +1462,151 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
     return "UNKNOWN_PHASE42H_FAILURE"
 
 
+def new_memory_telemetry() -> dict[str, Any]:
+    return {
+        "schema_version": "phase_4_2h_memory_telemetry_v1",
+        "samples": {},
+        "stage_order": list(MEMORY_TELEMETRY_STAGES),
+        "stage_durations_sec": {},
+        "peak_rss_bytes": 0,
+        "generated_file_sizes_bytes": {},
+        "finalization_memory_delta_bytes": None,
+        "available": True,
+        "notes": [],
+    }
+
+
+def record_memory_stage(telemetry: dict[str, Any], stage: str) -> dict[str, Any]:
+    samples = telemetry.setdefault("samples", {})
+    previous_stage = str(telemetry.get("_last_stage") or "")
+    previous_monotonic = _float_or_none(telemetry.get("_last_monotonic_sec"))
+    sample = _sample_process_memory()
+    samples[stage] = sample
+    rss = int(_num(sample.get("rss_bytes")))
+    peak = max(int(_num(telemetry.get("peak_rss_bytes"))), int(_num(sample.get("peak_rss_bytes"))), rss)
+    telemetry["peak_rss_bytes"] = peak
+    telemetry["available"] = bool(telemetry.get("available", True)) and sample.get("available") is True
+    monotonic_sec = _float_or_none(sample.get("monotonic_sec"))
+    if previous_stage and previous_monotonic is not None and monotonic_sec is not None:
+        telemetry.setdefault("stage_durations_sec", {})[f"{previous_stage}_to_{stage}"] = max(0.0, monotonic_sec - previous_monotonic)
+    telemetry["_last_stage"] = stage
+    telemetry["_last_monotonic_sec"] = monotonic_sec
+    if stage == "finalization_end":
+        start = _dict(samples.get("finalization_start"))
+        start_rss = _float_or_none(start.get("rss_bytes"))
+        end_rss = _float_or_none(sample.get("rss_bytes"))
+        if start_rss is not None and end_rss is not None:
+            telemetry["finalization_memory_delta_bytes"] = int(end_rss - start_rss)
+    return telemetry
+
+
+def refresh_generated_file_sizes(root: str | Path, telemetry: dict[str, Any]) -> dict[str, Any]:
+    root_path = Path(root)
+    sizes: dict[str, int] = {}
+    for relative in PHASE42H_GENERATED_RELATIVE_FILES:
+        path = root_path / relative
+        if path.exists() and path.is_file():
+            sizes[_display_path(relative)] = path.stat().st_size
+    telemetry["generated_file_sizes_bytes"] = sizes
+    return telemetry
+
+
+def finalize_memory_telemetry(root: str | Path, telemetry: dict[str, Any]) -> dict[str, Any]:
+    refresh_generated_file_sizes(root, telemetry)
+    telemetry.pop("_last_stage", None)
+    telemetry.pop("_last_monotonic_sec", None)
+    for stage in MEMORY_TELEMETRY_STAGES:
+        telemetry.setdefault("samples", {}).setdefault(stage, _unavailable_memory_sample(stage))
+    if telemetry.get("peak_rss_bytes") is None:
+        telemetry["peak_rss_bytes"] = 0
+    return telemetry
+
+
+def _empty_memory_telemetry() -> dict[str, Any]:
+    telemetry = new_memory_telemetry()
+    telemetry["available"] = False
+    telemetry["notes"] = ["memory telemetry was not attached by the runner"]
+    for stage in MEMORY_TELEMETRY_STAGES:
+        telemetry["samples"][stage] = _unavailable_memory_sample(stage)
+    return telemetry
+
+
+def _sample_process_memory() -> dict[str, Any]:
+    base = {
+        "at_utc": _utc_now(),
+        "monotonic_sec": time.monotonic(),
+        "rss_bytes": 0,
+        "peak_rss_bytes": 0,
+        "available": False,
+        "source": "unavailable",
+    }
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        process = psutil.Process(os.getpid())
+        info = process.memory_info()
+        rss = int(getattr(info, "rss", 0) or 0)
+        peak = int(getattr(info, "peak_wset", 0) or getattr(info, "peak_rss", 0) or rss)
+        return {**base, "rss_bytes": rss, "peak_rss_bytes": max(0, peak), "available": True, "source": "psutil"}
+    except Exception:
+        pass
+    proc_status = Path("/proc/self/status")
+    if proc_status.exists():
+        rss = 0
+        peak = 0
+        try:
+            with proc_status.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        rss = _kb_line_to_bytes(line)
+                    elif line.startswith("VmHWM:"):
+                        peak = _kb_line_to_bytes(line)
+            return {
+                **base,
+                "rss_bytes": rss,
+                "peak_rss_bytes": max(peak, rss, 0),
+                "available": True,
+                "source": "procfs",
+            }
+        except OSError:
+            pass
+    try:
+        resource_module = importlib.import_module("resource")
+        getrusage = getattr(resource_module, "getrusage", None)
+        rusage_self = getattr(resource_module, "RUSAGE_SELF", None)
+        if not callable(getrusage) or rusage_self is None:
+            raise RuntimeError("resource usage sampling unavailable")
+        usage = getrusage(rusage_self)
+        peak = int(getattr(usage, "ru_maxrss", 0) or 0)
+        if sys.platform != "darwin":
+            peak *= 1024
+        return {**base, "rss_bytes": 0, "peak_rss_bytes": max(0, peak), "available": True, "source": "resource"}
+    except Exception:
+        return base
+
+
+def _unavailable_memory_sample(stage: str) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "at_utc": None,
+        "monotonic_sec": None,
+        "rss_bytes": 0,
+        "peak_rss_bytes": 0,
+        "available": False,
+        "source": "unavailable",
+    }
+
+
+def _kb_line_to_bytes(line: str) -> int:
+    parts = line.split()
+    if len(parts) < 2:
+        return 0
+    try:
+        return int(parts[1]) * 1024
+    except ValueError:
+        return 0
+
+
 def _cpu_model() -> str:
     cpuinfo = Path("/proc/cpuinfo")
     if cpuinfo.exists():
@@ -1516,6 +1640,68 @@ def _memory_total_mb() -> int:
             return 0
         return int((page_size * page_count) / (1024 * 1024))
     return 0
+
+
+def _sysconf_int(name: str) -> int | None:
+    sysconf = getattr(os, "sysconf", None)
+    if not callable(sysconf):
+        return None
+    try:
+        raw = sysconf(name)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, (int, float, str)):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _system_memory_status() -> dict[str, Any]:
+    total = 0
+    available = 0
+    swap_total = 0
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        try:
+            with meminfo.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if line.startswith("MemTotal:"):
+                        total = _kb_line_to_bytes(line)
+                    elif line.startswith("MemAvailable:"):
+                        available = _kb_line_to_bytes(line)
+                    elif line.startswith("SwapTotal:"):
+                        swap_total = _kb_line_to_bytes(line)
+        except OSError:
+            pass
+    if total <= 0:
+        page_size = _sysconf_int("SC_PAGE_SIZE")
+        page_count = _sysconf_int("SC_PHYS_PAGES")
+        available_pages = _sysconf_int("SC_AVPHYS_PAGES")
+        if page_size is not None and page_count is not None:
+            total = page_size * page_count
+            available = page_size * available_pages if available_pages is not None else 0
+    try:
+        disk = shutil.disk_usage(Path.cwd())
+        disk_free = int(disk.free)
+        disk_total = int(disk.total)
+    except OSError:
+        disk_free = 0
+        disk_total = 0
+    return {
+        "memory_total_bytes": total,
+        "memory_available_bytes": available,
+        "total_memory_bytes": total,
+        "available_memory_bytes": available,
+        "memory_total_mb": int(total / (1024 * 1024)) if total else 0,
+        "memory_available_mb": int(available / (1024 * 1024)) if available else 0,
+        "swap_total_bytes": swap_total,
+        "swap_enabled": swap_total > 0,
+        "disk_free_bytes": disk_free,
+        "disk_total_bytes": disk_total,
+        "low_memory_no_swap_warning": total > 0 and total < 4 * 1024 * 1024 * 1024 and swap_total <= 0,
+    }
 
 
 def _timezone_name() -> str:

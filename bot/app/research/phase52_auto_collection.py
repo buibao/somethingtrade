@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,10 @@ REQUIRED_SESSION_METADATA_FIELDS = (
     "plan_name",
     "repo_commit",
     "source_repo_dirty",
+    "source_repo_dirty_before_session",
+    "source_repo_dirty_after_session",
+    "runtime_artifacts_present",
+    "ignored_runtime_artifacts_present",
     "started_at_utc",
     "ended_at_utc",
     "requested_duration_sec",
@@ -52,6 +57,16 @@ REQUIRED_SESSION_METADATA_FIELDS = (
     "low_latency_ready",
     "research_eligible",
     "notes",
+)
+
+OOM_CLASSIFICATION = "OOM_KILLED"
+PROCESS_SIGKILL_CLASSIFICATION = "PROCESS_SIGKILL"
+REPORT_MISSING_CLASSIFICATION = "REPORT_MISSING"
+KERNEL_OOM_PATTERNS = (
+    "Out of memory: Killed process",
+    "Killed process",
+    "oom-kill",
+    "Memory cgroup out of memory",
 )
 
 
@@ -116,6 +131,7 @@ def run_controlled_capture(
 
     started = _utc_now()
     start_mono = time.monotonic()
+    source_repo_state_before = _git_source_state(root_path)
     runtime_report: dict[str, Any]
     console_lines = [
         f"Phase 5.2 controlled capture started: {started}",
@@ -127,7 +143,7 @@ def run_controlled_capture(
     if dry_run:
         runtime_report = synthetic_phase42h_runtime_report(requested_duration_sec=requested_duration_sec, simulate_failure=simulate_failure)
         if create_bundle:
-            _write_synthetic_phase42h_bundle(bundle_path, runtime_report)
+            _write_synthetic_phase42h_bundle(bundle_path, runtime_report, dry_run=True)
         console_lines.append("dry-run synthetic capture completed")
         exit_code = 0 if runtime_report.get("status") == "pass" else 1
     else:
@@ -149,7 +165,7 @@ def run_controlled_capture(
     _write_text(console_path, "\n".join(console_lines) + "\n")
 
     if create_bundle and not bundle_path.exists():
-        _write_synthetic_phase42h_bundle(bundle_path, runtime_report)
+        _write_synthetic_phase42h_bundle(bundle_path, runtime_report, dry_run=dry_run)
     bundle_sha = _sha256_file(bundle_path) if bundle_path.exists() else ""
     _write_text(
         sha_path,
@@ -176,6 +192,7 @@ def run_controlled_capture(
         runtime_report=runtime_report,
         quality_report=quality,
         notes=notes,
+        source_repo_state_before=source_repo_state_before,
     )
     _write_json(quality_path, quality)
     _write_json(metadata_path, metadata)
@@ -369,19 +386,27 @@ def build_session_metadata(
     runtime_report: dict[str, Any],
     quality_report: dict[str, Any],
     notes: str,
+    source_repo_state_before: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     phase41 = _dict(runtime_report.get("phase41_runtime_report"))
     clock = _dict(runtime_report.get("clock_offset_summary"))
     hot_path = _dict(runtime_report.get("hot_path_latency_summary"))
     latency_metrics = _dict(hot_path.get("metrics"))
     end_to_end = _dict(latency_metrics.get("end_to_end_local_hot_path_ms"))
-    repo_commit, dirty = _git_identity(root_path)
+    before_state = source_repo_state_before or _git_source_state(root_path)
+    after_state = _git_source_state(root_path)
     metadata = {
         "phase": PHASE,
         "session_id": session_id,
         "plan_name": plan_name,
-        "repo_commit": repo_commit,
-        "source_repo_dirty": dirty,
+        "repo_commit": before_state.get("repo_commit", "unknown"),
+        "source_repo_dirty": before_state.get("source_repo_dirty", False),
+        "source_repo_dirty_before_session": before_state.get("source_repo_dirty", False),
+        "source_repo_dirty_after_session": after_state.get("source_repo_dirty", False),
+        "source_repo_status_before_session": before_state,
+        "source_repo_status_after_session": after_state,
+        "runtime_artifacts_present": after_state.get("runtime_artifacts_present", False),
+        "ignored_runtime_artifacts_present": after_state.get("ignored_runtime_artifacts_present", False),
         "started_at_utc": started_at_utc,
         "ended_at_utc": ended_at_utc,
         "requested_duration_sec": requested_duration_sec,
@@ -393,6 +418,13 @@ def build_session_metadata(
         "vps_region": os.environ.get("PHASE52_VPS_REGION", ""),
         "runtime_status": runtime_report.get("status"),
         "primary_failure": runtime_report.get("primary_failure"),
+        "failure_classifications": runtime_report.get("failure_classifications", []),
+        "exit_code": runtime_report.get("exit_code"),
+        "oom_detected": _dict(runtime_report.get("oom_evidence")).get("oom_detected", False),
+        "oom_log_excerpt": _dict(runtime_report.get("oom_evidence")).get("oom_log_excerpt", ""),
+        "oom_killed_pid": _dict(runtime_report.get("oom_evidence")).get("killed_pid"),
+        "process_failure_evidence": runtime_report.get("process_failure_evidence", {}),
+        "memory_telemetry": runtime_report.get("memory_telemetry", {}),
         "failure_reasons": quality_report.get("failure_reasons", []),
         "clock_sync_status": runtime_report.get("clock_sync_status"),
         "accepted_clock_sample_count": clock.get("accepted_clock_sample_count", 0),
@@ -462,6 +494,8 @@ def build_status(
     stopped_early: bool,
     stop_reason: str,
 ) -> dict[str, Any]:
+    failed_sessions = [session for session in sessions if session.get("status") != "pass"]
+    last_failure = str(failed_sessions[-1].get("primary_failure")) if failed_sessions else None
     return {
         "phase": PHASE,
         "plan_name": plan_name,
@@ -472,6 +506,7 @@ def build_status(
         "passed_session_count": sum(1 for session in sessions if session.get("status") == "pass"),
         "failed_session_count": sum(1 for session in sessions if session.get("status") != "pass"),
         "research_eligible_session_count": sum(1 for session in sessions if session.get("research_eligible") is True),
+        "last_failure": last_failure,
         "stopped_early": stopped_early,
         "stop_reason": stop_reason,
     }
@@ -481,7 +516,9 @@ def build_auto_collection_report(*, manifest: dict[str, Any], strict_100ms: bool
     return {
         "phase": PHASE,
         "schema_version": "phase_5_2_auto_collection_report_v1",
-        "status": "pass",
+        "status": "pass" if manifest.get("failed_session_count") == 0 and manifest.get("stopped_early") is not True else "fail",
+        "collection_status": _collection_status(manifest),
+        "aggregate_status": _collection_status(manifest),
         "strict_100ms_hard_requirement": strict_100ms,
         "binance_websocket_research_only": True,
         "manifest": manifest,
@@ -501,13 +538,20 @@ def create_all_sessions_bundle(root_path: Path, collection_root: Path) -> dict[s
     bundle_path = root_path / ALL_SESSIONS_BUNDLE
     if bundle_path.exists():
         bundle_path.unlink()
+    manifest_files: list[dict[str, Any]] = []
     with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for base in (collection_root, root_path / "data/debug", root_path / "data/reports"):
             if not base.exists():
                 continue
             for path in base.rglob("*"):
                 if path.is_file() and ("phase_5_2" in path.name or "phase_5_2" in path.as_posix()):
-                    archive.write(path, _relative(root_path, path))
+                    arcname = _relative(root_path, path)
+                    archive.write(path, arcname)
+                    manifest_files.append({"path": arcname, "size_bytes": path.stat().st_size, "included_in_bundle": True})
+        archive.writestr(
+            "data/debug/phase_5_2_all_sessions_bundle_file_manifest.json",
+            json.dumps({"files": manifest_files}, indent=2, sort_keys=True) + "\n",
+        )
     sha = _sha256_file(bundle_path)
     _write_text(
         root_path / ALL_SESSIONS_SHA256,
@@ -625,10 +669,163 @@ def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_
         "--skip-pytest",
         "--clean",
     ]
+    started_at_utc = _utc_now()
     process = subprocess.run(command, cwd=root_path, text=True, capture_output=True, check=False)
+    ended_at_utc = _utc_now()
     report_path = session_dir / "data/reports/phase_4_2h_hotpath_environment_latency_report.json"
-    report = _read_json(report_path) if report_path.exists() else synthetic_phase42h_runtime_report(requested_duration_sec=requested_duration_sec, simulate_failure="primary_failure")
+    if report_path.exists():
+        report = _read_json(report_path)
+        report.setdefault("exit_code", process.returncode)
+    else:
+        kernel_log_text = _collect_kernel_log_text(started_at_utc=started_at_utc, ended_at_utc=ended_at_utc)
+        classification = classify_child_process_failure(
+            exit_code=process.returncode,
+            kernel_log_text=kernel_log_text,
+            session_started_at_utc=started_at_utc,
+            session_ended_at_utc=ended_at_utc,
+            report_missing=True,
+        )
+        report = phase42h_process_failure_report(
+            requested_duration_sec=requested_duration_sec,
+            exit_code=process.returncode,
+            classification=classification,
+            started_at_utc=started_at_utc,
+            ended_at_utc=ended_at_utc,
+        )
     return process.returncode, report, process.stdout + process.stderr
+
+
+def phase42h_process_failure_report(
+    *,
+    requested_duration_sec: float,
+    exit_code: int,
+    classification: dict[str, Any],
+    started_at_utc: str,
+    ended_at_utc: str,
+) -> dict[str, Any]:
+    primary = str(classification.get("primary_failure") or REPORT_MISSING_CLASSIFICATION)
+    report = synthetic_phase42h_runtime_report(requested_duration_sec=requested_duration_sec)
+    report["status"] = "fail"
+    report["primary_failure"] = primary
+    report["failure_classifications"] = list(classification.get("failure_classifications", [primary]))
+    report["hard_fail_reasons"] = [str(classification.get("reason") or primary)]
+    report["exit_code"] = exit_code
+    report["child_exit_code"] = exit_code
+    report["child_signal"] = "SIGKILL" if exit_code == -9 else None
+    report["dry_run"] = False
+    report["fallback_reason"] = "child_exited_before_hotpath_report"
+    report["started_at_utc"] = started_at_utc
+    report["ended_at_utc"] = ended_at_utc
+    report["oom_evidence"] = classification.get("oom_evidence", {})
+    report["process_failure_evidence"] = {
+        "exit_code": exit_code,
+        "child_exit_code": exit_code,
+        "child_signal": "SIGKILL" if exit_code == -9 else None,
+        "report_missing": True,
+        "primary_failure": primary,
+        "fallback_reason": "child_exited_before_hotpath_report",
+        "session_started_at_utc": started_at_utc,
+        "session_ended_at_utc": ended_at_utc,
+    }
+    report["memory_telemetry"] = classification.get("memory_telemetry", {})
+    return report
+
+
+def classify_child_process_failure(
+    *,
+    exit_code: int,
+    kernel_log_text: str,
+    session_started_at_utc: str,
+    session_ended_at_utc: str,
+    report_missing: bool,
+) -> dict[str, Any]:
+    oom_evidence = detect_oom_evidence(
+        kernel_log_text,
+        session_started_at_utc=session_started_at_utc,
+        session_ended_at_utc=session_ended_at_utc,
+    )
+    if exit_code == -9 and oom_evidence.get("oom_detected") is True:
+        return {
+            "primary_failure": OOM_CLASSIFICATION,
+            "failure_classifications": [OOM_CLASSIFICATION],
+            "reason": "Phase 4.2H child exited -9 and kernel logs show OOM kill in the session window",
+            "oom_evidence": oom_evidence,
+        }
+    if exit_code == -9:
+        return {
+            "primary_failure": PROCESS_SIGKILL_CLASSIFICATION,
+            "failure_classifications": [PROCESS_SIGKILL_CLASSIFICATION],
+            "reason": "Phase 4.2H child exited -9 without kernel OOM evidence",
+            "oom_evidence": oom_evidence,
+        }
+    if report_missing:
+        return {
+            "primary_failure": REPORT_MISSING_CLASSIFICATION,
+            "failure_classifications": [REPORT_MISSING_CLASSIFICATION],
+            "reason": "Phase 4.2H report missing after child process returned",
+            "oom_evidence": oom_evidence,
+        }
+    return {
+        "primary_failure": "PROCESS_FAILED",
+        "failure_classifications": ["PROCESS_FAILED"],
+        "reason": f"Phase 4.2H child exited {exit_code}",
+        "oom_evidence": oom_evidence,
+    }
+
+
+def detect_oom_evidence(
+    kernel_log_text: str,
+    *,
+    session_started_at_utc: str,
+    session_ended_at_utc: str,
+    window_sec: int = 600,
+) -> dict[str, Any]:
+    started = _parse_utc(session_started_at_utc)
+    ended = _parse_utc(session_ended_at_utc)
+    window_start = started - timedelta(seconds=window_sec)
+    window_end = ended + timedelta(seconds=window_sec)
+    matches: list[str] = []
+    killed_pid: int | None = None
+    for raw_line in kernel_log_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if not any(pattern in line for pattern in KERNEL_OOM_PATTERNS):
+            continue
+        line_time = _parse_kernel_log_time(line, default_year=started.year)
+        if line_time is not None and not (window_start <= line_time <= window_end):
+            continue
+        matches.append(line)
+        pid_match = re.search(r"Killed process\s+(\d+)", line)
+        if pid_match:
+            killed_pid = int(pid_match.group(1))
+    excerpt = "\n".join(matches[:5])
+    return {
+        "oom_detected": bool(matches),
+        "oom_evidence_source": "kernel_log",
+        "oom_log_excerpt": excerpt,
+        "matched_line_count": len(matches),
+        "killed_pid": killed_pid,
+        "session_window_start_utc": window_start.isoformat().replace("+00:00", "Z"),
+        "session_window_end_utc": window_end.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _collect_kernel_log_text(*, started_at_utc: str, ended_at_utc: str) -> str:
+    commands = [
+        ["journalctl", "-k", "--since", started_at_utc, "--until", ended_at_utc, "--no-pager"],
+        ["dmesg", "--ctime", "--color=never"],
+        ["dmesg", "--color=never"],
+    ]
+    outputs: list[str] = []
+    for command in commands:
+        try:
+            process = subprocess.run(command, text=True, capture_output=True, check=False, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if process.stdout:
+            outputs.append(process.stdout)
+    return "\n".join(outputs)
 
 
 def _find_phase42h_bundle(session_dir: Path, runtime_report: dict[str, Any]) -> Path | None:
@@ -641,11 +838,18 @@ def _find_phase42h_bundle(session_dir: Path, runtime_report: dict[str, Any]) -> 
     return pass_bundle if pass_bundle.exists() else None
 
 
-def _write_synthetic_phase42h_bundle(path: Path, runtime_report: dict[str, Any]) -> None:
+def _write_synthetic_phase42h_bundle(path: Path, runtime_report: dict[str, Any], *, dry_run: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        md = "# Synthetic Phase 4.2H report for Phase 5.2 dry-run\n"
+        runtime_report.setdefault("dry_run", True)
+    else:
+        md = "# Fallback Phase 4.2H report generated because child process exited before producing hotpath report.\n"
+        runtime_report["dry_run"] = False
+        runtime_report.setdefault("fallback_reason", "child_exited_before_hotpath_report")
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("data/reports/phase_4_2h_hotpath_environment_latency_report.json", json.dumps(runtime_report, indent=2, sort_keys=True))
-        archive.writestr("data/reports/phase_4_2h_hotpath_environment_latency_report.md", "# Synthetic Phase 4.2H report for Phase 5.2 dry-run\n")
+        archive.writestr("data/reports/phase_4_2h_hotpath_environment_latency_report.md", md)
 
 
 def _completed_research_eligible(session: dict[str, Any]) -> bool:
@@ -686,12 +890,74 @@ def _ensure_dirs(root_path: Path, collection_root: Path) -> None:
 
 
 def _git_identity(root_path: Path) -> tuple[str, bool]:
+    state = _git_source_state(root_path)
+    return str(state.get("repo_commit", "unknown")), bool(state.get("source_repo_dirty", False))
+
+
+def _git_source_state(root_path: Path) -> dict[str, Any]:
     try:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root_path, text=True, capture_output=True, check=False)
-        status = subprocess.run(["git", "status", "--short"], cwd=root_path, text=True, capture_output=True, check=False)
+        status = subprocess.run(["git", "status", "--short", "--untracked-files=all"], cwd=root_path, text=True, capture_output=True, check=False)
     except OSError:
-        return "unknown", False
-    return commit.stdout.strip() if commit.returncode == 0 else "unknown", bool(status.stdout.strip())
+        return {
+            "repo_commit": "unknown",
+            "source_repo_dirty": False,
+            "git_available": False,
+            "raw_status_lines": [],
+            "source_status_lines": [],
+            "runtime_status_lines": [],
+            "runtime_artifacts_present": _runtime_artifacts_present(root_path),
+            "ignored_runtime_artifacts_present": _ignored_runtime_artifacts_present(root_path),
+        }
+    raw_lines = status.stdout.splitlines() if status.returncode == 0 else []
+    runtime_lines = [line for line in raw_lines if _is_runtime_artifact_status_line(line)]
+    source_lines = [line for line in raw_lines if line not in runtime_lines]
+    return {
+        "repo_commit": commit.stdout.strip() if commit.returncode == 0 else "unknown",
+        "source_repo_dirty": bool(source_lines),
+        "git_available": True,
+        "raw_status_lines": raw_lines[:50],
+        "source_status_lines": source_lines[:50],
+        "runtime_status_lines": runtime_lines[:50],
+        "runtime_artifacts_present": _runtime_artifacts_present(root_path),
+        "ignored_runtime_artifacts_present": _ignored_runtime_artifacts_present(root_path),
+    }
+
+
+def _is_runtime_artifact_status_line(line: str) -> bool:
+    path = line[3:].strip() if len(line) > 3 else line.strip()
+    return _is_runtime_artifact_path(path)
+
+
+def _is_runtime_artifact_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return (
+        normalized.startswith("data/phase_5_2/")
+        or normalized.startswith("data/dataset/")
+        or normalized.startswith("data/debug/")
+        or normalized.startswith("data/cache/")
+        or normalized.startswith("data/logs/")
+        or normalized.startswith("data/reports/")
+        or normalized.endswith(".jsonl")
+        or normalized.endswith(".zip")
+        or normalized.endswith(".log")
+        or normalized in {ALL_SESSIONS_BUNDLE.as_posix(), ALL_SESSIONS_SHA256.as_posix()}
+    )
+
+
+def _runtime_artifacts_present(root_path: Path) -> bool:
+    candidates = (
+        root_path / "data/phase_5_2",
+        root_path / "data/debug/phase_5_2_auto_collection_status.json",
+        root_path / "data/reports/phase_5_2_auto_collection_report.json",
+        root_path / ALL_SESSIONS_BUNDLE,
+        root_path / ALL_SESSIONS_SHA256,
+    )
+    return any(path.exists() for path in candidates)
+
+
+def _ignored_runtime_artifacts_present(root_path: Path) -> bool:
+    return _runtime_artifacts_present(root_path)
 
 
 def _resolve(root_path: Path, path: str | Path) -> Path:
@@ -730,6 +996,54 @@ def _sha256_file(path: Path) -> str:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _collection_status(manifest: dict[str, Any]) -> str:
+    if int(manifest.get("failed_session_count", 0) or 0) > 0 and manifest.get("stopped_early") is True:
+        return "partial_fail_stopped_early"
+    if int(manifest.get("failed_session_count", 0) or 0) > 0:
+        return "partial_fail"
+    if manifest.get("stopped_early") is True:
+        return "stopped_early"
+    return "complete_pass"
+
+
+def _parse_utc(value: str) -> datetime:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_kernel_log_time(line: str, *, default_year: int) -> datetime | None:
+    bracket = re.match(r"^\[(?P<stamp>[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+(?:\s+\d{4})?)\]", line)
+    if bracket:
+        stamp = bracket.group("stamp")
+        for fmt in ("%a %b %d %H:%M:%S %Y", "%a %b %d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(stamp, fmt)
+                if parsed.year == 1900:
+                    parsed = parsed.replace(year=default_year)
+                return parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    syslog = re.match(r"^(?P<stamp>[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+)", line)
+    if syslog:
+        try:
+            parsed = datetime.strptime(f"{default_year} {syslog.group('stamp')}", "%Y %b %d %H:%M:%S")
+            return parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    iso = re.match(r"^(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)", line)
+    if iso:
+        try:
+            return _parse_utc(iso.group("stamp"))
+        except ValueError:
+            return None
+    return None
 
 
 def _utc_now() -> str:

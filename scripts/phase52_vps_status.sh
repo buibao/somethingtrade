@@ -24,6 +24,7 @@ print(f"completed_session_count: {status.get('completed_session_count')}")
 print(f"passed_session_count: {status.get('passed_session_count')}")
 print(f"failed_session_count: {status.get('failed_session_count')}")
 print(f"research_eligible_session_count: {status.get('research_eligible_session_count')}")
+print(f"last_failure: {status.get('last_failure')}")
 print(f"stopped_early: {status.get('stopped_early')}")
 PY
 else
@@ -34,4 +35,3 @@ if [[ -f "${LOG_FILE}" ]]; then
   echo "--- latest nohup log ---"
   tail -n 80 "${LOG_FILE}"
 fi
-

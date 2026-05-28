@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import zipfile
 from types import SimpleNamespace
 import time
+from typing import Any
 
 import pytest
 
@@ -46,6 +48,10 @@ def test_phase52_real_capture_command_includes_clean(tmp_path: Path, monkeypatch
     assert "--duration-sec" in command
     assert command[command.index("--duration-sec") + 1] == "1800"
     assert "--skip-pytest" in command
+
+
+def test_phase52_real_capture_command_still_includes_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_phase52_real_capture_command_includes_clean(tmp_path, monkeypatch)
 
 
 def test_phase52_all_real_sessions_use_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -369,6 +375,318 @@ def test_phase52_failed_session_does_not_continue_silently_when_fail_session_on_
     assert "quality gate failed" in manifest["stop_reason"]
 
 
+def test_exit_code_minus_9_with_oom_dmesg_maps_to_oom_killed() -> None:
+    evidence = "[Thu May 28 01:10:00 2026] Out of memory: Killed process 22259 (python) total-vm:1 anon-rss:3714540kB\n"
+    classification = phase52.classify_child_process_failure(
+        exit_code=-9,
+        kernel_log_text=evidence,
+        session_started_at_utc="2026-05-28T01:00:00Z",
+        session_ended_at_utc="2026-05-28T01:59:00Z",
+        report_missing=True,
+    )
+    assert classification["primary_failure"] == "OOM_KILLED"
+    assert "OOM_KILLED" in classification["failure_classifications"]
+    assert classification["oom_evidence"]["killed_pid"] == 22259
+
+
+def test_exit_code_minus_9_without_oom_maps_to_process_sigkill() -> None:
+    classification = phase52.classify_child_process_failure(
+        exit_code=-9,
+        kernel_log_text="[Thu May 28 01:10:00 2026] python exited\n",
+        session_started_at_utc="2026-05-28T01:00:00Z",
+        session_ended_at_utc="2026-05-28T01:59:00Z",
+        report_missing=True,
+    )
+    assert classification["primary_failure"] == "PROCESS_SIGKILL"
+
+
+def test_missing_hotpath_report_after_oom_is_not_synthetic_failure() -> None:
+    classification = phase52.classify_child_process_failure(
+        exit_code=-9,
+        kernel_log_text="[Thu May 28 01:10:00 2026] Out of memory: Killed process 22259 (python)\n",
+        session_started_at_utc="2026-05-28T01:00:00Z",
+        session_ended_at_utc="2026-05-28T01:59:00Z",
+        report_missing=True,
+    )
+    report = phase52.phase42h_process_failure_report(
+        requested_duration_sec=3600,
+        exit_code=-9,
+        classification=classification,
+        started_at_utc="2026-05-28T01:00:00Z",
+        ended_at_utc="2026-05-28T01:59:00Z",
+    )
+    assert report["primary_failure"] == "OOM_KILLED"
+    assert report["primary_failure"] != "SYNTHETIC_FAILURE"
+
+
+def test_missing_hotpath_report_without_process_kill_remains_report_missing() -> None:
+    classification = phase52.classify_child_process_failure(
+        exit_code=1,
+        kernel_log_text="",
+        session_started_at_utc="2026-05-28T01:00:00Z",
+        session_ended_at_utc="2026-05-28T01:59:00Z",
+        report_missing=True,
+    )
+    assert classification["primary_failure"] == "REPORT_MISSING"
+
+
+def test_oom_evidence_window_uses_session_start_end_times() -> None:
+    logs = "\n".join(
+        [
+            "[Thu May 28 00:00:00 2026] Out of memory: Killed process 1 (python)",
+            "[Thu May 28 01:10:00 2026] Out of memory: Killed process 22259 (python)",
+        ]
+    )
+    evidence = phase52.detect_oom_evidence(
+        logs,
+        session_started_at_utc="2026-05-28T01:00:00Z",
+        session_ended_at_utc="2026-05-28T01:59:00Z",
+        window_sec=60,
+    )
+    assert evidence["oom_detected"] is True
+    assert evidence["matched_line_count"] == 1
+    assert evidence["killed_pid"] == 22259
+
+
+def test_oom_evidence_included_in_metadata(tmp_path: Path) -> None:
+    classification = phase52.classify_child_process_failure(
+        exit_code=-9,
+        kernel_log_text="[Thu May 28 01:10:00 2026] Out of memory: Killed process 22259 (python)\n",
+        session_started_at_utc="2026-05-28T01:00:00Z",
+        session_ended_at_utc="2026-05-28T01:59:00Z",
+        report_missing=True,
+    )
+    runtime_report = phase52.phase42h_process_failure_report(
+        requested_duration_sec=3600,
+        exit_code=-9,
+        classification=classification,
+        started_at_utc="2026-05-28T01:00:00Z",
+        ended_at_utc="2026-05-28T01:59:00Z",
+    )
+    quality = evaluate_session_quality(runtime_report, bundle_sha_valid=False)
+    metadata = phase52.build_session_metadata(
+        root_path=tmp_path,
+        session_id="session_002_short_1h",
+        plan_name="test_plan",
+        requested_duration_sec=3600,
+        actual_duration_sec=60,
+        started_at_utc="2026-05-28T01:00:00Z",
+        ended_at_utc="2026-05-28T01:59:00Z",
+        runtime_report=runtime_report,
+        quality_report=quality,
+        notes="",
+    )
+    assert metadata["exit_code"] == -9
+    assert metadata["oom_detected"] is True
+    assert metadata["oom_killed_pid"] == 22259
+    assert "Out of memory" in metadata["oom_log_excerpt"]
+
+
+def test_oom_evidence_included_in_collection_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["oom"])
+    report = run_auto_collection(
+        root=tmp_path,
+        plan_name="test_plan",
+        total_budget_hours=24,
+        create_bundles=True,
+        test_max_sessions=1,
+        strict_100ms=True,
+        fail_session_on_quality_gate=True,
+    )
+    session = report["manifest"]["sessions"][0]
+    assert session["primary_failure"] == "OOM_KILLED"
+    assert report["collection_status"] == "partial_fail_stopped_early"
+
+
+def test_fail_session_on_quality_gate_stops_after_oom(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["pass", "oom"])
+    report = run_auto_collection(
+        root=tmp_path,
+        plan_name="test_plan",
+        total_budget_hours=24,
+        create_bundles=True,
+        test_max_sessions=3,
+        strict_100ms=True,
+        fail_session_on_quality_gate=True,
+        cooldown_sec=0,
+    )
+    manifest = report["manifest"]
+    assert manifest["session_count"] == 2
+    assert manifest["sessions"][0]["research_eligible"] is True
+    assert manifest["sessions"][1]["primary_failure"] == "OOM_KILLED"
+    assert manifest["stopped_early"] is True
+
+
+def test_phase52_prior_passed_session_remains_research_eligible_after_later_oom(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["pass", "oom"])
+    report = run_auto_collection(
+        root=tmp_path,
+        plan_name="test_plan",
+        total_budget_hours=24,
+        create_bundles=True,
+        test_max_sessions=2,
+        strict_100ms=True,
+        fail_session_on_quality_gate=True,
+        cooldown_sec=0,
+    )
+    assert report["manifest"]["sessions"][0]["session_id"] == "session_001_sanity_30m"
+    assert report["manifest"]["sessions"][0]["research_eligible"] is True
+    assert report["manifest"]["sessions"][1]["primary_failure"] == "OOM_KILLED"
+
+
+def test_phase52_collection_report_status_distinguishes_partial_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["pass", "oom"])
+    report = run_auto_collection(
+        root=tmp_path,
+        plan_name="test_plan",
+        total_budget_hours=24,
+        create_bundles=True,
+        test_max_sessions=2,
+        strict_100ms=True,
+        fail_session_on_quality_gate=True,
+        cooldown_sec=0,
+    )
+    assert report["status"] == "fail"
+    assert report["collection_status"] == "partial_fail_stopped_early"
+
+
+def test_phase52_failed_session_bundle_contains_console_metadata_preflight_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["oom"])
+    result = run_controlled_capture(
+        root=tmp_path,
+        session_id="session_002_short_1h",
+        plan_name="test_plan",
+        requested_duration_sec=3600,
+        dry_run=False,
+        create_bundle=True,
+    )
+    for key in ("bundle", "console_log", "metadata", "quality_report"):
+        assert (tmp_path / result["artifact_paths"][key]).exists()
+    assert result["metadata"]["primary_failure"] == "OOM_KILLED"
+
+
+def test_phase52_synthetic_failure_not_used_for_known_oom(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["oom"])
+    result = run_controlled_capture(
+        root=tmp_path,
+        session_id="session_002_short_1h",
+        plan_name="test_plan",
+        requested_duration_sec=3600,
+        dry_run=False,
+        create_bundle=True,
+    )
+    assert result["metadata"]["primary_failure"] == "OOM_KILLED"
+    assert result["metadata"]["primary_failure"] != "SYNTHETIC_FAILURE"
+
+
+def test_real_run_sigkill_fallback_report_does_not_say_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["oom"])
+    result = run_controlled_capture(
+        root=tmp_path,
+        session_id="session_002_short_1h",
+        plan_name="test_plan",
+        requested_duration_sec=3600,
+        dry_run=False,
+        create_bundle=True,
+    )
+    with zipfile.ZipFile(tmp_path / result["artifact_paths"]["bundle"]) as archive:
+        markdown = archive.read("data/reports/phase_4_2h_hotpath_environment_latency_report.md").decode("utf-8")
+        payload = json.loads(archive.read("data/reports/phase_4_2h_hotpath_environment_latency_report.json"))
+    assert "Fallback Phase 4.2H report" in markdown
+    assert "dry-run" not in markdown.lower()
+    assert payload["dry_run"] is False
+
+
+def test_real_run_missing_hotpath_fallback_contains_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["oom"])
+    result = run_controlled_capture(
+        root=tmp_path,
+        session_id="session_002_short_1h",
+        plan_name="test_plan",
+        requested_duration_sec=3600,
+        dry_run=False,
+        create_bundle=True,
+    )
+    with zipfile.ZipFile(tmp_path / result["artifact_paths"]["bundle"]) as archive:
+        payload = json.loads(archive.read("data/reports/phase_4_2h_hotpath_environment_latency_report.json"))
+    assert payload["child_exit_code"] == -9
+    assert payload["fallback_reason"] == "child_exited_before_hotpath_report"
+
+
+def test_dry_run_fallback_report_only_for_dry_run(tmp_path: Path) -> None:
+    result = run_controlled_capture(
+        root=tmp_path,
+        session_id="dry_run_session",
+        plan_name="test_plan",
+        requested_duration_sec=1,
+        dry_run=True,
+        create_bundle=True,
+    )
+    with zipfile.ZipFile(tmp_path / result["artifact_paths"]["bundle"]) as archive:
+        markdown = archive.read("data/reports/phase_4_2h_hotpath_environment_latency_report.md").decode("utf-8")
+    assert "dry-run" in markdown.lower()
+
+
+def test_source_repo_dirty_ignores_runtime_artifacts_in_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    before_state = {
+        "repo_commit": "abc123",
+        "source_repo_dirty": False,
+        "runtime_artifacts_present": False,
+        "ignored_runtime_artifacts_present": False,
+    }
+
+    monkeypatch.setattr(
+        phase52,
+        "_git_source_state",
+        lambda root_path: {
+            "repo_commit": "abc123",
+            "source_repo_dirty": False,
+            "raw_status_lines": ["?? data/phase_5_2/sessions/session_002/artifact.zip"],
+            "source_status_lines": [],
+            "runtime_status_lines": ["?? data/phase_5_2/sessions/session_002/artifact.zip"],
+            "runtime_artifacts_present": True,
+            "ignored_runtime_artifacts_present": True,
+        },
+    )
+    runtime_report = synthetic_phase42h_runtime_report(requested_duration_sec=1)
+    quality = evaluate_session_quality(runtime_report, bundle_sha_valid=True)
+    metadata = phase52.build_session_metadata(
+        root_path=tmp_path,
+        session_id="session_001_sanity_30m",
+        plan_name="test_plan",
+        requested_duration_sec=1,
+        actual_duration_sec=1,
+        started_at_utc="2026-05-28T00:00:00Z",
+        ended_at_utc="2026-05-28T00:00:01Z",
+        runtime_report=runtime_report,
+        quality_report=quality,
+        notes="",
+        source_repo_state_before=before_state,
+    )
+    assert metadata["source_repo_dirty"] is False
+    assert metadata["source_repo_dirty_before_session"] is False
+    assert metadata["source_repo_dirty_after_session"] is False
+    assert metadata["runtime_artifacts_present"] is True
+    assert metadata["ignored_runtime_artifacts_present"] is True
+
+
+def test_runtime_artifact_status_lines_do_not_mark_source_dirty() -> None:
+    assert phase52._is_runtime_artifact_status_line("?? data/phase_5_2/sessions/session_002/bundle.zip") is True
+    assert phase52._is_runtime_artifact_status_line(" M bot/app/research/phase52_auto_collection.py") is False
+
+
+def test_phase52_simulated_child_sigkill_oom_failure_classification() -> None:
+    test_exit_code_minus_9_with_oom_dmesg_maps_to_oom_killed()
+
+
+def test_phase52_simulated_child_sigkill_no_oom_failure_classification() -> None:
+    test_exit_code_minus_9_without_oom_maps_to_process_sigkill()
+
+
+def test_phase52_simulated_session_002_oom_preserves_session_001_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_phase52_prior_passed_session_remains_research_eligible_after_later_oom(tmp_path, monkeypatch)
+
+
 def test_phase52_stop_after_current_session_file_honored(tmp_path: Path) -> None:
     stop_file = tmp_path / "stop_after_current"
     stop_file.write_text("stop", encoding="utf-8")
@@ -435,6 +753,35 @@ def _mock_phase42h_subprocess(monkeypatch: pytest.MonkeyPatch, *, commands: list
         return SimpleNamespace(returncode=0 if report["status"] == "pass" else 1, stdout="mock phase42h\n", stderr="")
 
     monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
+
+
+def _mock_phase52_real_capture_sequence(monkeypatch: pytest.MonkeyPatch, outcomes: list[str]) -> None:
+    calls = {"index": 0}
+
+    def fake_capture(*, root_path: Path, session_dir: Path, requested_duration_sec: float) -> tuple[int, dict[str, Any], str]:
+        outcome = outcomes[min(calls["index"], len(outcomes) - 1)]
+        calls["index"] += 1
+        if outcome == "pass":
+            report = synthetic_phase42h_runtime_report(requested_duration_sec=requested_duration_sec)
+            report["cleanup_report"] = {"cleanup_performed": True, "errors": []}
+            return 0, report, "mock phase42h pass\n"
+        classification = phase52.classify_child_process_failure(
+            exit_code=-9,
+            kernel_log_text="[Thu May 28 01:10:00 2026] Out of memory: Killed process 22259 (python) anon-rss:3714540kB\n",
+            session_started_at_utc="2026-05-28T01:00:00Z",
+            session_ended_at_utc="2026-05-28T01:59:00Z",
+            report_missing=True,
+        )
+        report = phase52.phase42h_process_failure_report(
+            requested_duration_sec=requested_duration_sec,
+            exit_code=-9,
+            classification=classification,
+            started_at_utc="2026-05-28T01:00:00Z",
+            ended_at_utc="2026-05-28T01:59:00Z",
+        )
+        return -9, report, "mock phase42h killed\n"
+
+    monkeypatch.setattr(phase52, "_run_real_phase42h_capture", fake_capture)
 
 
 def _read_json(path: Path) -> dict:

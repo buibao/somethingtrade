@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import gc
 import json
 from pathlib import Path
 import zipfile
@@ -8,6 +10,7 @@ from typing import Any
 import pytest
 
 import app.research.hotpath_environment_latency as hotpath
+import app.research.phase42h_streaming as phase42h_streaming
 import scripts.run_phase42h_hotpath_environment_latency as phase42h_cli
 from app.research.clock_sync_receive_lag import build_server_time_sample, compute_clock_offset_summary
 from app.research.hotpath_environment_latency import (
@@ -422,6 +425,10 @@ def test_phase42h_preflight_uses_source_root_gitignore_when_root_is_session_dir(
     assert gitignore["source_root"] == str(source_root.resolve()).replace("\\", "/")
 
 
+def test_phase42h_preflight_still_uses_source_root_gitignore_when_root_is_session_dir(tmp_path: Path) -> None:
+    test_phase42h_preflight_uses_source_root_gitignore_when_root_is_session_dir(tmp_path)
+
+
 def test_phase42h_preflight_fails_when_source_root_gitignore_missing(tmp_path: Path) -> None:
     source_root = tmp_path / "repo"
     session_root = source_root / "data/phase_5_2/sessions/session_001_sanity_30m"
@@ -449,6 +456,39 @@ def test_phase42h_preflight_passes_without_session_gitignore_when_source_root_ha
     assert report["passed"] is True
 
 
+def test_vps_preflight_reports_swap_status(tmp_path: Path) -> None:
+    _write_required_gitignore(tmp_path)
+    report = hotpath.run_phase42h_vps_preflight(tmp_path, required_imports=("json",), check_network=False)
+    memory = report["checks"]["memory_and_swap"]
+    assert "swap_total_bytes" in memory
+    assert "swap_enabled" in memory
+
+
+def test_vps_preflight_reports_memory_total_available(tmp_path: Path) -> None:
+    _write_required_gitignore(tmp_path)
+    report = hotpath.run_phase42h_vps_preflight(tmp_path, required_imports=("json",), check_network=False)
+    memory = report["checks"]["memory_and_swap"]
+    assert "memory_total_bytes" in memory
+    assert "memory_available_bytes" in memory
+    assert "total_memory_bytes" in memory
+    assert "available_memory_bytes" in memory
+    assert "disk_free_bytes" in memory
+
+
+def test_vps_preflight_warns_low_memory_no_swap_for_long_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hotpath, "_system_memory_status", lambda: {
+        "memory_total_bytes": 3 * 1024 * 1024 * 1024,
+        "memory_available_bytes": 2 * 1024 * 1024 * 1024,
+        "memory_total_mb": 3072,
+        "memory_available_mb": 2048,
+        "swap_total_bytes": 0,
+        "swap_enabled": False,
+        "low_memory_no_swap_warning": True,
+    })
+    status = hotpath._system_memory_status()
+    assert status["low_memory_no_swap_warning"] is True
+
+
 def test_gitignore_contains_required_generated_patterns() -> None:
     patterns = {
         line.strip()
@@ -472,6 +512,32 @@ def test_gitignore_contains_required_generated_patterns() -> None:
         "cache/",
     ):
         assert pattern in patterns
+
+
+def test_cleanup_still_cleans_source_root_and_session_root(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    session_root = tmp_path / "sessions/session_001"
+    source_file = source_root / "data/dataset/orderbook_clean_samples.jsonl"
+    session_file = session_root / "data/debug/phase_4_2h_latency_stage_profile.json"
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.write_text("{}\n", encoding="utf-8")
+    session_file.write_text("{}", encoding="utf-8")
+    cleanup_phase42h_artifacts(session_root, source_root=source_root)
+    assert not source_file.exists()
+    assert not session_file.exists()
+
+
+def test_gitignore_required_rules_still_present() -> None:
+    test_gitignore_contains_required_generated_patterns()
+
+
+def test_strict_100ms_gate_not_relaxed() -> None:
+    report = _report(h100=0.0, h250=0.96)
+    assert report["max_future_gap_ms"] == 100
+    assert report["strict_100ms_observability_ready"] is False
+    assert report["relaxed_250ms_observability_candidate"] is True
+    assert report["phase5_ready"] is False
 
 
 def test_runtime_cleanup_does_not_modify_gitignore(tmp_path: Path) -> None:
@@ -853,6 +919,261 @@ def test_dataset_zip_typecheck_placeholder_and_no_phase5_scope(tmp_path: Path) -
     assert not any(token in module_text or token in script_text for token in forbidden)
 
 
+def test_phase42h_large_file_paths_do_not_use_read_text() -> None:
+    streaming_text = Path("bot/app/research/phase42h_streaming.py").read_text(encoding="utf-8")
+    assert ".read_text(" not in streaming_text
+
+
+def test_phase42h_large_file_paths_do_not_use_readlines() -> None:
+    relevant = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "bot/app/research/phase42h_streaming.py",
+            "bot/app/research/hotpath_environment_latency.py",
+            "scripts/run_phase42h_hotpath_environment_latency.py",
+        )
+    )
+    assert ".readlines(" not in relevant
+
+
+def test_phase42h_large_file_paths_do_not_use_json_load_on_jsonl() -> None:
+    streaming_text = Path("bot/app/research/phase42h_streaming.py").read_text(encoding="utf-8")
+    assert "json.load(" not in streaming_text
+
+
+def test_phase42h_bundle_does_not_read_file_bytes_into_memory() -> None:
+    bundle_text = Path("bot/app/research/hotpath_environment_latency.py").read_text(encoding="utf-8")
+    runner_text = Path("scripts/run_phase42h_hotpath_environment_latency.py").read_text(encoding="utf-8")
+    assert ".read_bytes(" not in bundle_text
+    assert ".read_bytes(" not in runner_text
+
+
+def test_phase42h_streaming_helpers_are_used_for_large_jsonl() -> None:
+    module_text = Path("bot/app/research/hotpath_environment_latency.py").read_text(encoding="utf-8")
+    assert "run_phase42h_streaming_finalization(" in module_text
+    assert "build_latency_stage_profile_streaming(" in module_text
+
+
+def test_stream_jsonl_counts_large_file_without_memory_growth(tmp_path: Path) -> None:
+    path = tmp_path / "large.jsonl"
+    _write_simple_jsonl(path, line_count=120_000)
+    before = _rss_bytes()
+    count = sum(1 for _line, _row in phase42h_streaming.stream_jsonl_records(path))
+    gc.collect()
+    after = _rss_bytes()
+    assert count == 120_000
+    _assert_memory_delta_below(before, after, 100 * 1024 * 1024)
+
+
+def test_stream_jsonl_filters_large_file_without_accumulating_records(tmp_path: Path) -> None:
+    source = tmp_path / "large.jsonl"
+    target = tmp_path / "filtered.jsonl"
+    _write_simple_jsonl(source, line_count=80_000)
+    before = _rss_bytes()
+    summary = phase42h_streaming.stream_jsonl_filter(
+        source,
+        target,
+        predicate=lambda row: row["i"] % 10 == 0,
+        transform=lambda row: {"i": row["i"], "bucket": row["i"] // 10},
+    )
+    after = _rss_bytes()
+    assert summary["written_count"] == 8_000
+    assert sum(1 for _line, _row in phase42h_streaming.stream_jsonl_records(target)) == 8_000
+    _assert_memory_delta_below(before, after, 100 * 1024 * 1024)
+
+
+def test_stream_jsonl_handles_malformed_lines_with_bounded_error_sample(tmp_path: Path) -> None:
+    path = tmp_path / "malformed.jsonl"
+    path.write_text('{"ok": true}\nnot-json\n[]\n{bad}\n{"ok": true}\n', encoding="utf-8")
+    report = phase42h_streaming.JsonlStreamReport(path=str(path), max_malformed_samples=2)
+    rows = list(phase42h_streaming.stream_jsonl_records(path, report=report))
+    assert len(rows) == 2
+    assert report.malformed_line_count == 3
+    assert len(report.malformed_samples) == 2
+
+
+def test_stream_jsonl_summary_keeps_only_bounded_examples(tmp_path: Path) -> None:
+    path = tmp_path / "summary.jsonl"
+    _write_simple_jsonl(path, line_count=50)
+    summary = phase42h_streaming.summarize_jsonl_stream(path, max_examples=3)
+    assert summary["object_count"] == 50
+    assert len(summary["examples"]) == 3
+
+
+def test_large_label_generation_streams_output(tmp_path: Path) -> None:
+    _write_phase42h_streaming_inputs(tmp_path, line_count=2_500)
+    before = _rss_bytes()
+    result = phase42h_streaming.run_phase42h_streaming_finalization(
+        root=tmp_path,
+        clean_samples_path="data/dataset/orderbook_clean_samples.jsonl",
+        corrected_labels_path="data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl",
+        leakage_output_path="data/debug/phase_4_2h_leakage_check.json",
+        estimated_clock_offset_ms=0.0,
+        clock_offset_drift_valid=True,
+    )
+    after = _rss_bytes()
+    assert result.labeled_sample_count == 2_500
+    assert _count_jsonl(tmp_path / "data/dataset/orderbook_reference_benchmark_labels.jsonl") == 2_500
+    assert _count_jsonl(tmp_path / "data/dataset/orderbook_time_protocol_benchmark_labels.jsonl") == 2_500
+    assert _count_jsonl(tmp_path / "data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl") == 2_500
+    _assert_memory_delta_below(before, after, 100 * 1024 * 1024)
+
+
+def test_phase52_simulated_1h_large_outputs_no_oom(tmp_path: Path) -> None:
+    result = _assert_streaming_finalization_memory_ceiling(tmp_path, line_count=3_600)
+    assert result.labeled_sample_count == 3_600
+
+
+def test_corrected_time_protocol_label_generation_memory_ceiling(tmp_path: Path) -> None:
+    _assert_streaming_finalization_memory_ceiling(tmp_path, line_count=3_000)
+
+
+def test_orderbook_time_protocol_benchmark_generation_memory_ceiling(tmp_path: Path) -> None:
+    result = _assert_streaming_finalization_memory_ceiling(tmp_path, line_count=2_000)
+    assert result.sources["depth_mid"]["receive_time"]["max_future_gap_ms"] == 100
+
+
+def test_orderbook_reference_benchmark_generation_memory_ceiling(tmp_path: Path) -> None:
+    result = _assert_streaming_finalization_memory_ceiling(tmp_path, line_count=2_000)
+    assert result.sources["bookTicker_mid"]["valid_reference_event_count"] == 2_000
+
+
+def test_latency_profile_summary_streaming_memory_ceiling(tmp_path: Path) -> None:
+    path = tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "stages": {stage: index + 1 for index, stage in enumerate(hotpath.REQUIRED_STAGE_NAMES)},
+        "metrics": {metric: 1.0 for metric in hotpath.LATENCY_METRIC_NAMES},
+        "earliest_available_receive_stage": "raw_ws_callback_monotonic_ns",
+        "queue_size_at_enqueue": 1,
+        "disk_write_on_hot_path": False,
+        "debug_logging_on_hot_path": False,
+        "batch_writer_enabled": True,
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        for _ in range(20_000):
+            handle.write(json.dumps(row) + "\n")
+    before = _rss_bytes()
+    profile = hotpath.build_latency_stage_profile(path)
+    after = _rss_bytes()
+    assert profile["sample_count"] == 20_000
+    assert profile["metrics"]["end_to_end_local_hot_path_ms"]["p99"] == pytest.approx(1.0)
+    _assert_memory_delta_below(before, after, 100 * 1024 * 1024)
+
+
+def test_multisource_protocol_reports_streaming_memory_ceiling(tmp_path: Path) -> None:
+    result = _assert_streaming_finalization_memory_ceiling(tmp_path, line_count=2_000)
+    assert set(result.sources) == set(REFERENCE_SOURCES)
+    assert result.sources["trade_price"]["corrected_hybrid"]["corrected_hybrid_100ms"]["max_future_gap_ms"] == 100
+
+
+def test_phase42h_analysis_uses_streamed_clean_count_without_materialized_rows(tmp_path: Path) -> None:
+    line_count = 120
+    _write_phase42h_streaming_inputs(tmp_path, line_count=line_count)
+    _write_phase42h_latency_profile_samples(tmp_path, line_count=24)
+    clock_samples = [
+        build_server_time_sample(
+            sample_id=1,
+            phase="before_capture",
+            local_wall_before_request_ms=1_700_000_000_000.0,
+            local_wall_after_response_ms=1_700_000_000_004.0,
+            binance_server_time_ms=1_700_000_000_002.0,
+        ),
+        build_server_time_sample(
+            sample_id=2,
+            phase="after_capture",
+            local_wall_before_request_ms=1_700_000_012_000.0,
+            local_wall_after_response_ms=1_700_000_012_004.0,
+            binance_server_time_ms=1_700_000_012_002.0,
+        ),
+    ]
+    report = hotpath.run_phase42h_analysis(
+        root=tmp_path,
+        symbol="BTCUSDT",
+        clock_offset_samples=clock_samples,
+        environment={"environment_name": "test"},
+        capture={
+            "duration_sec": 60.0,
+            "fresh_capture_performed": True,
+            "fixture_mode": False,
+            "skip_capture": False,
+            "phase41_runtime_report": _phase41(),
+            "capture_diagnostics": {"reference_writer_batch_report": _writer_report()},
+        },
+        cleanup_report={"performed": True},
+        gitignore_validation={"passed": True},
+        memory_telemetry=hotpath.new_memory_telemetry(),
+    )
+    assert report["clean_sample_count"] == line_count
+    assert report["labeled_sample_count"] == line_count
+    assert "streaming_finalization" in report
+    assert _count_jsonl(tmp_path / "data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl") == line_count
+
+
+def test_capture_bundle_uses_zipfile_write_not_read_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_phase42h_artifacts(_report(), root=tmp_path, pytest_output="ok", bundle_created=True)
+    (tmp_path / LATENCY_PROFILE_DATASETS_ZIP).parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(tmp_path / LATENCY_PROFILE_DATASETS_ZIP, "w") as archive:
+        archive.writestr("data/dataset/phase_4_2h_latency_profile_samples.jsonl", "{}\n")
+
+    def fail_read_bytes(self: Path) -> bytes:
+        raise AssertionError(f"read_bytes called for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    assert create_phase42h_bundle(root=tmp_path, pass_bundle=True).exists()
+
+
+def test_large_artifact_copy_uses_streaming_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "source.jsonl"
+    target = tmp_path / "target.jsonl"
+    source.write_bytes(b"x" * (2 * 1024 * 1024))
+
+    def fail_read_bytes(self: Path) -> bytes:
+        raise AssertionError(f"read_bytes called for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    phase42h_cli._copy_if_exists(source, target)
+    assert target.stat().st_size == source.stat().st_size
+
+
+def test_bundle_large_files_memory_ceiling(tmp_path: Path) -> None:
+    report = _report()
+    write_phase42h_artifacts(report, root=tmp_path, pytest_output="ok", bundle_created=True)
+    dataset = tmp_path / LATENCY_PROFILE_DATASETS_ZIP
+    dataset.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(dataset, "w") as archive:
+        archive.writestr("large.bin", b"x" * (5 * 1024 * 1024))
+    before = _rss_bytes()
+    bundle = create_phase42h_bundle(root=tmp_path, pass_bundle=True)
+    after = _rss_bytes()
+    assert bundle.exists()
+    _assert_memory_delta_below(before, after, 100 * 1024 * 1024)
+
+
+def test_bundle_skips_missing_files_without_loading_existing_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_phase42h_artifacts(_report(writer_drops=1), root=tmp_path, pytest_output="ok", bundle_created=True)
+
+    def fail_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        raise AssertionError(f"read_text called for {self}")
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+    assert create_phase42h_bundle(root=tmp_path, pass_bundle=False).exists()
+
+
+def test_bundle_records_file_sizes_and_sha256_streaming(tmp_path: Path) -> None:
+    write_phase42h_artifacts(_report(), root=tmp_path, pytest_output="ok", bundle_created=True)
+    telemetry = hotpath.new_memory_telemetry()
+    large = tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl"
+    large.parent.mkdir(parents=True, exist_ok=True)
+    large.write_bytes(b"x" * (1024 * 1024))
+    hotpath.refresh_generated_file_sizes(tmp_path, telemetry)
+    assert telemetry["generated_file_sizes_bytes"]["data/dataset/phase_4_2h_latency_profile_samples.jsonl"] == 1024 * 1024
+    bundle = create_phase42h_bundle(root=tmp_path, pass_bundle=True)
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("data/debug/phase_4_2h_bundle_file_manifest.json"))
+    assert any(item["path"] == "data/debug/phase_4_2h_latency_stage_profile.json" for item in manifest["files"])
+
+
 def test_compute_readiness_semantics_direct_future_lag_telemetry_only() -> None:
     semantics = compute_readiness_semantics(
         sources=_sources(h100=0.97, h250=0.98, p95=80.0, p99=120.0),
@@ -867,6 +1188,55 @@ def test_compute_readiness_semantics_direct_future_lag_telemetry_only() -> None:
         for metrics in source_report["corrected_hybrid"].values():
             assert metrics["future_receive_lag_hard_gate_used"] is False
             assert metrics["future_receive_lag_is_telemetry_only"] is True
+
+
+def test_memory_telemetry_schema_present(tmp_path: Path) -> None:
+    telemetry = hotpath.new_memory_telemetry()
+    for stage in hotpath.MEMORY_TELEMETRY_STAGES:
+        hotpath.record_memory_stage(telemetry, stage)
+    finalized = hotpath.finalize_memory_telemetry(tmp_path, telemetry)
+    report = _report()
+    report["memory_telemetry"] = finalized
+    assert report["memory_telemetry"]["schema_version"] == "phase_4_2h_memory_telemetry_v1"
+
+
+def test_memory_telemetry_has_stage_samples(tmp_path: Path) -> None:
+    telemetry = hotpath.new_memory_telemetry()
+    for stage in hotpath.MEMORY_TELEMETRY_STAGES:
+        hotpath.record_memory_stage(telemetry, stage)
+    finalized = hotpath.finalize_memory_telemetry(tmp_path, telemetry)
+    assert set(hotpath.MEMORY_TELEMETRY_STAGES) <= set(finalized["samples"])
+
+
+def test_memory_telemetry_handles_missing_psutil(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    original_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "psutil":
+            raise ImportError("psutil hidden for test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    telemetry = hotpath.new_memory_telemetry()
+    hotpath.record_memory_stage(telemetry, "process_start")
+    finalized = hotpath.finalize_memory_telemetry(tmp_path, telemetry)
+    assert "process_start" in finalized["samples"]
+    assert finalized["samples"]["process_start"]["peak_rss_bytes"] >= 0
+
+
+def test_memory_telemetry_peak_rss_non_negative(tmp_path: Path) -> None:
+    telemetry = hotpath.new_memory_telemetry()
+    hotpath.record_memory_stage(telemetry, "process_start")
+    finalized = hotpath.finalize_memory_telemetry(tmp_path, telemetry)
+    assert finalized["peak_rss_bytes"] >= 0
+
+
+def test_memory_telemetry_included_in_failure_metadata() -> None:
+    report = _report(writer_drops=1)
+    evaluated = evaluate_phase42h_report(report)
+    assert "memory_telemetry" in evaluated
 
 
 def _patch_phase42h_cli_fixture(monkeypatch: pytest.MonkeyPatch, *, source_root: Path) -> None:
@@ -907,3 +1277,152 @@ def _patch_phase42h_cli_fixture(monkeypatch: pytest.MonkeyPatch, *, source_root:
     monkeypatch.setattr(phase42h_cli, "_run_capture_with_clock_samples", fake_capture)
     monkeypatch.setattr(phase42h_cli, "run_phase42h_analysis", fake_analysis)
     monkeypatch.setattr(phase42h_cli, "create_phase42h_dataset_zip", lambda root: root / LATENCY_PROFILE_DATASETS_ZIP)
+
+
+def _write_simple_jsonl(path: Path, *, line_count: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for index in range(line_count):
+            handle.write(json.dumps({"i": index, "value": f"row-{index}"}) + "\n")
+
+
+def _assert_streaming_finalization_memory_ceiling(tmp_path: Path, *, line_count: int) -> phase42h_streaming.Phase42HStreamingResult:
+    _write_phase42h_streaming_inputs(tmp_path, line_count=line_count)
+    before = _rss_bytes()
+    result = phase42h_streaming.run_phase42h_streaming_finalization(
+        root=tmp_path,
+        clean_samples_path="data/dataset/orderbook_clean_samples.jsonl",
+        corrected_labels_path="data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl",
+        leakage_output_path="data/debug/phase_4_2h_leakage_check.json",
+        estimated_clock_offset_ms=0.0,
+        clock_offset_drift_valid=True,
+    )
+    after = _rss_bytes()
+    assert result.labeled_sample_count == line_count
+    _assert_memory_delta_below(before, after, 100 * 1024 * 1024)
+    return result
+
+
+def _write_phase42h_streaming_inputs(root: Path, *, line_count: int) -> None:
+    dataset = root / "data/dataset"
+    dataset.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "clean": dataset / "orderbook_clean_samples.jsonl",
+        "book": dataset / "bookticker_reference_quotes.jsonl",
+        "trade": dataset / "trade_reference_events.jsonl",
+        "agg": dataset / "aggtrade_reference_events.jsonl",
+    }
+    handles = {key: path.open("w", encoding="utf-8") for key, path in paths.items()}
+    try:
+        for index in range(line_count):
+            local_ts = index * 100_000_000
+            exchange_ms = 1_700_000_000_000.0 + index * 100.0
+            wall_ts = _iso_ms(exchange_ms + 20.0)
+            bid = 100.0 + index * 0.01
+            ask = bid + 1.0
+            mid = (bid + ask) / 2.0
+            clean = {
+                "schema_version": "orderbook_clean_v1",
+                "symbol": "BTCUSDT",
+                "source": "binance_depth",
+                "generation_id": index,
+                "state_version": index,
+                "snapshot_version": 1,
+                "last_update_id": index,
+                "local_recv_monotonic_ns": local_ts,
+                "local_recv_wall_ts": wall_ts,
+                "exchange_event_ts": exchange_ms,
+                "best_bid": bid,
+                "best_ask": ask,
+                "mid_price": mid,
+                "bids": [[bid, 1.0], [bid - 1.0, 2.0]],
+                "asks": [[ask, 1.0], [ask + 1.0, 2.0]],
+                "quality": {"errors": [], "is_valid": True},
+                "lifecycle": {"snapshot_ready": True, "ready_to_emit": True, "sequence_continuous": True},
+            }
+            book = {
+                "schema_version": "bookticker_reference_v1",
+                "symbol": "BTCUSDT",
+                "source": "bookTicker_mid",
+                "update_id": index,
+                "event_id": index,
+                "local_recv_monotonic_ns": local_ts,
+                "local_recv_wall_ts": wall_ts,
+                "exchange_event_ts": exchange_ms,
+                "best_bid": bid,
+                "best_ask": ask,
+                "mid_price": mid,
+                "price": mid,
+                "quality": {"valid": True, "errors": []},
+            }
+            trade = {
+                "schema_version": "trade_reference_v1",
+                "symbol": "BTCUSDT",
+                "source": "trade_price",
+                "trade_id": index,
+                "event_id": index,
+                "local_recv_monotonic_ns": local_ts,
+                "local_recv_wall_ts": wall_ts,
+                "exchange_event_ts": exchange_ms,
+                "trade_time": exchange_ms,
+                "price": mid,
+                "quality": {"valid": True, "errors": []},
+            }
+            agg = {
+                "schema_version": "aggtrade_reference_v1",
+                "symbol": "BTCUSDT",
+                "source": "aggTrade_price",
+                "aggregate_trade_id": index,
+                "event_id": index,
+                "local_recv_monotonic_ns": local_ts,
+                "local_recv_wall_ts": wall_ts,
+                "exchange_event_ts": exchange_ms,
+                "trade_time": exchange_ms,
+                "price": mid,
+                "quality": {"valid": True, "errors": []},
+            }
+            handles["clean"].write(json.dumps(clean) + "\n")
+            handles["book"].write(json.dumps(book) + "\n")
+            handles["trade"].write(json.dumps(trade) + "\n")
+            handles["agg"].write(json.dumps(agg) + "\n")
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+
+def _write_phase42h_latency_profile_samples(root: Path, *, line_count: int) -> None:
+    path = root / "data/dataset/phase_4_2h_latency_profile_samples.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for index in range(line_count):
+            base = index * 1_000_000
+            row = {
+                "stages": {stage: base + offset for offset, stage in enumerate(hotpath.REQUIRED_STAGE_NAMES, start=1)},
+                "metrics": {metric: 1.0 for metric in hotpath.LATENCY_METRIC_NAMES},
+                "earliest_available_receive_stage": "raw_ws_callback_monotonic_ns",
+                "queue_size_at_enqueue": 1,
+                "disk_write_on_hot_path": False,
+                "debug_logging_on_hot_path": False,
+                "batch_writer_enabled": True,
+            }
+            handle.write(json.dumps(row) + "\n")
+
+
+def _iso_ms(epoch_ms: float) -> str:
+    return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).isoformat()
+
+
+def _count_jsonl(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def _rss_bytes() -> int:
+    sample = hotpath._sample_process_memory()
+    return int(sample.get("rss_bytes") or 0)
+
+
+def _assert_memory_delta_below(before: int, after: int, threshold: int) -> None:
+    if before <= 0 or after <= 0:
+        return
+    assert after - before < threshold

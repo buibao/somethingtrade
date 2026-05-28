@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import asyncio
@@ -47,6 +47,10 @@ from app.research.hotpath_environment_latency import (  # noqa: E402
     create_phase42h_bundle,
     create_phase42h_dataset_zip,
     evaluate_phase42h_report,
+    finalize_memory_telemetry,
+    new_memory_telemetry,
+    record_memory_stage,
+    refresh_generated_file_sizes,
     run_phase42h_vps_preflight,
     run_phase42h_analysis,
     validate_gitignore_rules,
@@ -88,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
+    memory_telemetry = new_memory_telemetry()
+    record_memory_stage(memory_telemetry, "process_start")
     debug_dir = root / "data/debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
     for bundle in (root / PHASE42H_PASS_BUNDLE, root / PHASE42H_FAIL_AUDIT_BUNDLE):
@@ -104,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
     if args.preflight_only:
         preflight_report = run_phase42h_vps_preflight(root, source_root=SOURCE_ROOT)
+        record_memory_stage(memory_telemetry, "preflight_end")
         _write_json(root / PHASE42H_ENVIRONMENT_METADATA, environment)
         print(f"Phase 4.2H VPS preflight report: {root / PHASE42H_VPS_PREFLIGHT_REPORT}")
         if preflight_report.get("passed") is not True:
@@ -142,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
                 classification="ARTIFACT_CLEANUP_FAILURE",
                 reason=f"artifact cleanup failed: {cleanup_report.get('errors')}",
             )
-            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
             print("Phase 4.2H failed: ARTIFACT_CLEANUP_FAILURE")
             return 1
     else:
@@ -150,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.skip_preflight:
         preflight_report = run_phase42h_vps_preflight(root, source_root=SOURCE_ROOT)
+        record_memory_stage(memory_telemetry, "preflight_end")
         if preflight_report.get("passed") is not True:
             report = _failure_report(
                 args=args,
@@ -160,9 +168,11 @@ def main(argv: list[str] | None = None) -> int:
                 classification="PREFLIGHT_FAILURE",
                 reason=f"VPS preflight failed: {preflight_report.get('hard_fail_reasons', [])}",
             )
-            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
             print("Phase 4.2H failed: PREFLIGHT_FAILURE")
             return 1
+    elif "preflight_end" not in memory_telemetry.get("samples", {}):
+        record_memory_stage(memory_telemetry, "preflight_end")
 
     pytest_output_path = debug_dir / "phase_4_2h_pytest_output.txt"
     if args.skip_pytest:
@@ -183,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                 reason="pytest failed",
                 pytest_passed=False,
             )
-            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
             print("Phase 4.2H failed: TEST_FAILURE")
             return pytest_code or 1
 
@@ -201,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             typecheck_passed=False,
             typecheck_summary=typecheck_summary,
         )
-        _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+        _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
         print("Phase 4.2H failed: TYPECHECK_FAILURE")
         return 1
 
@@ -220,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             typecheck_passed=typecheck_passed,
             typecheck_summary=typecheck_summary,
         )
-        _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+        _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
         print("Phase 4.2H failed: FRESH_CAPTURE_NOT_PERFORMED")
         return 1
     if not args.skip_capture and str(args.run_mode) not in {"vps_smoke", "smoke"} and float(args.duration_sec) < 1800.0:
@@ -236,11 +246,12 @@ def main(argv: list[str] | None = None) -> int:
             typecheck_passed=typecheck_passed,
             typecheck_summary=typecheck_summary,
         )
-        _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+        _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
         print("Phase 4.2H failed: FRESH_CAPTURE_DURATION_FAILURE")
         return 1
 
     capture_code = 0
+    record_memory_stage(memory_telemetry, "capture_start")
     if args.skip_capture:
         clock_samples = _fixture_clock_samples()
         capture.update(_fixture_capture(args, root=root))
@@ -269,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                 typecheck_passed=typecheck_passed,
                 typecheck_summary=typecheck_summary,
             )
-            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
             print("Phase 4.2H failed: FRESH_CAPTURE_NOT_PERFORMED")
             return 1
         diagnostic_errors = validate_capture_diagnostics(capture_diagnostics, symbol=args.symbol)
@@ -297,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
             _copy_if_exists(SOURCE_ROOT / AGGTRADE_REFERENCE_EVENTS, root / AGGTRADE_REFERENCE_EVENTS)
             _copy_if_exists(SOURCE_ROOT / LATENCY_PROFILE_SAMPLES, root / LATENCY_PROFILE_SAMPLES)
 
+    record_memory_stage(memory_telemetry, "capture_end")
+    record_memory_stage(memory_telemetry, "finalization_start")
     report = run_phase42h_analysis(
         root=root,
         symbol=args.symbol,
@@ -325,14 +338,18 @@ def main(argv: list[str] | None = None) -> int:
         typecheck_summary=typecheck_summary,
         fresh_capture_required=not args.skip_capture,
         preflight_report=preflight_report,
+        memory_telemetry=memory_telemetry,
     )
+    record_memory_stage(memory_telemetry, "finalization_end")
+    refresh_generated_file_sizes(root, memory_telemetry)
+    report["memory_telemetry"] = memory_telemetry
     if capture_code != 0:
         report["hard_fail_reasons"].append(f"multi-feed capture exited {capture_code}")
         report["primary_failure"] = report.get("primary_failure") or "FRESH_CAPTURE_NOT_PERFORMED"
         report = evaluate_phase42h_report(report)
     if report.get("labeled_sample_count", 0) or report.get("hot_path_latency_summary", {}).get("sample_count", 0):
         create_phase42h_dataset_zip(root)
-    _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle)
+    _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
     if report.get("status") != "pass":
         print(f"Phase 4.2H failed: {classify_phase42h_failure(report)}")
         return 1
@@ -683,9 +700,14 @@ def _write_and_bundle(
     root: Path,
     pytest_output: str,
     no_bundle: bool,
+    memory_telemetry: dict[str, Any] | None = None,
 ) -> None:
     pass_bundle = report.get("status") == "pass"
     bundle_path = root / (PHASE42H_PASS_BUNDLE if pass_bundle else PHASE42H_FAIL_AUDIT_BUNDLE)
+    if memory_telemetry is not None:
+        record_memory_stage(memory_telemetry, "bundle_start")
+        refresh_generated_file_sizes(root, memory_telemetry)
+        report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
     write_phase42h_artifacts(
         report,
         root=root,
@@ -694,9 +716,30 @@ def _write_and_bundle(
         bundle_path=bundle_path,
     )
     if no_bundle:
+        if memory_telemetry is not None:
+            record_memory_stage(memory_telemetry, "bundle_end")
+            report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
+            write_phase42h_artifacts(
+                report,
+                root=root,
+                pytest_output=pytest_output,
+                bundle_created=False,
+                bundle_path=bundle_path,
+            )
         return
     try:
         create_phase42h_bundle(root=root, pass_bundle=pass_bundle, bundle_path=bundle_path)
+        if memory_telemetry is not None:
+            record_memory_stage(memory_telemetry, "bundle_end")
+            report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
+            write_phase42h_artifacts(
+                report,
+                root=root,
+                pytest_output=pytest_output,
+                bundle_created=True,
+                bundle_path=bundle_path,
+            )
+            create_phase42h_bundle(root=root, pass_bundle=pass_bundle, bundle_path=bundle_path)
     except Exception as exc:
         report["status"] = "fail"
         report["primary_failure"] = "BUNDLE_FAILURE"
@@ -981,7 +1024,10 @@ def _copy_if_exists(source: Path, target: Path) -> None:
     if not source.exists():
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(source.read_bytes())
+    with source.open("rb") as incoming, target.open("wb") as outgoing:
+        import shutil
+
+        shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
 
 
 def _write_json(path: str | Path, payload: Any) -> None:

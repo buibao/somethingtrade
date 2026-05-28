@@ -6,6 +6,7 @@ cd "${ROOT_DIR}"
 
 RESUME=0
 DRY_RUN=0
+ALLOW_LOW_MEMORY_VPS=0
 
 usage() {
   cat <<'EOF'
@@ -13,6 +14,7 @@ Usage:
   bash scripts/phase52_vps_24h_start.sh
   bash scripts/phase52_vps_24h_start.sh --resume
   bash scripts/phase52_vps_24h_start.sh --dry-run
+  bash scripts/phase52_vps_24h_start.sh --allow-low-memory-vps
 
 Clean reruns must start with no active data/phase_5_2 directory. Use:
   bash scripts/phase52_vps_clean_failed_run.sh --archive-active-output
@@ -26,6 +28,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      ;;
+    --allow-low-memory-vps)
+      ALLOW_LOW_MEMORY_VPS=1
       ;;
     -h|--help)
       usage
@@ -81,6 +86,33 @@ fi
 
 if ! grep -q -- '"--clean"' bot/app/research/phase52_auto_collection.py; then
   fail "Phase 5.2 runner does not guarantee Phase 4.2H --clean."
+fi
+
+memory_total_bytes="${PHASE52_MEMORY_TOTAL_BYTES:-}"
+memory_available_bytes="${PHASE52_MEMORY_AVAILABLE_BYTES:-}"
+swap_total_bytes="${PHASE52_SWAP_TOTAL_BYTES:-}"
+if [[ -z "${memory_total_bytes}" || -z "${swap_total_bytes}" ]]; then
+  if [[ -r /proc/meminfo ]]; then
+    memory_total_bytes="${memory_total_bytes:-$(awk '/^MemTotal:/ {printf "%.0f", $2 * 1024}' /proc/meminfo)}"
+    memory_available_bytes="${memory_available_bytes:-$(awk '/^MemAvailable:/ {printf "%.0f", $2 * 1024}' /proc/meminfo)}"
+    swap_total_bytes="${swap_total_bytes:-$(awk '/^SwapTotal:/ {printf "%.0f", $2 * 1024}' /proc/meminfo)}"
+  else
+    memory_total_bytes="${memory_total_bytes:-0}"
+    memory_available_bytes="${memory_available_bytes:-0}"
+    swap_total_bytes="${swap_total_bytes:-0}"
+  fi
+fi
+
+memory_total_bytes="${memory_total_bytes%.*}"
+memory_available_bytes="${memory_available_bytes%.*}"
+swap_total_bytes="${swap_total_bytes%.*}"
+low_memory_threshold_bytes=$((4 * 1024 * 1024 * 1024))
+if [[ "${ALLOW_LOW_MEMORY_VPS}" != "1" ]]; then
+  if [[ "${memory_total_bytes:-0}" -lt "${low_memory_threshold_bytes}" || "${swap_total_bytes:-0}" -le 0 ]]; then
+    fail "planned 1h+ Phase 5.2 sessions need streaming finalization plus a safe memory budget. Detected memory_total_bytes=${memory_total_bytes:-0}, memory_available_bytes=${memory_available_bytes:-0}, swap_total_bytes=${swap_total_bytes:-0}. Add swap or rerun with --allow-low-memory-vps."
+  fi
+else
+  echo "Warning: low-memory VPS guard overridden. memory_total_bytes=${memory_total_bytes:-0} memory_available_bytes=${memory_available_bytes:-0} swap_total_bytes=${swap_total_bytes:-0}" >&2
 fi
 
 command=(
