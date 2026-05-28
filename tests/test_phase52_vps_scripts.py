@@ -10,11 +10,15 @@ import zipfile
 
 import pytest
 
+from app.marketdata.orderbook_phase41 import OrderbookPhase41Processor, orderbook_phase41_paths_for_root
+from orderbook_phase41_test_utils import make_depth_update
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CLEAN_SCRIPT = ROOT / "scripts/phase52_vps_clean_failed_run.sh"
 START_SCRIPT = ROOT / "scripts/phase52_vps_24h_start.sh"
 COLLECT_SCRIPT = ROOT / "scripts/phase52_vps_collect_artifacts.sh"
+AUDIT_SCRIPT = ROOT / "scripts/phase52_vps_audit_session.sh"
 RUN_AUTO_SCRIPT = ROOT / "scripts/run_phase52_auto_collection.py"
 GENERATED_ARTIFACT_PATTERNS_THAT_MUST_NOT_BE_TRACKED = (
     "phase_5_2_audit_bundle_sha256.txt",
@@ -28,6 +32,7 @@ GENERATED_ARTIFACT_PATTERNS_THAT_MUST_NOT_BE_TRACKED = (
     "data/dataset/*.jsonl",
     "data/debug/*.json",
     "data/reports/*.json",
+    "data/reports/*.md",
 )
 
 
@@ -179,6 +184,48 @@ def test_phase52_status_reports_last_failure_oom(tmp_path: Path) -> None:
     assert "last_failure: OOM_KILLED" in result.stdout
 
 
+def test_phase52_audit_session_rejects_path_traversal(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(AUDIT_SCRIPT, tmp_path)
+
+    result = subprocess.run([bash, str(script), "../session_004_medium_2h"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert result.returncode == 2
+    assert "Invalid session id" in result.stderr
+
+
+def test_phase52_audit_session_missing_report_exits_nonzero(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(AUDIT_SCRIPT, tmp_path)
+    status = tmp_path / "data/debug/phase_5_2_auto_collection_status.json"
+    status.parent.mkdir(parents=True)
+    status.write_text(
+        json.dumps(
+            {
+                "running": False,
+                "current_session": "session_004_medium_2h",
+                "completed_session_count": 4,
+                "passed_session_count": 3,
+                "failed_session_count": 1,
+                "research_eligible_session_count": 3,
+                "last_failure": "REPORT_MISSING",
+                "stopped_early": True,
+                "stop_reason": "quality gate failed for session_004_medium_2h",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run([bash, str(script), "session_004_medium_2h"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert result.returncode == 1
+    assert "=== Missing required reports ===" in result.stdout
+    assert "quality_report" in result.stdout
+    assert "metadata" in result.stdout
+    assert "hotpath_report" in result.stdout
+    assert "self_check" in result.stdout
+
+
 def test_phase52_clean_failed_run_archive_mode_keeps_git_status_clean(tmp_path: Path) -> None:
     bash = _require_bash()
     script = _copy_script(CLEAN_SCRIPT, tmp_path)
@@ -213,6 +260,39 @@ def test_phase52_start_refuses_dirty_git_state_including_untracked_archive(tmp_p
 
     assert result.returncode != 0
     assert "git working tree is dirty" in result.stderr
+
+
+def test_phase52_start_guard_stays_clean_after_phase41_report_generation(tmp_path: Path) -> None:
+    bash = _require_bash()
+    script = _copy_script(START_SCRIPT, tmp_path)
+    _write_phase52_runner_marker(tmp_path)
+    docs_report = tmp_path / "docs/reports/phase_4_1_orderbook_quality_report.md"
+    docs_report.parent.mkdir(parents=True, exist_ok=True)
+    docs_report.write_text("# Static Phase 4.1 report\n", encoding="utf-8")
+    _init_clean_git_repo_with_script(tmp_path, script)
+    subprocess.run(["git", "add", "docs/reports/phase_4_1_orderbook_quality_report.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "static docs report"], cwd=tmp_path, text=True, capture_output=True, check=True)
+    before = docs_report.read_text(encoding="utf-8")
+
+    processor = OrderbookPhase41Processor(symbols=("BTCUSDT",), paths=orderbook_phase41_paths_for_root(tmp_path))
+    processor.load_snapshot(
+        "BTCUSDT",
+        bids=[("100.00", "1.0"), ("99.00", "2.0")],
+        asks=[("101.00", "1.5"), ("102.00", "2.5")],
+        last_update_id=100,
+        local_recv_monotonic_ns=1_000_000_000,
+    )
+    processor.process_depth_update(make_depth_update(first_update_id=101, final_update_id=101))
+    processor.write_reports(duration_sec=1.0)
+
+    status = subprocess.run(["git", "status", "--short", "--untracked-files=all"], cwd=tmp_path, text=True, capture_output=True, check=False)
+    result = subprocess.run([bash, str(script), "--dry-run"], cwd=tmp_path, env=_bash_env(), text=True, capture_output=True, check=False)
+
+    assert docs_report.read_text(encoding="utf-8") == before
+    assert status.returncode == 0
+    assert status.stdout == ""
+    assert result.returncode == 0, result.stderr
+    assert "Phase 5.2 start validation passed" in result.stdout
 
 
 def test_phase52_start_refuses_missing_gitignore_rules(tmp_path: Path) -> None:

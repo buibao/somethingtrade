@@ -41,9 +41,9 @@ DEFAULT_CLEAN_SAMPLE_SCHEMA_VIOLATION_CASES = Path("data/debug/clean_sample_sche
 DEFAULT_WS_LIFECYCLE_REPORT = Path("data/debug/ws_lifecycle_report.json")
 DEFAULT_ORDERBOOK_CLEAN_SAMPLES = Path("data/dataset/orderbook_clean_samples.jsonl")
 DEFAULT_LATENCY_PROFILE_SAMPLES = Path("data/dataset/phase_4_2fg_latency_profile_samples.jsonl")
-DEFAULT_ORDERBOOK_MARKDOWN_REPORT = Path("docs/reports/phase_4_1_orderbook_quality_report.md")
 DEFAULT_PHASE411_REPORT_JSON = Path("data/reports/phase_4_1_orderbook_quality_report.json")
 DEFAULT_PHASE411_REPORT_MD = Path("data/reports/phase_4_1_orderbook_quality_report.md")
+DEFAULT_ORDERBOOK_MARKDOWN_REPORT = DEFAULT_PHASE411_REPORT_MD
 
 PHASE_4_1_SCHEMA_VERSION = "phase_4_1_clean_orderbook_v1"
 SNAPSHOT_COPY_BUDGET_US = 200.0
@@ -66,6 +66,30 @@ class OrderbookPhase41Paths:
     clean_samples: Path = REPO_ROOT / DEFAULT_ORDERBOOK_CLEAN_SAMPLES
     latency_profile_samples: Path = REPO_ROOT / DEFAULT_LATENCY_PROFILE_SAMPLES
     markdown_report: Path = REPO_ROOT / DEFAULT_ORDERBOOK_MARKDOWN_REPORT
+    phase411_report_json: Path = REPO_ROOT / DEFAULT_PHASE411_REPORT_JSON
+    phase411_report_md: Path = REPO_ROOT / DEFAULT_PHASE411_REPORT_MD
+
+
+def orderbook_phase41_paths_for_root(root: str | Path) -> OrderbookPhase41Paths:
+    root_path = Path(root)
+    return OrderbookPhase41Paths(
+        quality_report=root_path / DEFAULT_ORDERBOOK_QUALITY_REPORT,
+        quality_samples=root_path / DEFAULT_ORDERBOOK_QUALITY_SAMPLES,
+        mismatch_cases=root_path / DEFAULT_ORDERBOOK_MISMATCH_CASES,
+        book_incomplete_cases=root_path / DEFAULT_BOOK_INCOMPLETE_CASES,
+        sequence_gap_cases=root_path / DEFAULT_SEQUENCE_GAP_CASES,
+        duplicate_update_cases=root_path / DEFAULT_DUPLICATE_UPDATE_CASES,
+        invalid_delta_cases=root_path / DEFAULT_INVALID_DELTA_CASES,
+        stale_period_cases=root_path / DEFAULT_STALE_PERIOD_CASES,
+        sequence_recovery_trace=root_path / DEFAULT_SEQUENCE_RECOVERY_TRACE,
+        clean_sample_schema_violation_cases=root_path / DEFAULT_CLEAN_SAMPLE_SCHEMA_VIOLATION_CASES,
+        lifecycle_report=root_path / DEFAULT_WS_LIFECYCLE_REPORT,
+        clean_samples=root_path / DEFAULT_ORDERBOOK_CLEAN_SAMPLES,
+        latency_profile_samples=root_path / DEFAULT_LATENCY_PROFILE_SAMPLES,
+        markdown_report=root_path / DEFAULT_ORDERBOOK_MARKDOWN_REPORT,
+        phase411_report_json=root_path / DEFAULT_PHASE411_REPORT_JSON,
+        phase411_report_md=root_path / DEFAULT_PHASE411_REPORT_MD,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1856,8 +1880,8 @@ async def run_orderbook_phase41_capture(
         processor.close_writer()
     duration = (monotonic_now_ns() - start_mono) / 1_000_000_000.0
     summary = processor.write_reports(duration_sec=duration)
-    _write_json(REPO_ROOT / DEFAULT_PHASE411_REPORT_JSON, summary)
-    report_md = REPO_ROOT / DEFAULT_PHASE411_REPORT_MD
+    _write_json(paths.phase411_report_json, summary)
+    report_md = paths.phase411_report_md
     report_md.parent.mkdir(parents=True, exist_ok=True)
     report_md.write_text(render_phase41_markdown_report(summary), encoding="utf-8")
     return summary

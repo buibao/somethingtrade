@@ -25,7 +25,7 @@ if str(BOT_PATH) not in sys.path:
 from app.marketdata.batch_writer import JsonlBatchWriter  # noqa: E402
 from app.marketdata.binance_aggtrade_source import parse_aggtrade_payload  # noqa: E402
 from app.marketdata.binance_trade_source import parse_trade_payload  # noqa: E402
-from app.marketdata.orderbook_phase41 import OrderbookPhase41Paths, run_orderbook_phase41_capture  # noqa: E402
+from app.marketdata.orderbook_phase41 import orderbook_phase41_paths_for_root, run_orderbook_phase41_capture  # noqa: E402
 from app.research.bookticker_reference import parse_bookticker_payload  # noqa: E402
 from app.research.clock_sync_receive_lag import build_server_time_sample  # noqa: E402
 from app.research.hotpath_environment_latency import (  # noqa: E402
@@ -259,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             clock_samples, capture_code, capture_diagnostics = asyncio.run(
                 _run_capture_with_clock_samples(
+                    root=root,
                     symbol=args.symbol,
                     duration_sec=args.duration_sec,
                     depth_n=args.depth_n,
@@ -292,21 +293,15 @@ def main(argv: list[str] | None = None) -> int:
                 "capture_exit_code": capture_code,
                 "capture_diagnostics": capture_diagnostics,
                 "capture_diagnostic_errors": diagnostic_errors,
-                "depth_clean_sample_count": _count_jsonl(SOURCE_ROOT / "data/dataset/orderbook_clean_samples.jsonl"),
-                "latency_profile_sample_count": _count_jsonl(SOURCE_ROOT / LATENCY_PROFILE_SAMPLES),
+                "depth_clean_sample_count": _count_jsonl(root / "data/dataset/orderbook_clean_samples.jsonl"),
+                "latency_profile_sample_count": _count_jsonl(root / LATENCY_PROFILE_SAMPLES),
                 "reference_event_counts": {
-                    "bookTicker_mid": _count_jsonl(SOURCE_ROOT / BOOKTICKER_REFERENCE_QUOTES),
-                    "trade_price": _count_jsonl(SOURCE_ROOT / TRADE_REFERENCE_EVENTS),
-                    "aggTrade_price": _count_jsonl(SOURCE_ROOT / AGGTRADE_REFERENCE_EVENTS),
+                    "bookTicker_mid": _count_jsonl(root / BOOKTICKER_REFERENCE_QUOTES),
+                    "trade_price": _count_jsonl(root / TRADE_REFERENCE_EVENTS),
+                    "aggTrade_price": _count_jsonl(root / AGGTRADE_REFERENCE_EVENTS),
                 },
             }
         )
-        if root != SOURCE_ROOT:
-            _copy_if_exists(SOURCE_ROOT / "data/dataset/orderbook_clean_samples.jsonl", root / "data/dataset/orderbook_clean_samples.jsonl")
-            _copy_if_exists(SOURCE_ROOT / BOOKTICKER_REFERENCE_QUOTES, root / BOOKTICKER_REFERENCE_QUOTES)
-            _copy_if_exists(SOURCE_ROOT / TRADE_REFERENCE_EVENTS, root / TRADE_REFERENCE_EVENTS)
-            _copy_if_exists(SOURCE_ROOT / AGGTRADE_REFERENCE_EVENTS, root / AGGTRADE_REFERENCE_EVENTS)
-            _copy_if_exists(SOURCE_ROOT / LATENCY_PROFILE_SAMPLES, root / LATENCY_PROFILE_SAMPLES)
 
     record_memory_stage(memory_telemetry, "capture_end")
     record_memory_stage(memory_telemetry, "finalization_start")
@@ -359,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
 
 async def _run_capture_with_clock_samples(
     *,
+    root: Path,
     symbol: str,
     duration_sec: float,
     depth_n: int,
@@ -370,6 +366,7 @@ async def _run_capture_with_clock_samples(
     samples.append(await _sample_binance_server_time(sample_id=1, phase="before_capture"))
     capture_task = asyncio.create_task(
         _run_phase42h_multi_feed_capture(
+            root=root,
             symbol=symbol,
             duration_sec=duration_sec,
             depth_n=depth_n,
@@ -387,6 +384,7 @@ async def _run_capture_with_clock_samples(
 
 async def _run_phase42h_multi_feed_capture(
     *,
+    root: Path,
     symbol: str,
     duration_sec: float,
     depth_n: int,
@@ -395,13 +393,10 @@ async def _run_phase42h_multi_feed_capture(
     writer_queue_max_size: int,
 ) -> tuple[int, dict[str, Any]]:
     for path in (BOOKTICKER_REFERENCE_QUOTES, TRADE_REFERENCE_EVENTS, AGGTRADE_REFERENCE_EVENTS, LATENCY_PROFILE_SAMPLES):
-        target = SOURCE_ROOT / path
+        target = root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("", encoding="utf-8")
-    paths = OrderbookPhase41Paths(
-        clean_samples=SOURCE_ROOT / "data/dataset/orderbook_clean_samples.jsonl",
-        latency_profile_samples=SOURCE_ROOT / LATENCY_PROFILE_SAMPLES,
-    )
+    paths = orderbook_phase41_paths_for_root(root)
     depth_task = asyncio.create_task(
         run_orderbook_phase41_capture(
             symbol=symbol,
@@ -416,6 +411,7 @@ async def _run_phase42h_multi_feed_capture(
     )
     reference_task = asyncio.create_task(
         _capture_references(
+            root=root,
             symbol=symbol,
             duration_sec=duration_sec,
             writer_batch_size=writer_batch_size,
@@ -438,18 +434,20 @@ async def _run_phase42h_multi_feed_capture(
     else:
         reference_diagnostics = reference_result
     diagnostics = _build_capture_diagnostics(
+        root=root,
         symbol=symbol,
         duration_sec=duration_sec,
         reference_diagnostics=reference_diagnostics,
         depth_summary=depth_summary,
         depth_code=depth_code,
     )
-    _write_json(SOURCE_ROOT / PHASE42H_CAPTURE_DIAGNOSTICS, diagnostics)
+    _write_json(root / PHASE42H_CAPTURE_DIAGNOSTICS, diagnostics)
     return depth_code, diagnostics
 
 
 async def _capture_references(
     *,
+    root: Path,
     symbol: str,
     duration_sec: float,
     writer_batch_size: int,
@@ -516,7 +514,7 @@ async def _capture_references(
                                         "parse_end_monotonic_ns": parse_end_ns,
                                     }
                                 )
-                                writer.enqueue_jsonl(_reference_path(source), row)
+                                writer.enqueue_jsonl(_reference_path(root, source), row)
                                 parsed_count_by_source[source] += 1
                                 quality = row.get("quality")
                                 if isinstance(quality, dict) and quality.get("valid") is not True:
@@ -584,17 +582,18 @@ def _parse_reference_message(
     return None, None
 
 
-def _reference_path(source: str) -> Path:
+def _reference_path(root: Path, source: str) -> Path:
     paths = {
-        "bookTicker_mid": SOURCE_ROOT / BOOKTICKER_REFERENCE_QUOTES,
-        "trade_price": SOURCE_ROOT / TRADE_REFERENCE_EVENTS,
-        "aggTrade_price": SOURCE_ROOT / AGGTRADE_REFERENCE_EVENTS,
+        "bookTicker_mid": root / BOOKTICKER_REFERENCE_QUOTES,
+        "trade_price": root / TRADE_REFERENCE_EVENTS,
+        "aggTrade_price": root / AGGTRADE_REFERENCE_EVENTS,
     }
     return paths[source]
 
 
 def _build_capture_diagnostics(
     *,
+    root: Path,
     symbol: str,
     duration_sec: float,
     reference_diagnostics: dict[str, Any],
@@ -604,7 +603,7 @@ def _build_capture_diagnostics(
     requested = required_streams(symbol)
     depth_stream = requested[0]
     depth_message_count = int(_num(depth_summary.get("messages_received")))
-    clean_count = _count_jsonl(SOURCE_ROOT / "data/dataset/orderbook_clean_samples.jsonl")
+    clean_count = _count_jsonl(root / "data/dataset/orderbook_clean_samples.jsonl")
     message_count_by_stream = {stream: 0 for stream in requested}
     message_count_by_stream[depth_stream] = depth_message_count
     message_count_by_stream.update(_dict(reference_diagnostics.get("message_count_by_stream")))
@@ -648,7 +647,7 @@ def _build_capture_diagnostics(
         "first_message_wall_ts_by_stream": _dict(reference_diagnostics.get("first_message_wall_ts_by_stream")),
         "last_message_wall_ts_by_stream": _dict(reference_diagnostics.get("last_message_wall_ts_by_stream")),
         "output_file_paths": output_paths,
-        "output_file_sizes_bytes": {key: _file_size(SOURCE_ROOT / path) for key, path in output_paths.items()},
+        "output_file_sizes_bytes": {key: _file_size(root / path) for key, path in output_paths.items()},
         "depth_capture_exit_code": depth_code,
         "phase41_runtime_report": depth_summary,
         "phase41_runtime_report_source": "current_capture_summary",

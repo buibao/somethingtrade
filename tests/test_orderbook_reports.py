@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+from app.marketdata.orderbook_phase41 import OrderbookPhase41Processor, orderbook_phase41_paths_for_root
 from orderbook_phase41_test_utils import make_depth_update, make_processor
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_tc_69_quality_report_json_schema(tmp_path) -> None:
@@ -118,3 +123,26 @@ def test_tc_75_runtime_summary_includes_pass_fail_conclusion(tmp_path) -> None:
     summary = processor.write_reports(duration_sec=1.0)
     assert "phase_4_1_pass" in summary
     assert isinstance(summary["phase_4_1_pass"], bool)
+
+
+def test_phase41_tmp_path_report_generation_does_not_modify_docs_report(tmp_path: Path) -> None:
+    docs_report = ROOT / "docs/reports/phase_4_1_orderbook_quality_report.md"
+    before = docs_report.read_bytes() if docs_report.exists() else None
+    processor = OrderbookPhase41Processor(symbols=("BTCUSDT",), paths=orderbook_phase41_paths_for_root(tmp_path))
+    processor.load_snapshot(
+        "BTCUSDT",
+        bids=[("100.00", "1.0"), ("99.00", "2.0")],
+        asks=[("101.00", "1.5"), ("102.00", "2.5")],
+        last_update_id=100,
+        local_recv_monotonic_ns=1_000_000_000,
+    )
+    processor.process_depth_update(make_depth_update(first_update_id=101, final_update_id=101))
+
+    processor.write_reports(duration_sec=1.0)
+
+    assert (tmp_path / "data/reports/phase_4_1_orderbook_quality_report.md").exists()
+    assert not (tmp_path / "docs/reports/phase_4_1_orderbook_quality_report.md").exists()
+    if before is None:
+        assert not docs_report.exists()
+    else:
+        assert docs_report.read_bytes() == before

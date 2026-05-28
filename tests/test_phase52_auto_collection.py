@@ -18,6 +18,7 @@ from app.research.phase52_auto_collection import (
     FILE_SIZE_MANIFEST,
     FULL_DATASET_BUNDLE,
     MANIFEST_PATH,
+    REPORT_JSON_PATH,
     STATUS_PATH,
     build_auto_collection_manifest,
     default_session_plan,
@@ -267,6 +268,103 @@ def test_phase52_stop_after_current_session_file_stops_gracefully(tmp_path: Path
     assert manifest["stopped_early"] is True
     assert manifest["session_count"] == 1
     assert "stop-after-current-session" in manifest["stop_reason"]
+
+
+def test_phase52_report_status_pass_when_graceful_stop_after_current_session_with_no_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stop_file = tmp_path / "stop_after_current"
+    original_capture = phase52.run_controlled_capture
+    calls = {"count": 0}
+
+    def stop_after_third_session(**kwargs: Any) -> dict[str, Any]:
+        result = original_capture(**kwargs)
+        calls["count"] += 1
+        if calls["count"] == 3:
+            stop_file.write_text("stop", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(phase52, "run_controlled_capture", stop_after_third_session)
+    report = run_auto_collection(
+        root=tmp_path,
+        plan_name="test_plan",
+        total_budget_hours=24,
+        dry_run=True,
+        create_bundles=True,
+        test_max_sessions=5,
+        strict_100ms=True,
+        stop_after_current_session_file=stop_file,
+    )
+    manifest = report["manifest"]
+    assert manifest["session_count"] == 3
+    assert manifest["passed_session_count"] == 3
+    assert manifest["failed_session_count"] == 0
+    assert manifest["research_eligible_session_count"] == 3
+    assert manifest["stopped_early"] is True
+    assert "stop-after-current-session file observed" in manifest["stop_reason"]
+    assert report["status"] == "pass"
+    assert report["aggregate_status"] == "stopped_early"
+    assert report["collection_status"] == "stopped_early"
+    assert report["last_failure"] is None
+
+
+def test_phase52_report_status_fail_when_stopped_early_due_to_failed_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_phase52_real_capture_sequence(monkeypatch, ["pass", "oom"])
+    report = run_auto_collection(
+        root=tmp_path,
+        plan_name="test_plan",
+        total_budget_hours=24,
+        create_bundles=True,
+        test_max_sessions=3,
+        strict_100ms=True,
+        fail_session_on_quality_gate=True,
+        cooldown_sec=0,
+    )
+    status = _read_json(tmp_path / STATUS_PATH)
+    assert report["status"] == "fail"
+    assert report["last_failure"] == "OOM_KILLED"
+    assert report["manifest"]["failed_session_count"] == 1
+    assert report["manifest"]["stopped_early"] is True
+    assert report["collection_status"] == "partial_fail_stopped_early"
+    assert status["last_failure"] == "OOM_KILLED"
+
+
+def test_phase52_status_manifest_report_consistent_for_graceful_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stop_file = tmp_path / "stop_after_current"
+    original_capture = phase52.run_controlled_capture
+    calls = {"count": 0}
+
+    def stop_after_third_session(**kwargs: Any) -> dict[str, Any]:
+        result = original_capture(**kwargs)
+        calls["count"] += 1
+        if calls["count"] == 3:
+            stop_file.write_text("stop", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(phase52, "run_controlled_capture", stop_after_third_session)
+    report = run_auto_collection(
+        root=tmp_path,
+        plan_name="test_plan",
+        total_budget_hours=24,
+        dry_run=True,
+        create_bundles=True,
+        test_max_sessions=5,
+        strict_100ms=True,
+        stop_after_current_session_file=stop_file,
+    )
+    manifest = _read_json(tmp_path / MANIFEST_PATH)
+    status = _read_json(tmp_path / STATUS_PATH)
+    report_json = _read_json(tmp_path / REPORT_JSON_PATH)
+
+    assert report["status"] == report_json["status"] == "pass"
+    assert report_json["collection_status"] == "stopped_early"
+    assert manifest["stopped_early"] is True
+    assert status["stopped_early"] is True
+    assert status["stop_reason"] == manifest["stop_reason"]
+    assert "stop-after-current-session file observed" in manifest["stop_reason"]
+    for field in ("completed_session_count", "passed_session_count", "failed_session_count", "research_eligible_session_count"):
+        manifest_field = "session_count" if field == "completed_session_count" else field
+        assert status[field] == manifest[manifest_field]
+    assert status["last_failure"] is None
+    assert report_json["last_failure"] is None
 
 
 def test_phase52_session_quality_gate_accepts_valid_session() -> None:
@@ -605,6 +703,8 @@ def test_phase52_failed_session_does_not_continue_silently_when_fail_session_on_
     assert manifest["session_count"] == 1
     assert manifest["stopped_early"] is True
     assert "quality gate failed" in manifest["stop_reason"]
+    assert report["status"] == "fail"
+    assert report["last_failure"] == "ARTIFACT_CLEANUP_FAILURE"
 
 
 def test_exit_code_minus_9_with_oom_dmesg_maps_to_oom_killed() -> None:

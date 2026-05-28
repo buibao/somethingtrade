@@ -518,8 +518,7 @@ def build_status(
     stopped_early: bool,
     stop_reason: str,
 ) -> dict[str, Any]:
-    failed_sessions = [session for session in sessions if session.get("status") != "pass"]
-    last_failure = str(failed_sessions[-1].get("primary_failure")) if failed_sessions else None
+    last_failure = _last_failure(sessions, stopped_early=stopped_early, stop_reason=stop_reason)
     return {
         "phase": PHASE,
         "plan_name": plan_name,
@@ -544,12 +543,18 @@ def build_auto_collection_report(
     allow_nested_zip: bool = False,
 ) -> dict[str, Any]:
     bundle_mode = "full_dataset_explicit" if include_large_datasets else "audit_light"
+    collection_status = _collection_status(manifest)
     return {
         "phase": PHASE,
         "schema_version": "phase_5_2_auto_collection_report_v1",
-        "status": "pass" if manifest.get("failed_session_count") == 0 and manifest.get("stopped_early") is not True else "fail",
-        "collection_status": _collection_status(manifest),
-        "aggregate_status": _collection_status(manifest),
+        "status": _report_status(manifest),
+        "collection_status": collection_status,
+        "aggregate_status": collection_status,
+        "last_failure": _last_failure(
+            list(_manifest_sessions(manifest)),
+            stopped_early=manifest.get("stopped_early") is True,
+            stop_reason=str(manifest.get("stop_reason") or ""),
+        ),
         "strict_100ms_hard_requirement": strict_100ms,
         "binance_websocket_research_only": True,
         "manifest": manifest,
@@ -1231,6 +1236,53 @@ def _sha256_file(path: Path) -> str:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _manifest_sessions(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return [session for session in manifest.get("sessions", []) if isinstance(session, dict)]
+
+
+def _stop_after_current_session_observed(stop_reason: str) -> bool:
+    return stop_reason.startswith("stop-after-current-session file observed")
+
+
+def _all_completed_sessions_passed(sessions: list[dict[str, Any]]) -> bool:
+    return bool(sessions) and all(session.get("status") == "pass" for session in sessions)
+
+
+def _report_status(manifest: dict[str, Any]) -> str:
+    failed = int(manifest.get("failed_session_count", 0) or 0)
+    stopped_early = manifest.get("stopped_early") is True
+    stop_reason = str(manifest.get("stop_reason") or "")
+    sessions = _manifest_sessions(manifest)
+    if failed > 0:
+        return "fail"
+    if stopped_early:
+        if _stop_after_current_session_observed(stop_reason) and _all_completed_sessions_passed(sessions):
+            return "pass"
+        return "fail"
+    return "pass"
+
+
+def _last_failure(
+    sessions: list[dict[str, Any]],
+    *,
+    stopped_early: bool = False,
+    stop_reason: str = "",
+) -> str | None:
+    failed_sessions = [session for session in sessions if session.get("status") != "pass"]
+    if failed_sessions:
+        failed = failed_sessions[-1]
+        primary = failed.get("primary_failure")
+        if primary:
+            return str(primary)
+        runtime_status = failed.get("runtime_status")
+        if runtime_status and runtime_status != "pass":
+            return str(runtime_status)
+        return "SESSION_FAILED"
+    if stopped_early and stop_reason.startswith("quality gate failed"):
+        return "QUALITY_GATE_FAILED"
+    return None
 
 
 def _collection_status(manifest: dict[str, Any]) -> str:
