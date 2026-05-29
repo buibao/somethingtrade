@@ -14,6 +14,14 @@ import time
 from typing import Any
 import zipfile
 
+from app.research.hotpath_environment_latency import (
+    BUNDLE_SLOW_WARNING_SEC,
+    CAPTURE_DURATION_GUARD_GRACE_SEC,
+    FINALIZATION_SLOW_WARNING_SEC,
+    PHASE42H_STAGE_TIMING_FIELDS,
+    phase42h_capture_duration_guard_limit_sec,
+)
+
 
 PHASE = "5.2"
 PRIMARY_HORIZON_MS = 100
@@ -47,6 +55,18 @@ REQUIRED_SESSION_METADATA_FIELDS = (
     "ended_at_utc",
     "requested_duration_sec",
     "actual_duration_sec",
+    "child_started_at_utc",
+    "capture_started_at_utc",
+    "capture_ended_at_utc",
+    "finalization_started_at_utc",
+    "finalization_ended_at_utc",
+    "bundle_started_at_utc",
+    "bundle_ended_at_utc",
+    "child_ended_at_utc",
+    "capture_duration_sec",
+    "finalization_duration_sec",
+    "bundle_duration_sec",
+    "total_child_duration_sec",
     "host_info",
     "os_info",
     "python_version",
@@ -375,6 +395,7 @@ def evaluate_session_quality(runtime_report: dict[str, Any], *, bundle_sha_valid
     phase41 = _dict(runtime_report.get("phase41_runtime_report"))
     clock = _dict(runtime_report.get("clock_offset_summary"))
     phase41_status = phase41.get("phase_4_1_status") or runtime_report.get("phase41_runtime_report_status")
+    duration_quality = _phase42h_duration_quality(runtime_report)
     checks = {
         "status_pass": runtime_report.get("status") == "pass",
         "primary_failure_none": runtime_report.get("primary_failure") is None,
@@ -385,6 +406,7 @@ def evaluate_session_quality(runtime_report: dict[str, Any], *, bundle_sha_valid
         "strict_100ms_observability_ready": runtime_report.get("strict_100ms_observability_ready") is True,
         "low_latency_ready": runtime_report.get("low_latency_ready") is True,
         "bundle_sha256_valid": bundle_sha_valid,
+        **duration_quality["checks"],
     }
     failure_reasons = [name for name, passed in checks.items() if not passed]
     return {
@@ -395,6 +417,72 @@ def evaluate_session_quality(runtime_report: dict[str, Any], *, bundle_sha_valid
         "failure_reasons": failure_reasons,
         "bundle_sha256_valid": bundle_sha_valid,
         "strict_100ms_hard_requirement": True,
+        "duration_guard": duration_quality,
+        "warning_reasons": duration_quality["warnings"],
+    }
+
+
+def _phase42h_stage_timing(runtime_report: dict[str, Any]) -> dict[str, Any]:
+    nested = _dict(runtime_report.get("stage_timing"))
+    capture = _dict(runtime_report.get("capture"))
+    capture_nested = _dict(capture.get("stage_timing"))
+    combined = {**capture_nested, **capture, **nested, **runtime_report}
+    timing: dict[str, Any] = {}
+    for field in PHASE42H_STAGE_TIMING_FIELDS:
+        value = combined.get(field)
+        if field.endswith("_duration_sec"):
+            timing[field] = _float_or_none(value)
+        else:
+            timing[field] = value if value is not None else None
+    return timing
+
+
+def _phase42h_duration_quality(runtime_report: dict[str, Any]) -> dict[str, Any]:
+    requested = _float_or_none(runtime_report.get("duration_sec"))
+    timing = _phase42h_stage_timing(runtime_report)
+    capture_duration = _float_or_none(timing.get("capture_duration_sec"))
+    finalization_duration = _float_or_none(timing.get("finalization_duration_sec"))
+    bundle_duration = _float_or_none(timing.get("bundle_duration_sec"))
+    total_child_duration = _float_or_none(timing.get("total_child_duration_sec"))
+    guard_limit = phase42h_capture_duration_guard_limit_sec(requested)
+    warnings: list[str] = []
+    checks = {
+        "capture_duration_within_guard": True,
+        "child_stage_timing_present": True,
+        "child_duration_explained": True,
+    }
+    if guard_limit is not None:
+        capture_payload = _dict(runtime_report.get("capture"))
+        diagnostics = _dict(capture_payload.get("capture_diagnostics"))
+        if capture_payload.get("capture_duration_within_guard") is False or diagnostics.get("duration_guard_failure") is True:
+            checks["capture_duration_within_guard"] = False
+        if capture_duration is not None:
+            checks["capture_duration_within_guard"] = checks["capture_duration_within_guard"] is not False and capture_duration <= guard_limit
+        elif total_child_duration is not None and total_child_duration > guard_limit:
+            checks["capture_duration_within_guard"] = False
+            checks["child_stage_timing_present"] = False
+        if total_child_duration is not None and total_child_duration > guard_limit:
+            required = (capture_duration, finalization_duration, bundle_duration)
+            checks["child_stage_timing_present"] = all(value is not None for value in required)
+            if checks["child_stage_timing_present"]:
+                explained = float(capture_duration or 0.0) + float(finalization_duration or 0.0) + float(bundle_duration or 0.0)
+                allowed_unexplained = max(CAPTURE_DURATION_GUARD_GRACE_SEC, float(total_child_duration) * 0.05)
+                checks["child_duration_explained"] = (float(total_child_duration) - explained) <= allowed_unexplained
+            else:
+                checks["child_duration_explained"] = False
+    if finalization_duration is not None and finalization_duration > FINALIZATION_SLOW_WARNING_SEC:
+        warnings.append("finalization_duration_sec_slow")
+    if bundle_duration is not None and bundle_duration > BUNDLE_SLOW_WARNING_SEC:
+        warnings.append("bundle_duration_sec_slow")
+    return {
+        "requested_duration_sec": requested,
+        "guard_limit_sec": guard_limit,
+        "capture_duration_sec": capture_duration,
+        "finalization_duration_sec": finalization_duration,
+        "bundle_duration_sec": bundle_duration,
+        "total_child_duration_sec": total_child_duration,
+        "checks": checks,
+        "warnings": warnings,
     }
 
 
@@ -419,6 +507,7 @@ def build_session_metadata(
     end_to_end = _dict(latency_metrics.get("end_to_end_local_hot_path_ms"))
     before_state = source_repo_state_before or _git_source_state(root_path)
     after_state = _git_source_state(root_path)
+    child_stage_timing = _phase42h_stage_timing(runtime_report)
     metadata = {
         "phase": PHASE,
         "session_id": session_id,
@@ -435,6 +524,7 @@ def build_session_metadata(
         "ended_at_utc": ended_at_utc,
         "requested_duration_sec": requested_duration_sec,
         "actual_duration_sec": actual_duration_sec,
+        **child_stage_timing,
         "host_info": {"hostname": platform.node(), "machine": platform.machine(), "processor": platform.processor()},
         "os_info": {"platform": platform.platform(), "system": platform.system(), "release": platform.release()},
         "python_version": sys.version,
@@ -449,6 +539,7 @@ def build_session_metadata(
         "oom_killed_pid": _dict(runtime_report.get("oom_evidence")).get("killed_pid"),
         "process_failure_evidence": runtime_report.get("process_failure_evidence", {}),
         "memory_telemetry": runtime_report.get("memory_telemetry", {}),
+        "duration_guard": _phase42h_duration_quality(runtime_report),
         "failure_reasons": quality_report.get("failure_reasons", []),
         "clock_sync_status": runtime_report.get("clock_sync_status"),
         "accepted_clock_sample_count": clock.get("accepted_clock_sample_count", 0),
@@ -779,6 +870,8 @@ def render_auto_collection_markdown(report: dict[str, Any]) -> str:
 
 
 def synthetic_phase42h_runtime_report(*, requested_duration_sec: float, simulate_failure: str | None = None) -> dict[str, Any]:
+    now = _utc_now()
+    guard_limit = phase42h_capture_duration_guard_limit_sec(requested_duration_sec)
     report = {
         "phase": "4.2H",
         "status": "pass",
@@ -787,6 +880,18 @@ def synthetic_phase42h_runtime_report(*, requested_duration_sec: float, simulate
         "strict_100ms_observability_ready": True,
         "low_latency_ready": True,
         "duration_sec": requested_duration_sec,
+        "child_started_at_utc": now,
+        "capture_started_at_utc": now,
+        "capture_ended_at_utc": now,
+        "finalization_started_at_utc": now,
+        "finalization_ended_at_utc": now,
+        "bundle_started_at_utc": now,
+        "bundle_ended_at_utc": now,
+        "child_ended_at_utc": now,
+        "capture_duration_sec": float(requested_duration_sec),
+        "finalization_duration_sec": 0.0,
+        "bundle_duration_sec": 0.0,
+        "total_child_duration_sec": float(requested_duration_sec),
         "clock_offset_summary": {
             "clock_offset_drift_valid": True,
             "clock_offset_sample_quality_valid": True,
@@ -809,6 +914,14 @@ def synthetic_phase42h_runtime_report(*, requested_duration_sec: float, simulate
         },
         "hard_fail_reasons": [],
         "warning_reasons": [],
+    }
+    report["capture"] = {
+        "duration_sec": requested_duration_sec,
+        "capture_duration_sec": float(requested_duration_sec),
+        "capture_duration_guard_limit_sec": guard_limit,
+        "capture_duration_guard_grace_sec": CAPTURE_DURATION_GUARD_GRACE_SEC,
+        "capture_duration_within_guard": True,
+        "stage_timing": _phase42h_stage_timing(report),
     }
     if simulate_failure == "strict_100ms_false":
         report["strict_100ms_observability_ready"] = False
@@ -882,6 +995,7 @@ def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_
             check=False,
         )
     ended_at_utc = _utc_now()
+    duration_sec = max(0.0, (_parse_utc(ended_at_utc) - _parse_utc(started_at_utc)).total_seconds())
     _append_text(
         console_path,
         "\n".join(
@@ -897,6 +1011,9 @@ def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_
     if report_path.exists():
         report = _read_json(report_path)
         report.setdefault("exit_code", process.returncode)
+        _set_missing_or_none(report, "child_started_at_utc", started_at_utc)
+        _set_missing_or_none(report, "child_ended_at_utc", ended_at_utc)
+        _set_missing_or_none(report, "total_child_duration_sec", duration_sec)
     else:
         kernel_log_text = _collect_kernel_log_text(started_at_utc=started_at_utc, ended_at_utc=ended_at_utc)
         classification = classify_child_process_failure(
@@ -913,7 +1030,6 @@ def _run_real_phase42h_capture(*, root_path: Path, session_dir: Path, requested_
             started_at_utc=started_at_utc,
             ended_at_utc=ended_at_utc,
         )
-    duration_sec = max(0.0, (_parse_utc(ended_at_utc) - _parse_utc(started_at_utc)).total_seconds())
     summary = f"Phase 4.2H child output streamed to {_relative(root_path, console_path)}; duration_sec={duration_sec:.3f}; exit_code={process.returncode}"
     return process.returncode, report, summary
 
@@ -939,6 +1055,18 @@ def phase42h_process_failure_report(
     report["fallback_reason"] = "child_exited_before_hotpath_report"
     report["started_at_utc"] = started_at_utc
     report["ended_at_utc"] = ended_at_utc
+    report["child_started_at_utc"] = started_at_utc
+    report["child_ended_at_utc"] = ended_at_utc
+    report["total_child_duration_sec"] = max(0.0, (_parse_utc(ended_at_utc) - _parse_utc(started_at_utc)).total_seconds())
+    report["capture_started_at_utc"] = None
+    report["capture_ended_at_utc"] = None
+    report["finalization_started_at_utc"] = None
+    report["finalization_ended_at_utc"] = None
+    report["bundle_started_at_utc"] = None
+    report["bundle_ended_at_utc"] = None
+    report["capture_duration_sec"] = None
+    report["finalization_duration_sec"] = None
+    report["bundle_duration_sec"] = None
     report["oom_evidence"] = classification.get("oom_evidence", {})
     report["process_failure_evidence"] = {
         "exit_code": exit_code,
@@ -1236,6 +1364,23 @@ def _sha256_file(path: Path) -> str:
 
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _float_or_none(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result != result:
+        return None
+    return result
+
+
+def _set_missing_or_none(mapping: dict[str, Any], key: str, value: Any) -> None:
+    if mapping.get(key) is None:
+        mapping[key] = value
 
 
 def _manifest_sessions(manifest: dict[str, Any]) -> list[dict[str, Any]]:

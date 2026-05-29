@@ -427,6 +427,69 @@ def test_phase52_quality_passes_only_when_all_gates_pass() -> None:
     assert quality["failure_reasons"] == []
 
 
+def test_phase52_session_metadata_includes_child_stage_durations(tmp_path: Path) -> None:
+    runtime_report = synthetic_phase42h_runtime_report(requested_duration_sec=7200)
+    quality = evaluate_session_quality(runtime_report, bundle_sha_valid=True)
+    metadata = phase52.build_session_metadata(
+        root_path=tmp_path,
+        session_id="session_004_medium_2h",
+        plan_name="test_plan",
+        requested_duration_sec=7200,
+        actual_duration_sec=7201,
+        started_at_utc="2026-05-28T14:28:57Z",
+        ended_at_utc="2026-05-28T16:28:58Z",
+        runtime_report=runtime_report,
+        quality_report=quality,
+        notes="",
+    )
+    for field in hotpath.PHASE42H_STAGE_TIMING_FIELDS:
+        assert field in metadata
+    assert metadata["capture_duration_sec"] == 7200.0
+    assert metadata["finalization_duration_sec"] == 0.0
+    assert metadata["bundle_duration_sec"] == 0.0
+    assert metadata["total_child_duration_sec"] == 7200.0
+
+
+def test_phase52_quality_fails_when_capture_duration_exceeded() -> None:
+    report = synthetic_phase42h_runtime_report(requested_duration_sec=7200)
+    report["capture_duration_sec"] = 48_360.0
+    report["finalization_duration_sec"] = 0.0
+    report["bundle_duration_sec"] = 0.0
+    report["total_child_duration_sec"] = 48_360.0
+
+    quality = evaluate_session_quality(report, bundle_sha_valid=True)
+
+    assert quality["research_eligible"] is False
+    assert "capture_duration_within_guard" in quality["failure_reasons"]
+
+
+def test_phase52_allows_slow_finalization_with_warning_if_capture_duration_ok() -> None:
+    report = synthetic_phase42h_runtime_report(requested_duration_sec=7200)
+    report["capture_duration_sec"] = 7200.0
+    report["finalization_duration_sec"] = 36_000.0
+    report["bundle_duration_sec"] = 60.0
+    report["total_child_duration_sec"] = 43_260.0
+
+    quality = evaluate_session_quality(report, bundle_sha_valid=True)
+
+    assert quality["research_eligible"] is True
+    assert "finalization_duration_sec_slow" in quality["warning_reasons"]
+
+
+def test_phase52_does_not_mark_13h_child_as_pass_for_2h_requested_without_stage_explanation() -> None:
+    report = synthetic_phase42h_runtime_report(requested_duration_sec=7200)
+    report["capture_duration_sec"] = None
+    report["finalization_duration_sec"] = None
+    report["bundle_duration_sec"] = None
+    report["total_child_duration_sec"] = 48_360.85698554201
+
+    quality = evaluate_session_quality(report, bundle_sha_valid=True)
+
+    assert quality["research_eligible"] is False
+    assert "child_stage_timing_present" in quality["failure_reasons"]
+    assert "child_duration_explained" in quality["failure_reasons"]
+
+
 def test_phase52_failed_session_not_research_eligible(tmp_path: Path) -> None:
     result = run_controlled_capture(
         root=tmp_path,

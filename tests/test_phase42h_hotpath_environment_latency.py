@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import gc
 import hashlib
 import json
 from pathlib import Path
+import time
 import zipfile
 from typing import Any
 
@@ -541,6 +543,10 @@ def test_strict_100ms_gate_not_relaxed() -> None:
     assert report["phase5_ready"] is False
 
 
+def test_phase42h_strict_100ms_gates_unchanged() -> None:
+    test_strict_100ms_gate_not_relaxed()
+
+
 def test_runtime_cleanup_does_not_modify_gitignore(tmp_path: Path) -> None:
     gitignore = tmp_path / ".gitignore"
     original = "*.jsonl\n*.zip\n"
@@ -599,6 +605,105 @@ def test_phase42h_cli_without_clean_for_fresh_capture_fails(tmp_path: Path, monk
     assert exit_code == 1
     assert report["status"] == "fail"
     assert report["primary_failure"] == "ARTIFACT_CLEANUP_FAILURE"
+
+
+def test_phase42h_capture_duration_stops_near_requested_duration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def slow_capture(**_kwargs: Any) -> tuple[int, dict[str, Any]]:
+        await asyncio.sleep(1.0)
+        return 0, {}
+
+    async def fake_sample(*, sample_id: int, phase: str) -> dict[str, Any]:
+        return build_server_time_sample(
+            sample_id=sample_id,
+            phase=phase,
+            local_wall_before_request_ms=37_500.0 + sample_id,
+            local_wall_after_response_ms=37_505.0 + sample_id,
+            binance_server_time_ms=10.0 + sample_id,
+        )
+
+    monkeypatch.setattr(phase42h_cli, "_run_phase42h_multi_feed_capture", slow_capture)
+    monkeypatch.setattr(phase42h_cli, "_sample_binance_server_time", fake_sample)
+
+    started = time.monotonic()
+    _samples, capture_code, diagnostics = asyncio.run(
+        phase42h_cli._run_capture_with_clock_samples(
+            root=tmp_path,
+            symbol="BTCUSDT",
+            duration_sec=0.01,
+            depth_n=20,
+            writer_batch_size=512,
+            writer_flush_interval_ms=100.0,
+            writer_queue_max_size=65_536,
+            capture_guard_grace_sec=0.01,
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert capture_code == 1
+    assert diagnostics["duration_guard_failure"] is True
+    assert diagnostics["capture_duration_sec"] <= 0.5
+
+
+def test_phase42h_duration_guard_fails_large_capture_overrun() -> None:
+    report = _fresh_phase42h_report()
+    report["duration_sec"] = 7200.0
+    report["capture_duration_sec"] = 48_360.0
+    report["total_child_duration_sec"] = 48_360.0
+    report["finalization_duration_sec"] = 0.0
+    report["bundle_duration_sec"] = 0.0
+    report["capture"] = {
+        **report["capture"],
+        "capture_duration_sec": 48_360.0,
+        "capture_duration_guard_limit_sec": 7320.0,
+        "capture_duration_within_guard": False,
+    }
+
+    evaluated = evaluate_phase42h_report(report)
+
+    assert evaluated["status"] == "fail"
+    assert "CAPTURE_DURATION_EXCEEDED" in evaluated["failure_classifications"]
+
+
+def test_phase42h_report_includes_stage_timestamps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_required_gitignore(tmp_path)
+    _patch_phase42h_cli_fixture(monkeypatch, source_root=tmp_path)
+
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "1800",
+            "--environment-name",
+            "test",
+            "--environment-region",
+            "local",
+            "--run-mode",
+            "vps_final",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--clean",
+            "--no-bundle",
+        ]
+    )
+
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    for field in hotpath.PHASE42H_STAGE_TIMING_FIELDS:
+        assert field in report
+    assert report["capture_started_at_utc"]
+    assert report["capture_ended_at_utc"]
+    assert report["finalization_started_at_utc"]
+    assert report["finalization_ended_at_utc"]
+    assert report["bundle_started_at_utc"]
+    assert report["bundle_ended_at_utc"]
+    assert report["child_started_at_utc"]
+    assert report["child_ended_at_utc"]
+    assert report["capture_duration_sec"] is not None
+    assert report["finalization_duration_sec"] is not None
+    assert report["bundle_duration_sec"] is not None
+    assert report["total_child_duration_sec"] is not None
 
 
 def test_hot_path_decoupling_flags_and_batch_writer_enabled() -> None:
@@ -953,6 +1058,28 @@ def test_phase42h_streaming_helpers_are_used_for_large_jsonl() -> None:
     module_text = Path("bot/app/research/hotpath_environment_latency.py").read_text(encoding="utf-8")
     assert "run_phase42h_streaming_finalization(" in module_text
     assert "build_latency_stage_profile_streaming(" in module_text
+
+
+def test_phase42h_streaming_finalization_still_avoids_read_text_read_bytes_on_large_jsonl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_phase42h_streaming_inputs(tmp_path, line_count=25)
+
+    def blocked_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        raise AssertionError(f"read_text should not be used while streaming {self}")
+
+    def blocked_read_bytes(self: Path) -> bytes:
+        raise AssertionError(f"read_bytes should not be used while streaming {self}")
+
+    monkeypatch.setattr(Path, "read_text", blocked_read_text)
+    monkeypatch.setattr(Path, "read_bytes", blocked_read_bytes)
+    result = phase42h_streaming.run_phase42h_streaming_finalization(
+        root=tmp_path,
+        clean_samples_path="data/dataset/orderbook_clean_samples.jsonl",
+        corrected_labels_path="data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl",
+        leakage_output_path="data/debug/phase_4_2h_leakage_check.json",
+        estimated_clock_offset_ms=0.0,
+        clock_offset_drift_valid=True,
+    )
+    assert result.labeled_sample_count == 25
 
 
 def test_stream_jsonl_counts_large_file_without_memory_growth(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 import importlib.util
 import json
@@ -31,6 +32,7 @@ from app.research.clock_sync_receive_lag import build_server_time_sample  # noqa
 from app.research.hotpath_environment_latency import (  # noqa: E402
     AGGTRADE_REFERENCE_EVENTS,
     BOOKTICKER_REFERENCE_QUOTES,
+    CAPTURE_DURATION_GUARD_GRACE_SEC,
     CORRECTED_TIME_PROTOCOL_LABELS,
     LATENCY_PROFILE_SAMPLES,
     PHASE42H_CAPTURE_DIAGNOSTICS,
@@ -38,6 +40,7 @@ from app.research.hotpath_environment_latency import (  # noqa: E402
     PHASE42H_ENVIRONMENT_METADATA,
     PHASE42H_FAIL_AUDIT_BUNDLE,
     PHASE42H_PASS_BUNDLE,
+    PHASE42H_STAGE_TIMING_FIELDS,
     PHASE42H_TYPECHECK_REPORT,
     PHASE42H_VPS_PREFLIGHT_REPORT,
     PHASE42H_VPS_SETUP_REPORT,
@@ -49,6 +52,8 @@ from app.research.hotpath_environment_latency import (  # noqa: E402
     evaluate_phase42h_report,
     finalize_memory_telemetry,
     new_memory_telemetry,
+    phase42h_capture_duration_guard_limit_sec,
+    phase42h_stage_timing_from_mapping,
     record_memory_stage,
     refresh_generated_file_sizes,
     run_phase42h_vps_preflight,
@@ -92,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
+    stage_timing = _new_stage_timing()
     memory_telemetry = new_memory_telemetry()
     record_memory_stage(memory_telemetry, "process_start")
     debug_dir = root / "data/debug"
@@ -251,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     capture_code = 0
+    _mark_stage_start(stage_timing, "capture")
     record_memory_stage(memory_telemetry, "capture_start")
     if args.skip_capture:
         clock_samples = _fixture_clock_samples()
@@ -269,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except Exception as exc:
+            _mark_stage_end(stage_timing, "capture")
+            _apply_capture_duration_guard(capture, stage_timing=stage_timing, requested_duration_sec=args.duration_sec)
             report = _failure_report(
                 args=args,
                 environment=environment,
@@ -280,8 +289,9 @@ def main(argv: list[str] | None = None) -> int:
                 pytest_passed=pytest_passed,
                 typecheck_passed=typecheck_passed,
                 typecheck_summary=typecheck_summary,
+                stage_timing=stage_timing,
             )
-            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
+            _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry, stage_timing=stage_timing)
             print("Phase 4.2H failed: FRESH_CAPTURE_NOT_PERFORMED")
             return 1
         diagnostic_errors = validate_capture_diagnostics(capture_diagnostics, symbol=args.symbol)
@@ -303,7 +313,12 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
+    _mark_stage_end(stage_timing, "capture")
+    _apply_capture_duration_guard(capture, stage_timing=stage_timing, requested_duration_sec=args.duration_sec)
+    capture["stage_timing"] = phase42h_stage_timing_from_mapping(stage_timing)
+    capture["capture_duration_sec"] = stage_timing.get("capture_duration_sec")
     record_memory_stage(memory_telemetry, "capture_end")
+    _mark_stage_start(stage_timing, "finalization")
     record_memory_stage(memory_telemetry, "finalization_start")
     report = run_phase42h_analysis(
         root=root,
@@ -335,6 +350,8 @@ def main(argv: list[str] | None = None) -> int:
         preflight_report=preflight_report,
         memory_telemetry=memory_telemetry,
     )
+    _mark_stage_end(stage_timing, "finalization")
+    _apply_stage_timing(report, stage_timing)
     record_memory_stage(memory_telemetry, "finalization_end")
     refresh_generated_file_sizes(root, memory_telemetry)
     report["memory_telemetry"] = memory_telemetry
@@ -342,9 +359,16 @@ def main(argv: list[str] | None = None) -> int:
         report["hard_fail_reasons"].append(f"multi-feed capture exited {capture_code}")
         report["primary_failure"] = report.get("primary_failure") or "FRESH_CAPTURE_NOT_PERFORMED"
         report = evaluate_phase42h_report(report)
-    if report.get("labeled_sample_count", 0) or report.get("hot_path_latency_summary", {}).get("sample_count", 0):
-        create_phase42h_dataset_zip(root)
-    _write_and_bundle(report, root=root, pytest_output=pytest_output, no_bundle=args.no_bundle, memory_telemetry=memory_telemetry)
+    create_dataset_zip = bool(report.get("labeled_sample_count", 0) or report.get("hot_path_latency_summary", {}).get("sample_count", 0))
+    report = _write_and_bundle(
+        report,
+        root=root,
+        pytest_output=pytest_output,
+        no_bundle=args.no_bundle,
+        memory_telemetry=memory_telemetry,
+        stage_timing=stage_timing,
+        create_dataset_zip=create_dataset_zip,
+    )
     if report.get("status") != "pass":
         print(f"Phase 4.2H failed: {classify_phase42h_failure(report)}")
         return 1
@@ -361,9 +385,12 @@ async def _run_capture_with_clock_samples(
     writer_batch_size: int,
     writer_flush_interval_ms: float,
     writer_queue_max_size: int,
+    capture_guard_grace_sec: float = CAPTURE_DURATION_GUARD_GRACE_SEC,
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     samples: list[dict[str, Any]] = []
     samples.append(await _sample_binance_server_time(sample_id=1, phase="before_capture"))
+    capture_started_at_utc = _utc_now()
+    capture_start_mono = time.monotonic()
     capture_task = asyncio.create_task(
         _run_phase42h_multi_feed_capture(
             root=root,
@@ -376,8 +403,31 @@ async def _run_capture_with_clock_samples(
         )
     )
     periodic_task = asyncio.create_task(_periodic_server_time_samples(samples, capture_task, interval_sec=300.0))
-    capture_code, diagnostics = await capture_task
-    await periodic_task
+    guard_limit = phase42h_capture_duration_guard_limit_sec(duration_sec, grace_sec=capture_guard_grace_sec)
+    try:
+        if guard_limit is None:
+            capture_code, diagnostics = await capture_task
+        else:
+            capture_code, diagnostics = await asyncio.wait_for(capture_task, timeout=guard_limit)
+        await periodic_task
+    except asyncio.TimeoutError:
+        capture_task.cancel()
+        periodic_task.cancel()
+        done, _pending = await asyncio.wait({capture_task, periodic_task}, timeout=5.0)
+        for task in done:
+            with suppress(asyncio.CancelledError, Exception):
+                task.result()
+        capture_duration_sec = max(0.0, time.monotonic() - capture_start_mono)
+        diagnostics = _duration_guard_capture_diagnostics(
+            symbol=symbol,
+            duration_sec=duration_sec,
+            capture_started_at_utc=capture_started_at_utc,
+            capture_ended_at_utc=_utc_now(),
+            capture_duration_sec=capture_duration_sec,
+            guard_limit_sec=guard_limit,
+        )
+        _write_json(root / PHASE42H_CAPTURE_DIAGNOSTICS, diagnostics)
+        capture_code = 1
     samples.append(await _sample_binance_server_time(sample_id=len(samples) + 1, phase="after_capture"))
     return samples, capture_code, diagnostics
 
@@ -656,6 +706,48 @@ def _build_capture_diagnostics(
     }
 
 
+def _duration_guard_capture_diagnostics(
+    *,
+    symbol: str,
+    duration_sec: float,
+    capture_started_at_utc: str,
+    capture_ended_at_utc: str,
+    capture_duration_sec: float,
+    guard_limit_sec: float | None,
+) -> dict[str, Any]:
+    requested = required_streams(symbol)
+    return {
+        "fresh_capture_performed": False,
+        "fixture_mode": False,
+        "skip_capture": False,
+        "duration_sec": float(duration_sec),
+        "symbol": symbol.upper(),
+        "requested_streams": requested,
+        "connected": False,
+        "connect_count": 0,
+        "disconnect_count": 0,
+        "reconnect_count": 0,
+        "message_count_by_stream": {stream: 0 for stream in requested},
+        "parsed_count_by_source": {"depth_mid": 0, "bookTicker_mid": 0, "trade_price": 0, "aggTrade_price": 0},
+        "parse_error_count_by_source": {"depth_mid": 0, "bookTicker_mid": 0, "trade_price": 0, "aggTrade_price": 0},
+        "unknown_stream_count": 0,
+        "output_file_paths": {},
+        "output_file_sizes_bytes": {},
+        "depth_capture_exit_code": 1,
+        "phase41_runtime_report": {},
+        "phase41_runtime_report_source": "duration_guard_timeout",
+        "depth_writer_batch_report": {},
+        "reference_writer_batch_report": {},
+        "duration_guard_failure": True,
+        "primary_failure": "CAPTURE_DURATION_EXCEEDED",
+        "capture_started_at_utc": capture_started_at_utc,
+        "capture_ended_at_utc": capture_ended_at_utc,
+        "capture_duration_sec": capture_duration_sec,
+        "capture_duration_guard_limit_sec": guard_limit_sec,
+        "capture_duration_guard_grace_sec": CAPTURE_DURATION_GUARD_GRACE_SEC,
+    }
+
+
 async def _periodic_server_time_samples(
     samples: list[dict[str, Any]],
     capture_task: asyncio.Task[tuple[int, dict[str, Any]]],
@@ -700,14 +792,35 @@ def _write_and_bundle(
     pytest_output: str,
     no_bundle: bool,
     memory_telemetry: dict[str, Any] | None = None,
-) -> None:
+    stage_timing: dict[str, Any] | None = None,
+    create_dataset_zip: bool = False,
+) -> dict[str, Any]:
+    timing = stage_timing if stage_timing is not None else _stage_timing_from_report(report)
+    _mark_stage_start(timing, "bundle")
+    _apply_stage_timing(report, timing)
+    report = evaluate_phase42h_report(report)
     pass_bundle = report.get("status") == "pass"
     bundle_path = root / (PHASE42H_PASS_BUNDLE if pass_bundle else PHASE42H_FAIL_AUDIT_BUNDLE)
     if memory_telemetry is not None:
         record_memory_stage(memory_telemetry, "bundle_start")
         refresh_generated_file_sizes(root, memory_telemetry)
-        record_memory_stage(memory_telemetry, "bundle_end")
-        report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
+    if create_dataset_zip:
+        create_phase42h_dataset_zip(root)
+    if no_bundle:
+        _mark_stage_end(timing, "bundle")
+        _mark_child_end(timing)
+        _apply_stage_timing(report, timing)
+        if memory_telemetry is not None:
+            record_memory_stage(memory_telemetry, "bundle_end")
+            report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
+        write_phase42h_artifacts(
+            report,
+            root=root,
+            pytest_output=pytest_output,
+            bundle_created=False,
+            bundle_path=bundle_path,
+        )
+        return report
     write_phase42h_artifacts(
         report,
         root=root,
@@ -715,11 +828,29 @@ def _write_and_bundle(
         bundle_created=not no_bundle,
         bundle_path=bundle_path,
     )
-    if no_bundle:
-        return
     try:
         create_phase42h_bundle(root=root, pass_bundle=pass_bundle, bundle_path=bundle_path)
+        _mark_stage_end(timing, "bundle")
+        _mark_child_end(timing)
+        _apply_stage_timing(report, timing)
+        if memory_telemetry is not None:
+            record_memory_stage(memory_telemetry, "bundle_end")
+            report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
+        write_phase42h_artifacts(
+            report,
+            root=root,
+            pytest_output=pytest_output,
+            bundle_created=True,
+            bundle_path=bundle_path,
+        )
+        return report
     except Exception as exc:
+        _mark_stage_end(timing, "bundle")
+        _mark_child_end(timing)
+        _apply_stage_timing(report, timing)
+        if memory_telemetry is not None:
+            record_memory_stage(memory_telemetry, "bundle_end")
+            report["memory_telemetry"] = finalize_memory_telemetry(root, memory_telemetry)
         report["status"] = "fail"
         report["primary_failure"] = "BUNDLE_FAILURE"
         report["hard_fail_reasons"].append(f"bundle failure: {exc}")
@@ -747,7 +878,9 @@ def _failure_report(
     pytest_passed: bool = True,
     typecheck_passed: bool = True,
     typecheck_summary: str = "",
+    stage_timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    timing = phase42h_stage_timing_from_mapping(stage_timing)
     report = {
         "phase": "4.2H",
         "status": "fail",
@@ -773,13 +906,17 @@ def _failure_report(
         "readiness_decision_reason": "benchmark_failed_before_readiness_decision",
         "symbol": args.symbol.upper(),
         "duration_sec": float(args.duration_sec),
+        **timing,
         "fresh_capture_performed": False,
         "fixture_mode": bool(args.skip_capture),
         "skip_capture": bool(args.skip_capture),
         "max_future_gap_ms": 100,
         "future_receive_lag_hard_gate_used": False,
         "fresh_capture_required": not bool(args.skip_capture),
-        "capture": _capture_summary(args, fresh=False, cleanup_report=cleanup_report),
+        "capture": {
+            **_capture_summary(args, fresh=False, cleanup_report=cleanup_report),
+            "stage_timing": timing,
+        },
         "environment": environment,
         "cleanup_report": cleanup_report,
         "gitignore_validation": gitignore_validation,
@@ -879,6 +1016,66 @@ def _mypy_is_configured() -> bool:
         return True
     pyproject = SOURCE_ROOT / "pyproject.toml"
     return pyproject.exists() and "[tool.mypy" in pyproject.read_text(encoding="utf-8", errors="ignore")
+
+
+def _new_stage_timing() -> dict[str, Any]:
+    timing = {field: None for field in PHASE42H_STAGE_TIMING_FIELDS}
+    timing["child_started_at_utc"] = _utc_now()
+    timing["_child_start_monotonic_sec"] = time.monotonic()
+    return timing
+
+
+def _stage_timing_from_report(report: dict[str, Any]) -> dict[str, Any]:
+    timing = phase42h_stage_timing_from_mapping(report)
+    if timing.get("child_started_at_utc") is None:
+        timing["child_started_at_utc"] = _utc_now()
+        timing["_child_start_monotonic_sec"] = time.monotonic()
+    return timing
+
+
+def _mark_stage_start(timing: dict[str, Any], stage: str) -> None:
+    key = f"{stage}_started_at_utc"
+    timing[key] = timing.get(key) or _utc_now()
+    timing[f"_{stage}_start_monotonic_sec"] = time.monotonic()
+
+
+def _mark_stage_end(timing: dict[str, Any], stage: str) -> None:
+    ended_key = f"{stage}_ended_at_utc"
+    timing[ended_key] = _utc_now()
+    start_mono = timing.get(f"_{stage}_start_monotonic_sec")
+    if isinstance(start_mono, (int, float)):
+        timing[f"{stage}_duration_sec"] = max(0.0, time.monotonic() - float(start_mono))
+
+
+def _mark_child_end(timing: dict[str, Any]) -> None:
+    timing["child_ended_at_utc"] = _utc_now()
+    start_mono = timing.get("_child_start_monotonic_sec")
+    if isinstance(start_mono, (int, float)):
+        timing["total_child_duration_sec"] = max(0.0, time.monotonic() - float(start_mono))
+
+
+def _apply_capture_duration_guard(capture: dict[str, Any], *, stage_timing: dict[str, Any], requested_duration_sec: float) -> None:
+    guard_limit = phase42h_capture_duration_guard_limit_sec(requested_duration_sec)
+    capture_duration = stage_timing.get("capture_duration_sec")
+    capture["requested_duration_sec"] = float(requested_duration_sec)
+    capture["capture_duration_guard_limit_sec"] = guard_limit
+    capture["capture_duration_guard_grace_sec"] = CAPTURE_DURATION_GUARD_GRACE_SEC
+    diagnostics = _dict(capture.get("capture_diagnostics"))
+    if diagnostics.get("duration_guard_failure") is True:
+        capture["capture_duration_within_guard"] = False
+    if isinstance(capture_duration, (int, float)) and guard_limit is not None:
+        capture["capture_duration_within_guard"] = capture.get("capture_duration_within_guard") is not False and float(capture_duration) <= guard_limit
+
+
+def _apply_stage_timing(report: dict[str, Any], stage_timing: dict[str, Any]) -> None:
+    timing = phase42h_stage_timing_from_mapping(stage_timing)
+    for field, value in timing.items():
+        report[field] = value
+    capture = _dict(report.get("capture")).copy()
+    capture["stage_timing"] = timing
+    if timing.get("capture_duration_sec") is not None:
+        capture["capture_duration_sec"] = timing.get("capture_duration_sec")
+    report["capture"] = capture
 
 
 def _capture_summary(
@@ -1019,6 +1216,10 @@ def _write_text(path: str | Path, text: str) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _read_text(path: str | Path) -> str:

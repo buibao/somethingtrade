@@ -59,6 +59,25 @@ STRICT_LAG_P99_MS = 200.0
 QUEUE_DEPTH_NEAR_CAPACITY_RATIO = 0.80
 QUEUE_PUT_BLOCK_WARNING_MS = 5.0
 WRITER_FLUSH_WARNING_MS = 50.0
+CAPTURE_DURATION_GUARD_REQUESTED_MAX_SEC = 7200.0
+CAPTURE_DURATION_GUARD_GRACE_SEC = 120.0
+FINALIZATION_SLOW_WARNING_SEC = 600.0
+BUNDLE_SLOW_WARNING_SEC = 300.0
+
+PHASE42H_STAGE_TIMING_FIELDS = (
+    "child_started_at_utc",
+    "capture_started_at_utc",
+    "capture_ended_at_utc",
+    "finalization_started_at_utc",
+    "finalization_ended_at_utc",
+    "bundle_started_at_utc",
+    "bundle_ended_at_utc",
+    "child_ended_at_utc",
+    "capture_duration_sec",
+    "finalization_duration_sec",
+    "bundle_duration_sec",
+    "total_child_duration_sec",
+)
 
 LATENCY_PROFILE_SAMPLES = Path("data/dataset/phase_4_2h_latency_profile_samples.jsonl")
 CORRECTED_TIME_PROTOCOL_LABELS = Path("data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl")
@@ -200,6 +219,18 @@ PHASE42H_REQUIRED_REPORT_FIELDS = frozenset(
         "phase5_ready",
         "symbol",
         "duration_sec",
+        "child_started_at_utc",
+        "capture_started_at_utc",
+        "capture_ended_at_utc",
+        "finalization_started_at_utc",
+        "finalization_ended_at_utc",
+        "bundle_started_at_utc",
+        "bundle_ended_at_utc",
+        "child_ended_at_utc",
+        "capture_duration_sec",
+        "finalization_duration_sec",
+        "bundle_duration_sec",
+        "total_child_duration_sec",
         "max_future_gap_ms",
         "environment",
         "clock_offset_summary",
@@ -472,6 +503,35 @@ def run_phase42h_vps_preflight(
     return report
 
 
+def phase42h_capture_duration_guard_limit_sec(
+    requested_duration_sec: float | int | str | None,
+    *,
+    grace_sec: float = CAPTURE_DURATION_GUARD_GRACE_SEC,
+) -> float | None:
+    requested = _float_or_none(requested_duration_sec)
+    if requested is None or requested > CAPTURE_DURATION_GUARD_REQUESTED_MAX_SEC:
+        return None
+    return max(0.0, requested) + max(0.0, grace_sec)
+
+
+def phase42h_stage_timing_from_mapping(payload: dict[str, Any] | None) -> dict[str, Any]:
+    source = _dict(payload)
+    nested = _dict(source.get("stage_timing"))
+    combined = {**nested, **source}
+    timing: dict[str, Any] = {}
+    for field in PHASE42H_STAGE_TIMING_FIELDS:
+        value = combined.get(field)
+        if field.endswith("_duration_sec"):
+            timing[field] = _float_or_none(value)
+        else:
+            timing[field] = value if value is not None else None
+    return timing
+
+
+def empty_phase42h_stage_timing() -> dict[str, Any]:
+    return {field: None for field in PHASE42H_STAGE_TIMING_FIELDS}
+
+
 def run_phase42h_analysis(
     *,
     root: str | Path,
@@ -627,6 +687,7 @@ def build_phase42h_report(
         "fresh": None,
         "artifact_loaded": False,
     }
+    stage_timing = phase42h_stage_timing_from_mapping(capture)
     report = {
         "phase": PHASE,
         "status": "pass",
@@ -655,6 +716,7 @@ def build_phase42h_report(
         **semantics,
         "symbol": symbol.upper(),
         "duration_sec": float(capture.get("duration_sec", 0.0) or 0.0),
+        **stage_timing,
         "fresh_capture_performed": bool(capture.get("fresh_capture_performed", False)),
         "fixture_mode": bool(capture.get("fixture_mode", False)),
         "skip_capture": bool(capture.get("skip_capture", False)),
@@ -974,7 +1036,12 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
         primary = primary or classification
         if implementation:
             implementation_status = "fail"
-        if classification in {"FRESH_CAPTURE_NOT_PERFORMED", "FRESH_CAPTURE_DURATION_FAILURE"}:
+        if classification in {
+            "FRESH_CAPTURE_NOT_PERFORMED",
+            "FRESH_CAPTURE_DURATION_FAILURE",
+            "CAPTURE_DURATION_EXCEEDED",
+            "DURATION_GUARD_FAILURE",
+        }:
             fresh_capture_status = "fail"
         if classification in {"CLOCK_SYNC_FAILURE", "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE", "CLOCK_OFFSET_DRIFT_FAILURE", "SERVER_TIME_RTT_FAILURE"}:
             clock_sync_status = "fail"
@@ -1030,6 +1097,33 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
             add("fresh 30-minute capture was not performed", "FRESH_CAPTURE_NOT_PERFORMED")
         if final_duration_required and _num(evaluated.get("duration_sec")) < 1800:
             add("fresh capture duration_sec < 1800", "FRESH_CAPTURE_DURATION_FAILURE")
+        requested_duration = _float_or_none(evaluated.get("duration_sec"))
+        capture_duration = _float_or_none(evaluated.get("capture_duration_sec"))
+        if capture_duration is None:
+            capture_duration = _float_or_none(_dict(evaluated.get("capture")).get("capture_duration_sec"))
+        guard_limit = phase42h_capture_duration_guard_limit_sec(requested_duration)
+        if guard_limit is not None:
+            capture_payload = _dict(evaluated.get("capture"))
+            diagnostics = _dict(capture_payload.get("capture_diagnostics"))
+            if capture_payload.get("capture_duration_within_guard") is False or diagnostics.get("duration_guard_failure") is True:
+                add("capture duration guard stopped the capture loop", "DURATION_GUARD_FAILURE")
+            if capture_duration is not None and capture_duration > guard_limit:
+                add(
+                    f"capture duration_sec {capture_duration:.3f} exceeded requested duration_sec {float(requested_duration or 0.0):.3f} + {CAPTURE_DURATION_GUARD_GRACE_SEC:.0f}s grace",
+                    "CAPTURE_DURATION_EXCEEDED",
+                )
+            total_child_duration = _float_or_none(evaluated.get("total_child_duration_sec"))
+            if total_child_duration is not None and total_child_duration > guard_limit and capture_duration is None:
+                add(
+                    "total_child_duration_sec exceeded the requested capture guard but capture_duration_sec is missing",
+                    "DURATION_GUARD_FAILURE",
+                )
+    finalization_duration = _float_or_none(evaluated.get("finalization_duration_sec"))
+    if finalization_duration is not None and finalization_duration > FINALIZATION_SLOW_WARNING_SEC:
+        warnings.append("finalization_duration_sec_slow")
+    bundle_duration = _float_or_none(evaluated.get("bundle_duration_sec"))
+    if bundle_duration is not None and bundle_duration > BUNDLE_SLOW_WARNING_SEC:
+        warnings.append("bundle_duration_sec_slow")
     if evaluated.get("max_future_gap_ms") != REQUIRED_100MS_MAX_FUTURE_GAP_MS:
         add("max_future_gap_ms was relaxed", "HORIZON_100MS_POLICY_RELAXED", implementation=True)
     if evaluated.get("future_receive_lag_hard_gate_used") is not False:
@@ -1237,6 +1331,7 @@ def write_phase42h_artifacts(
         "typecheck_report_path": _display_path(PHASE42H_TYPECHECK_REPORT),
         "bundle_path": _display_path(bundle_path or (PHASE42H_PASS_BUNDLE if report.get("status") == "pass" else PHASE42H_FAIL_AUDIT_BUNDLE)),
         "bundle_created": bundle_created,
+        "stage_timing": {field: report.get(field) for field in PHASE42H_STAGE_TIMING_FIELDS},
     }
     _write_json(root_path / PHASE42H_SELF_CHECK_JSON, self_check)
     if report.get("status") != "pass":
@@ -1275,6 +1370,14 @@ def render_phase42h_markdown(report: dict[str, Any]) -> str:
         f"- Machine profile: `{environment.get('machine_profile')}`",
         f"- Run mode: `{environment.get('run_mode')}`",
         f"- Preflight passed: `{preflight.get('passed')}`",
+        "",
+        "## Stage Timing",
+        "",
+        f"- Child started: `{report.get('child_started_at_utc')}`",
+        f"- Capture: `{report.get('capture_started_at_utc')}` to `{report.get('capture_ended_at_utc')}` (`{report.get('capture_duration_sec')}` sec)",
+        f"- Finalization: `{report.get('finalization_started_at_utc')}` to `{report.get('finalization_ended_at_utc')}` (`{report.get('finalization_duration_sec')}` sec)",
+        f"- Bundle: `{report.get('bundle_started_at_utc')}` to `{report.get('bundle_ended_at_utc')}` (`{report.get('bundle_duration_sec')}` sec)",
+        f"- Child ended: `{report.get('child_ended_at_utc')}` (`{report.get('total_child_duration_sec')}` sec)",
         "",
         "## Embedded Phase 4.1",
         "",
@@ -1435,6 +1538,8 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
         "PHASE41_RUNTIME_STALE_RISK",
         "FRESH_CAPTURE_NOT_PERFORMED",
         "FRESH_CAPTURE_DURATION_FAILURE",
+        "CAPTURE_DURATION_EXCEEDED",
+        "DURATION_GUARD_FAILURE",
         "CLOCK_SYNC_FAILURE",
         "CLOCK_OFFSET_SAMPLE_QUALITY_FAILURE",
         "CLOCK_OFFSET_DRIFT_FAILURE",
