@@ -2,6 +2,7 @@ import argparse
 import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +109,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--rest-url",
         default="https://api.binance.com",
         help="Binance REST base URL for depth snapshots.",
+    )
+    orderbook_capture.add_argument(
+        "--latency-profile-samples",
+        default=None,
+        help="Optional latency profile JSONL output path.",
     )
 
     poly_monitor = subparsers.add_parser(
@@ -402,13 +408,16 @@ async def run(argv: Sequence[str] | None = None) -> None:
         await run_binance_monitor(args)
         return
     if args.command == "orderbook-quality-capture":
+        paths = OrderbookPhase41Paths()
+        if args.latency_profile_samples:
+            paths = replace(paths, latency_profile_samples=Path(args.latency_profile_samples))
         summary = await run_orderbook_phase41_capture(
             symbol=args.symbol,
             duration_sec=args.duration_sec,
             depth_n=args.depth_n,
             ws_url=args.ws_url,
             rest_url=args.rest_url,
-            paths=OrderbookPhase41Paths(),
+            paths=paths,
         )
         print(orjson.dumps(summary, option=orjson.OPT_INDENT_2).decode("utf-8"), flush=True)
         return

@@ -276,7 +276,13 @@ async def _run_capture_with_clock_samples(
     samples: list[dict[str, Any]] = []
     samples.append(await _sample_binance_server_time(sample_id=1, phase="before_capture"))
     capture_task = asyncio.create_task(
-        _run_multi_feed_capture(symbol=symbol, duration_sec=duration_sec, depth_n=depth_n, root=SOURCE_ROOT)
+        _run_multi_feed_capture(
+            symbol=symbol,
+            duration_sec=duration_sec,
+            depth_n=depth_n,
+            root=SOURCE_ROOT,
+            latency_profile_samples_path=SOURCE_ROOT / LATENCY_PROFILE_SAMPLES,
+        )
     )
     periodic_task = asyncio.create_task(_periodic_server_time_samples(samples, capture_task, interval_sec=300.0))
     capture_code, diagnostics = await capture_task

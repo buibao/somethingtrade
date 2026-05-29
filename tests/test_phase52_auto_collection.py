@@ -400,6 +400,22 @@ def test_phase52_session_quality_gate_rejects_low_latency_false() -> None:
     assert "low_latency_ready" in quality["failure_reasons"]
 
 
+def test_phase52_session_quality_rejects_invalid_latency_stage_profile_artifact() -> None:
+    report = synthetic_phase42h_runtime_report(requested_duration_sec=7200)
+    report["latency_profile_status"] = "fail"
+    report["latency_stage_profile_artifact"] = {
+        "checked": True,
+        "valid": False,
+        "errors": ["latency stage profile artifact missing"],
+    }
+
+    quality = evaluate_session_quality(report, bundle_sha_valid=True)
+
+    assert quality["research_eligible"] is False
+    assert "latency_profile_status_pass" in quality["failure_reasons"]
+    assert "latency_stage_profile_artifact_valid" in quality["failure_reasons"]
+
+
 def test_phase52_session_quality_gate_rejects_clock_sync_fail() -> None:
     quality = evaluate_session_quality(synthetic_phase42h_runtime_report(requested_duration_sec=1, simulate_failure="clock_sync_fail"), bundle_sha_valid=True)
     assert quality["research_eligible"] is False

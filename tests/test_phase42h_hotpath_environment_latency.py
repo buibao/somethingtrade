@@ -126,21 +126,34 @@ def _leakage() -> dict[str, Any]:
 
 
 def _latency_profile() -> dict[str, Any]:
+    metrics = {metric: {"count": 1, "p50": 0.01, "p95": 0.01, "p99": 0.01, "max": 0.01} for metric in hotpath.LATENCY_METRIC_NAMES}
+    metrics["book_apply_duration_ms"] = {"count": 1, "p50": 0.02, "p95": 0.02, "p99": 0.02, "max": 0.02}
+    metrics["file_write_duration_ms"] = {"count": 1, "p50": 0.03, "p95": 0.03, "p99": 0.03, "max": 0.03}
+    metrics["end_to_end_local_hot_path_ms"] = {"count": 1, "p50": 0.10, "p95": 0.10, "p99": 0.10, "max": 0.10}
+    stage_availability = {
+        stage: {
+            "available_count": 0 if stage == "socket_recv_monotonic_ns" else 1,
+            "stage_not_available_count": 1 if stage == "socket_recv_monotonic_ns" else 0,
+        }
+        for stage in hotpath.REQUIRED_STAGE_NAMES
+    }
     return {
+        "schema_version": hotpath.PHASE42H_LATENCY_STAGE_PROFILE_SCHEMA_VERSION,
+        "phase": "4.2H",
         "performed": True,
         "sample_count": 1,
+        "stage_availability": stage_availability,
+        "unavailable_stages": {"socket_recv_monotonic_ns": "stage_not_available"},
         "socket_recv_monotonic_ns": "stage_not_available",
         "earliest_available_receive_stage": "raw_ws_callback_monotonic_ns",
-        "metrics": {
-            "parse_duration_ms": {"count": 1, "p95": 0.01, "p99": 0.01},
-            "book_apply_duration_ms": {"count": 1, "p95": 0.02, "p99": 0.02},
-            "input_queue_put_duration_ms": {"count": 1, "p95": 0.01, "p99": 0.01},
-            "file_write_duration_ms": {"count": 1, "p95": 0.03, "p99": 0.03},
-            "end_to_end_local_hot_path_ms": {"count": 1, "p95": 0.10, "p99": 0.10},
-        },
+        "metrics": metrics,
+        "missing_metrics": [],
+        "queue_depth_from_latency_samples": {"count": 1, "p50": 1.0, "p95": 1.0, "p99": 1.0, "max": 1.0},
         "disk_write_on_hot_path": False,
         "debug_logging_on_hot_path": False,
         "batch_writer_enabled": True,
+        "stage_profile_path": "data/dataset/phase_4_2h_latency_profile_samples.jsonl",
+        "required_latency_profile_samples_path": "data/dataset/phase_4_2h_latency_profile_samples.jsonl",
     }
 
 
@@ -607,6 +620,188 @@ def test_phase42h_cli_without_clean_for_fresh_capture_fails(tmp_path: Path, monk
     assert report["primary_failure"] == "ARTIFACT_CLEANUP_FAILURE"
 
 
+def test_phase42h_cli_rejects_evaluate_existing_without_skip_capture(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        phase42h_cli.main(
+            [
+                "--root",
+                str(tmp_path),
+                "--duration-sec",
+                "7200",
+                "--environment-name",
+                "test",
+                "--environment-region",
+                "local",
+                "--run-mode",
+                "repaired_eval",
+                "--evaluate-existing-artifacts",
+                "--skip-pytest",
+                "--no-bundle",
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_phase42h_cli_rejects_evaluate_existing_with_clean(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        phase42h_cli.main(
+            [
+                "--root",
+                str(tmp_path),
+                "--duration-sec",
+                "7200",
+                "--environment-name",
+                "test",
+                "--environment-region",
+                "local",
+                "--run-mode",
+                "repaired_eval",
+                "--skip-capture",
+                "--evaluate-existing-artifacts",
+                "--clean",
+                "--skip-pytest",
+                "--no-bundle",
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_phase42h_cli_skip_capture_without_evaluate_existing_still_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_required_gitignore(tmp_path)
+    monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
+    monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
+
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "7200",
+            "--environment-name",
+            "test",
+            "--environment-region",
+            "local",
+            "--run-mode",
+            "vps_final",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--skip-capture",
+            "--no-bundle",
+        ]
+    )
+
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert report["primary_failure"] == "FRESH_CAPTURE_NOT_PERFORMED"
+    assert report["fixture_mode"] is True
+
+
+def test_phase42h_cli_evaluate_existing_artifacts_passes_valid_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_existing_phase42h_artifacts(tmp_path, line_count=48)
+    monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
+    monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
+
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "7200",
+            "--environment-name",
+            "phase52_vps_repaired_eval",
+            "--environment-region",
+            "unknown",
+            "--run-mode",
+            "repaired_eval",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--skip-capture",
+            "--evaluate-existing-artifacts",
+            "--no-bundle",
+        ]
+    )
+
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert report["evaluation_mode"] == "existing_artifacts"
+    assert report["fresh_capture_required"] is False
+    assert report["fresh_capture_performed"] is False
+    assert report["skip_capture"] is True
+    assert report["fixture_mode"] is False
+    assert report["latency_profile_status"] == "pass"
+    assert report["latency_stage_profile_artifact"]["valid"] is True
+    assert report["hot_path_latency_summary"]["sample_count"] == 48
+
+
+def test_phase42h_cli_evaluate_existing_fails_empty_42h_latency_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_existing_phase42h_artifacts(tmp_path, line_count=24)
+    (tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
+    monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
+
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "7200",
+            "--environment-name",
+            "phase52_vps_repaired_eval",
+            "--environment-region",
+            "unknown",
+            "--run-mode",
+            "repaired_eval",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--skip-capture",
+            "--evaluate-existing-artifacts",
+            "--no-bundle",
+        ]
+    )
+
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert report["evaluation_mode"] == "existing_artifacts"
+    assert report["fixture_mode"] is False
+    assert report["primary_failure"] == "LATENCY_PROFILE_MISSING"
+    assert report["latency_profile_status"] == "fail"
+
+
+def test_phase42h_cli_evaluate_existing_ignores_42fg_latency_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_existing_phase42h_artifacts(tmp_path, line_count=24)
+    phase42h = tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl"
+    phase42fg = tmp_path / "data/dataset/phase_4_2fg_latency_profile_samples.jsonl"
+    phase42fg.write_bytes(phase42h.read_bytes())
+    phase42h.unlink()
+    monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
+    monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
+
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "7200",
+            "--environment-name",
+            "phase52_vps_repaired_eval",
+            "--environment-region",
+            "unknown",
+            "--run-mode",
+            "repaired_eval",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--skip-capture",
+            "--evaluate-existing-artifacts",
+            "--no-bundle",
+        ]
+    )
+
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert "LATENCY_PROFILE_MISSING" in report["failure_classifications"]
+    assert report["hot_path_latency_summary"]["stage_profile_path"].endswith("phase_4_2h_latency_profile_samples.jsonl")
+
+
 def test_phase42h_capture_duration_stops_near_requested_duration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def slow_capture(**_kwargs: Any) -> tuple[int, dict[str, Any]]:
         await asyncio.sleep(1.0)
@@ -814,6 +1009,141 @@ def test_latency_stage_profile_schema_and_stage_calculations(tmp_path: Path) -> 
     assert profile["metrics"]["input_queue_put_to_sample_emit_ms"]["p95"] == pytest.approx(0.2)
     assert "sample_emit_to_queue_put_start_ms" not in profile["metrics"]
     assert profile["metrics"]["file_write_duration_ms"]["p95"] == pytest.approx(0.3)
+
+
+def test_medium_session_valid_phase42h_latency_stage_profile_passes(tmp_path: Path) -> None:
+    session_root = tmp_path / "data/phase_5_2/sessions/session_005_medium_2h"
+    report = _fresh_phase42h_report()
+    report["duration_sec"] = 7200.0
+    report["capture"]["duration_sec"] = 7200.0
+
+    write_phase42h_artifacts(report, root=session_root, pytest_output="pytest ok", bundle_created=False)
+
+    payload = json.loads((session_root / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "pass"
+    assert payload["latency_profile_status"] == "pass"
+    assert payload["latency_stage_profile_artifact"]["valid"] is True
+    assert payload["latency_stage_profile_artifact"]["root"] == str(session_root.resolve()).replace("\\", "/")
+
+
+def test_phase42h_latency_stage_profile_empty_or_invalid_schema_fails(tmp_path: Path) -> None:
+    session_root = tmp_path / "data/phase_5_2/sessions/session_005_medium_2h"
+    profile_path = session_root / "data/debug/phase_4_2h_latency_stage_profile.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text("", encoding="utf-8")
+
+    empty_validation = hotpath.validate_phase42h_latency_stage_profile_artifact(session_root, report=_fresh_phase42h_report())
+    assert empty_validation["valid"] is False
+
+    profile_path.write_text(json.dumps({"performed": True, "sample_count": 1}), encoding="utf-8")
+    invalid_validation = hotpath.validate_phase42h_latency_stage_profile_artifact(session_root, report=_fresh_phase42h_report())
+    report = _fresh_phase42h_report()
+    report["latency_stage_profile_artifact"] = invalid_validation
+    evaluated = evaluate_phase42h_report(report)
+    assert invalid_validation["valid"] is False
+    assert evaluated["status"] == "fail"
+    assert evaluated["primary_failure"] == "LATENCY_PROFILE_MISSING"
+    assert "latency stage profile missing" in evaluated["hard_fail_reasons"]
+
+
+def test_phase42h_legacy_42fg_latency_samples_do_not_satisfy_requirement(tmp_path: Path) -> None:
+    _write_phase42h_streaming_inputs(tmp_path, line_count=20)
+    legacy_path = tmp_path / "data/dataset/phase_4_2fg_latency_profile_samples.jsonl"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_text(json.dumps({"performed": True, "sample_count": 1}) + "\n", encoding="utf-8")
+    clock_samples = [
+        build_server_time_sample(
+            sample_id=1,
+            phase="before_capture",
+            local_wall_before_request_ms=1_700_000_000_000.0,
+            local_wall_after_response_ms=1_700_000_000_004.0,
+            binance_server_time_ms=1_700_000_000_002.0,
+        ),
+        build_server_time_sample(
+            sample_id=2,
+            phase="after_capture",
+            local_wall_before_request_ms=1_700_000_002_000.0,
+            local_wall_after_response_ms=1_700_000_002_004.0,
+            binance_server_time_ms=1_700_000_002_002.0,
+        ),
+    ]
+
+    report = hotpath.run_phase42h_analysis(
+        root=tmp_path,
+        symbol="BTCUSDT",
+        clock_offset_samples=clock_samples,
+        environment={"environment_name": "test"},
+        capture={
+            "duration_sec": 1800.0,
+            "fresh_capture_performed": True,
+            "fixture_mode": False,
+            "skip_capture": False,
+            "phase41_runtime_report": _phase41(),
+            "capture_diagnostics": {"reference_writer_batch_report": _writer_report()},
+        },
+        cleanup_report={"cleanup_performed": True, "errors": []},
+        gitignore_validation={"passed": True},
+        fresh_capture_required=False,
+    )
+
+    assert (tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl").exists() is False
+    assert "LATENCY_PROFILE_MISSING" in report["failure_classifications"]
+    assert report["latency_profile_status"] == "fail"
+
+
+def test_phase42h_latency_stage_profile_validation_uses_session_root_not_repo_root(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    session_root = repo_root / "data/phase_5_2/sessions/session_005_medium_2h"
+    repo_profile = repo_root / "data/debug/phase_4_2h_latency_stage_profile.json"
+    repo_profile.parent.mkdir(parents=True, exist_ok=True)
+    repo_profile.write_text(json.dumps(_latency_profile()), encoding="utf-8")
+
+    validation = hotpath.validate_phase42h_latency_stage_profile_artifact(session_root, report=_fresh_phase42h_report())
+
+    assert validation["valid"] is False
+    assert validation["root"] == str(session_root.resolve()).replace("\\", "/")
+    assert validation["absolute_path"] == str((session_root / "data/debug/phase_4_2h_latency_stage_profile.json").resolve()).replace("\\", "/")
+    assert "latency stage profile artifact missing" in validation["errors"]
+
+
+def test_phase42h_capture_writes_latency_samples_to_42h_path_not_42fg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, Path] = {}
+
+    async def fake_depth_capture(**kwargs: Any) -> dict[str, Any]:
+        paths = kwargs["paths"]
+        observed["latency_profile_samples"] = paths.latency_profile_samples
+        paths.latency_profile_samples.parent.mkdir(parents=True, exist_ok=True)
+        paths.latency_profile_samples.write_text("{}\n", encoding="utf-8")
+        return _phase41()
+
+    async def fake_references(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "connected": True,
+            "message_count_by_stream": {},
+            "parsed_count_by_source": {},
+            "parse_error_count_by_source": {},
+            "reference_writer_batch_report": _writer_report(),
+        }
+
+    monkeypatch.setattr(phase42h_cli, "run_orderbook_phase41_capture", fake_depth_capture)
+    monkeypatch.setattr(phase42h_cli, "_capture_references", fake_references)
+
+    code, _diagnostics = asyncio.run(
+        phase42h_cli._run_phase42h_multi_feed_capture(
+            root=tmp_path,
+            symbol="BTCUSDT",
+            duration_sec=1.0,
+            depth_n=20,
+            writer_batch_size=512,
+            writer_flush_interval_ms=100.0,
+            writer_queue_max_size=1024,
+        )
+    )
+
+    assert code == 0
+    assert observed["latency_profile_samples"] == tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl"
+    assert (tmp_path / "data/dataset/phase_4_2h_latency_profile_samples.jsonl").exists()
+    assert not (tmp_path / "data/dataset/phase_4_2fg_latency_profile_samples.jsonl").exists()
 
 
 def test_queue_backpressure_report_schema_and_hard_fail() -> None:
@@ -1493,6 +1823,70 @@ def _patch_phase42h_cli_fixture(monkeypatch: pytest.MonkeyPatch, *, source_root:
     monkeypatch.setattr(phase42h_cli, "_run_capture_with_clock_samples", fake_capture)
     monkeypatch.setattr(phase42h_cli, "run_phase42h_analysis", fake_analysis)
     monkeypatch.setattr(phase42h_cli, "create_phase42h_dataset_zip", lambda root: root / LATENCY_PROFILE_DATASETS_ZIP)
+
+
+def _seed_existing_phase42h_artifacts(root: Path, *, line_count: int) -> None:
+    _write_required_gitignore(root)
+    _write_phase42h_streaming_inputs(root, line_count=line_count)
+    _write_phase42h_latency_profile_samples(root, line_count=line_count)
+    clock_samples = [
+        build_server_time_sample(
+            sample_id=1,
+            phase="before_capture",
+            local_wall_before_request_ms=1_700_000_000_000.0,
+            local_wall_after_response_ms=1_700_000_000_004.0,
+            binance_server_time_ms=1_700_000_000_002.0,
+        ),
+        build_server_time_sample(
+            sample_id=2,
+            phase="after_capture",
+            local_wall_before_request_ms=1_700_000_012_000.0,
+            local_wall_after_response_ms=1_700_000_012_004.0,
+            binance_server_time_ms=1_700_000_012_002.0,
+        ),
+    ]
+    clock_path = root / hotpath.PHASE42H_CLOCK_OFFSET_SAMPLES
+    clock_path.parent.mkdir(parents=True, exist_ok=True)
+    clock_path.write_text(
+        json.dumps({"samples": clock_samples, "summary": compute_clock_offset_summary(clock_samples)}),
+        encoding="utf-8",
+    )
+    output_paths = {
+        "clean_samples": "data/dataset/orderbook_clean_samples.jsonl",
+        "latency_profile_samples": "data/dataset/phase_4_2h_latency_profile_samples.jsonl",
+        "bookticker": "data/dataset/bookticker_reference_quotes.jsonl",
+        "trade": "data/dataset/trade_reference_events.jsonl",
+        "aggtrade": "data/dataset/aggtrade_reference_events.jsonl",
+    }
+    diagnostics = {
+        "fresh_capture_performed": False,
+        "fixture_mode": False,
+        "skip_capture": True,
+        "evaluation_mode": "existing_artifacts",
+        "duration_sec": 7200.0,
+        "symbol": "BTCUSDT",
+        "requested_streams": phase42h_cli.required_streams("BTCUSDT"),
+        "message_count_by_stream": {stream: line_count for stream in phase42h_cli.required_streams("BTCUSDT")},
+        "parsed_count_by_source": {
+            "depth_mid": line_count,
+            "bookTicker_mid": line_count,
+            "trade_price": line_count,
+            "aggTrade_price": line_count,
+        },
+        "parse_error_count_by_source": {
+            "depth_mid": 0,
+            "bookTicker_mid": 0,
+            "trade_price": 0,
+            "aggTrade_price": 0,
+        },
+        "output_file_paths": output_paths,
+        "output_file_sizes_bytes": {key: (root / relative).stat().st_size for key, relative in output_paths.items()},
+        "phase41_runtime_report": _phase41(),
+        "reference_writer_batch_report": _writer_report(),
+    }
+    diagnostics_path = root / hotpath.PHASE42H_CAPTURE_DIAGNOSTICS
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_path.write_text(json.dumps(diagnostics), encoding="utf-8")
 
 
 def _write_simple_jsonl(path: Path, *, line_count: int) -> None:

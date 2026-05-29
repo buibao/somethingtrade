@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime, timezone
 import importlib.util
 import json
@@ -37,9 +38,11 @@ from app.research.hotpath_environment_latency import (  # noqa: E402
     LATENCY_PROFILE_SAMPLES,
     PHASE42H_CAPTURE_DIAGNOSTICS,
     PHASE42H_CLEANUP_REPORT,
+    PHASE42H_CLOCK_OFFSET_SAMPLES,
     PHASE42H_ENVIRONMENT_METADATA,
     PHASE42H_FAIL_AUDIT_BUNDLE,
     PHASE42H_PASS_BUNDLE,
+    PHASE42H_REPORT_JSON,
     PHASE42H_STAGE_TIMING_FIELDS,
     PHASE42H_TYPECHECK_REPORT,
     PHASE42H_VPS_PREFLIGHT_REPORT,
@@ -82,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--clean", action="store_true")
     parser.add_argument("--skip-capture", action="store_true")
     parser.add_argument("--allow-fixture-mode", action="store_true")
+    parser.add_argument("--evaluate-existing-artifacts", action="store_true")
     parser.add_argument("--skip-pytest", action="store_true")
     parser.add_argument("--root", default=str(SOURCE_ROOT))
     parser.add_argument("--input-clean-samples", default="data/dataset/orderbook_clean_samples.jsonl")
@@ -97,6 +101,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
+    if args.evaluate_existing_artifacts:
+        if not args.skip_capture:
+            parser.error("--evaluate-existing-artifacts requires --skip-capture")
+        if args.clean:
+            parser.error("--evaluate-existing-artifacts rejects --clean")
+        _validate_existing_artifact_paths_under_root(parser, args=args, root=root)
     stage_timing = _new_stage_timing()
     memory_telemetry = new_memory_telemetry()
     record_memory_stage(memory_telemetry, "process_start")
@@ -223,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
 
     capture = _capture_summary(args, fresh=False, cleanup_report=cleanup_report)
     clock_samples: list[dict[str, Any]] = []
-    if args.skip_capture and not args.allow_fixture_mode:
+    if args.skip_capture and not args.allow_fixture_mode and not args.evaluate_existing_artifacts:
         report = _failure_report(
             args=args,
             environment=environment,
@@ -260,8 +270,12 @@ def main(argv: list[str] | None = None) -> int:
     _mark_stage_start(stage_timing, "capture")
     record_memory_stage(memory_telemetry, "capture_start")
     if args.skip_capture:
-        clock_samples = _fixture_clock_samples()
-        capture.update(_fixture_capture(args, root=root))
+        if args.evaluate_existing_artifacts:
+            clock_samples = _existing_artifact_clock_samples(root)
+            capture.update(_existing_artifact_capture(args, root=root))
+        else:
+            clock_samples = _fixture_clock_samples()
+            capture.update(_fixture_capture(args, root=root))
     else:
         try:
             clock_samples, capture_code, capture_diagnostics = asyncio.run(
@@ -350,6 +364,21 @@ def main(argv: list[str] | None = None) -> int:
         preflight_report=preflight_report,
         memory_telemetry=memory_telemetry,
     )
+    if args.evaluate_existing_artifacts:
+        report["evaluation_mode"] = "existing_artifacts"
+        report["fresh_capture_required"] = False
+        report["fresh_capture_performed"] = False
+        report["skip_capture"] = True
+        report["fixture_mode"] = False
+        report["capture"] = {
+            **_dict(report.get("capture")),
+            "evaluation_mode": "existing_artifacts",
+            "fresh_capture_required": False,
+            "fresh_capture_performed": False,
+            "skip_capture": True,
+            "fixture_mode": False,
+        }
+        report = evaluate_phase42h_report(report)
     _mark_stage_end(stage_timing, "finalization")
     _apply_stage_timing(report, stage_timing)
     record_memory_stage(memory_telemetry, "finalization_end")
@@ -446,7 +475,10 @@ async def _run_phase42h_multi_feed_capture(
         target = root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("", encoding="utf-8")
-    paths = orderbook_phase41_paths_for_root(root)
+    paths = replace(
+        orderbook_phase41_paths_for_root(root),
+        latency_profile_samples=root / LATENCY_PROFILE_SAMPLES,
+    )
     depth_task = asyncio.create_task(
         run_orderbook_phase41_capture(
             symbol=symbol,
@@ -881,8 +913,10 @@ def _failure_report(
     stage_timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     timing = phase42h_stage_timing_from_mapping(stage_timing)
+    evaluate_existing = bool(getattr(args, "evaluate_existing_artifacts", False))
     report = {
         "phase": "4.2H",
+        "evaluation_mode": "existing_artifacts" if evaluate_existing else "fresh_capture",
         "status": "fail",
         "implementation_status": "fail" if classification in {"TEST_FAILURE", "TYPECHECK_FAILURE"} else "pass",
         "fresh_capture_status": "fail",
@@ -908,11 +942,11 @@ def _failure_report(
         "duration_sec": float(args.duration_sec),
         **timing,
         "fresh_capture_performed": False,
-        "fixture_mode": bool(args.skip_capture),
+        "fixture_mode": bool(args.skip_capture and not evaluate_existing),
         "skip_capture": bool(args.skip_capture),
         "max_future_gap_ms": 100,
         "future_receive_lag_hard_gate_used": False,
-        "fresh_capture_required": not bool(args.skip_capture),
+        "fresh_capture_required": False if evaluate_existing else not bool(args.skip_capture),
         "capture": {
             **_capture_summary(args, fresh=False, cleanup_report=cleanup_report),
             "stage_timing": timing,
@@ -1084,10 +1118,12 @@ def _capture_summary(
     fresh: bool,
     cleanup_report: dict[str, Any],
 ) -> dict[str, Any]:
+    evaluate_existing = bool(getattr(args, "evaluate_existing_artifacts", False))
     return {
         "fresh_capture_performed": fresh,
-        "fixture_mode": bool(args.skip_capture),
+        "fixture_mode": bool(args.skip_capture and not evaluate_existing),
         "skip_capture": bool(args.skip_capture),
+        "evaluation_mode": "existing_artifacts" if evaluate_existing else ("fixture" if args.skip_capture else "fresh_capture"),
         "cleanup_performed": bool(cleanup_report.get("cleanup_performed", False)),
         "duration_sec": float(args.duration_sec),
         "depth_stream": f"{args.symbol.lower()}@depth@100ms",
@@ -1104,6 +1140,82 @@ def _capture_summary(
             "bookTicker_mid": 0,
             "trade_price": 0,
             "aggTrade_price": 0,
+        },
+    }
+
+
+def _validate_existing_artifact_paths_under_root(
+    parser: argparse.ArgumentParser,
+    *,
+    args: argparse.Namespace,
+    root: Path,
+) -> None:
+    for flag, value in (
+        ("--input-clean-samples", args.input_clean_samples),
+        ("--input-bookticker", args.input_bookticker),
+        ("--input-trade", args.input_trade),
+        ("--input-aggtrade", args.input_aggtrade),
+        ("--input-latency-profile", args.input_latency_profile),
+        ("--output-corrected-labels", args.output_corrected_labels),
+    ):
+        resolved = _resolve(root, value).resolve()
+        if not _is_within(resolved, root):
+            parser.error(f"{flag} must resolve under --root when --evaluate-existing-artifacts is used")
+
+
+def _existing_artifact_clock_samples(root: Path) -> list[dict[str, Any]]:
+    payload = _read_json(root / PHASE42H_CLOCK_OFFSET_SAMPLES)
+    samples = payload.get("samples")
+    if not isinstance(samples, list):
+        return []
+    return [sample for sample in samples if isinstance(sample, dict)]
+
+
+def _existing_artifact_capture(args: argparse.Namespace, *, root: Path) -> dict[str, Any]:
+    diagnostics = _read_json(root / PHASE42H_CAPTURE_DIAGNOSTICS)
+    previous_report = _read_json(root / PHASE42H_REPORT_JSON)
+    phase41_report = _dict(diagnostics.get("phase41_runtime_report")) or _dict(previous_report.get("phase41_runtime_report"))
+    if phase41_report and "phase41_runtime_report" not in diagnostics:
+        diagnostics["phase41_runtime_report"] = phase41_report
+    reference_writer = _dict(_dict(previous_report.get("writer_batch_report")).get("reference_writer"))
+    if reference_writer and "reference_writer_batch_report" not in diagnostics:
+        diagnostics["reference_writer_batch_report"] = reference_writer
+    diagnostic_errors = validate_capture_diagnostics(diagnostics, symbol=args.symbol) if diagnostics else ["capture diagnostics missing"]
+    requested_streams = diagnostics.get("requested_streams") if isinstance(diagnostics.get("requested_streams"), list) else required_streams(args.symbol)
+    parsed_counts = _dict(diagnostics.get("parsed_count_by_source"))
+    parsed_counts = {
+        "depth_mid": parsed_counts.get("depth_mid", _count_jsonl(_resolve(root, args.input_clean_samples))),
+        "bookTicker_mid": parsed_counts.get("bookTicker_mid", _count_jsonl(_resolve(root, args.input_bookticker))),
+        "trade_price": parsed_counts.get("trade_price", _count_jsonl(_resolve(root, args.input_trade))),
+        "aggTrade_price": parsed_counts.get("aggTrade_price", _count_jsonl(_resolve(root, args.input_aggtrade))),
+    }
+    diagnostics = {
+        **diagnostics,
+        "fresh_capture_performed": False,
+        "fixture_mode": False,
+        "skip_capture": True,
+        "evaluation_mode": "existing_artifacts",
+        "symbol": args.symbol.upper(),
+        "duration_sec": float(previous_report.get("duration_sec", args.duration_sec) or args.duration_sec),
+        "requested_streams": requested_streams,
+        "parsed_count_by_source": parsed_counts,
+    }
+    return {
+        "fresh_capture_performed": False,
+        "fresh_capture_required": False,
+        "fixture_mode": False,
+        "skip_capture": True,
+        "evaluation_mode": "existing_artifacts",
+        "capture_exit_code": None,
+        "capture_diagnostics": diagnostics,
+        "capture_diagnostic_errors": diagnostic_errors,
+        "duration_sec": float(previous_report.get("duration_sec", args.duration_sec) or args.duration_sec),
+        "depth_clean_sample_count": _count_jsonl(_resolve(root, args.input_clean_samples)),
+        "latency_profile_sample_count": _count_jsonl(_resolve(root, args.input_latency_profile)),
+        "reference_event_counts": {
+            "bookTicker_mid": _count_jsonl(_resolve(root, args.input_bookticker)),
+            "trade_price": _count_jsonl(_resolve(root, args.input_trade)),
+            "aggTrade_price": _count_jsonl(_resolve(root, args.input_aggtrade)),
         },
     }
 
@@ -1196,6 +1308,14 @@ def _resolve(root: Path, path: str | Path) -> Path:
     return candidate if candidate.is_absolute() else root / candidate
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def _copy_if_exists(source: Path, target: Path) -> None:
     if not source.exists():
         return
@@ -1227,6 +1347,17 @@ def _read_text(path: str | Path) -> str:
     if not target.exists():
         return ""
     return target.read_text(encoding="utf-8", errors="ignore")
+
+
+def _read_json(path: str | Path) -> dict[str, Any]:
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        return {}
+    try:
+        value = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _file_size(path: Path) -> int:

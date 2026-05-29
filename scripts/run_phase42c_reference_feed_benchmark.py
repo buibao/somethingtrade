@@ -346,6 +346,7 @@ async def _run_multi_feed_capture(
     duration_sec: float,
     depth_n: int,
     root: Path,
+    latency_profile_samples_path: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     for path in (BOOKTICKER_REFERENCE_QUOTES, TRADE_REFERENCE_EVENTS, AGGTRADE_REFERENCE_EVENTS):
         target = SOURCE_ROOT / path
@@ -360,7 +361,7 @@ async def _run_multi_feed_capture(
     runtime_stdout_path.parent.mkdir(parents=True, exist_ok=True)
     runtime_stdout = runtime_stdout_path.open("w", encoding="utf-8")
     runtime_stderr = runtime_stderr_path.open("w", encoding="utf-8")
-    depth_process = await asyncio.create_subprocess_exec(
+    depth_command = [
         sys.executable,
         "-X",
         "utf8",
@@ -373,6 +374,11 @@ async def _run_multi_feed_capture(
         str(duration_sec),
         "--depth-n",
         str(depth_n),
+    ]
+    if latency_profile_samples_path is not None:
+        depth_command.extend(["--latency-profile-samples", str(latency_profile_samples_path)])
+    depth_process = await asyncio.create_subprocess_exec(
+        *depth_command,
         cwd=SOURCE_ROOT / "bot",
         env=env,
         stdout=runtime_stdout,

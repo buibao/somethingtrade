@@ -394,11 +394,14 @@ def load_session_plan(*, plan_name: str, session_plan_json: Path | None = None) 
 def evaluate_session_quality(runtime_report: dict[str, Any], *, bundle_sha_valid: bool) -> dict[str, Any]:
     phase41 = _dict(runtime_report.get("phase41_runtime_report"))
     clock = _dict(runtime_report.get("clock_offset_summary"))
+    latency_artifact = _dict(runtime_report.get("latency_stage_profile_artifact"))
     phase41_status = phase41.get("phase_4_1_status") or runtime_report.get("phase41_runtime_report_status")
     duration_quality = _phase42h_duration_quality(runtime_report)
     checks = {
         "status_pass": runtime_report.get("status") == "pass",
         "primary_failure_none": runtime_report.get("primary_failure") is None,
+        "latency_profile_status_pass": runtime_report.get("latency_profile_status", "pass") == "pass",
+        "latency_stage_profile_artifact_valid": latency_artifact.get("valid", True) is True,
         "phase41_status_pass": phase41_status == "pass",
         "clock_sync_status_pass": runtime_report.get("clock_sync_status") == "pass",
         "clock_offset_drift_valid": clock.get("clock_offset_drift_valid") is True,

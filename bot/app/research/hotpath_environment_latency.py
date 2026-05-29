@@ -82,6 +82,7 @@ PHASE42H_STAGE_TIMING_FIELDS = (
 LATENCY_PROFILE_SAMPLES = Path("data/dataset/phase_4_2h_latency_profile_samples.jsonl")
 CORRECTED_TIME_PROTOCOL_LABELS = Path("data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl")
 LATENCY_PROFILE_DATASETS_ZIP = Path("data/dataset/phase_4_2h_latency_profile_datasets.zip")
+PHASE42H_LATENCY_STAGE_PROFILE_SCHEMA_VERSION = "phase_4_2h_latency_stage_profile_v1"
 
 PHASE42H_REPORT_JSON = Path("data/reports/phase_4_2h_hotpath_environment_latency_report.json")
 PHASE42H_REPORT_MD = Path("data/reports/phase_4_2h_hotpath_environment_latency_report.md")
@@ -681,6 +682,7 @@ def build_phase42h_report(
     )
     warnings = set(_readiness_warnings(semantics, clock_offset_summary, latency_profile, queue_report, writer_report, sources))
     phase41_status = phase41_runtime_report_status(phase41_report)
+    latency_profile_validation = validate_phase42h_latency_profile_summary(latency_profile)
     phase41_source = phase41_runtime_report_source or {
         "source": "direct_argument",
         "path": "data/reports/phase_4_1_orderbook_quality_report.json",
@@ -690,12 +692,13 @@ def build_phase42h_report(
     stage_timing = phase42h_stage_timing_from_mapping(capture)
     report = {
         "phase": PHASE,
+        "evaluation_mode": str(capture.get("evaluation_mode") or ("fresh_capture" if fresh_capture_required else ("fixture" if capture.get("fixture_mode") else "manual_existing_artifacts"))),
         "status": "pass",
         "implementation_status": "pass",
         "fresh_capture_status": "pass",
         "clock_sync_status": "pass" if clock_sanity.get("clock_sanity_valid") is True else "fail",
         "readiness_semantics_status": "pass",
-        "latency_profile_status": "pass" if int(_num(latency_profile.get("sample_count"))) > 0 else "fail",
+        "latency_profile_status": "pass" if latency_profile_validation["valid"] is True else "fail",
         "hot_path_decoupling_status": "pass"
         if latency_profile.get("disk_write_on_hot_path") is False
         and latency_profile.get("debug_logging_on_hot_path") is False
@@ -741,6 +744,7 @@ def build_phase42h_report(
         "protocol_summary": protocol_summary,
         "corrected_hybrid_summary": corrected_summary,
         "receive_lag_summary": build_receive_lag_raw_vs_corrected(sources),
+        "latency_profile_validation": latency_profile_validation,
         "hot_path_latency_summary": latency_profile,
         "queue_backpressure_summary": queue_report,
         "writer_batch_report": writer_report,
@@ -771,11 +775,196 @@ def build_phase42h_report(
 
 
 def build_latency_stage_profile(samples_path: str | Path) -> dict[str, Any]:
-    return build_latency_stage_profile_streaming(
+    profile = build_latency_stage_profile_streaming(
         samples_path,
         required_stage_names=REQUIRED_STAGE_NAMES,
         latency_metric_names=LATENCY_METRIC_NAMES,
     )
+    profile["schema_version"] = PHASE42H_LATENCY_STAGE_PROFILE_SCHEMA_VERSION
+    profile["phase"] = PHASE
+    profile["required_latency_profile_samples_path"] = _display_path(LATENCY_PROFILE_SAMPLES)
+    return profile
+
+
+def validate_phase42h_latency_profile_summary(
+    profile: dict[str, Any],
+    *,
+    root: str | Path | None = None,
+    expected_samples_path: str | Path | None = None,
+    require_stage_profile_schema: bool = False,
+) -> dict[str, Any]:
+    root_path = Path(root).resolve() if root is not None else None
+    errors = _phase42h_latency_profile_validation_errors(
+        profile,
+        root=root_path,
+        expected_samples_path=expected_samples_path,
+        require_stage_profile_schema=require_stage_profile_schema,
+    )
+    return {
+        "schema_version": PHASE42H_LATENCY_STAGE_PROFILE_SCHEMA_VERSION,
+        "valid": not errors,
+        "errors": errors,
+        "sample_count": int(_num(_dict(profile).get("sample_count"))),
+        "performed": _dict(profile).get("performed") is True,
+        "required_latency_profile_samples_path": _display_path(LATENCY_PROFILE_SAMPLES),
+    }
+
+
+def validate_phase42h_latency_stage_profile_artifact(
+    root: str | Path,
+    *,
+    report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    root_path = Path(root).resolve()
+    profile_path = root_path / PHASE42H_LATENCY_STAGE_PROFILE
+    expected_samples_path = root_path / LATENCY_PROFILE_SAMPLES
+    errors: list[str] = []
+    profile: dict[str, Any] = {}
+    exists = profile_path.exists()
+    size_bytes = profile_path.stat().st_size if exists and profile_path.is_file() else 0
+    if not _is_within(profile_path.resolve(), root_path):
+        errors.append("latency stage profile path is outside active root")
+    if not exists:
+        errors.append("latency stage profile artifact missing")
+    elif not profile_path.is_file():
+        errors.append("latency stage profile artifact is not a file")
+    elif size_bytes <= 0:
+        errors.append("latency stage profile artifact is empty")
+    else:
+        try:
+            with profile_path.open("r", encoding="utf-8") as handle:
+                parsed = json.load(handle)
+        except json.JSONDecodeError as exc:
+            errors.append(f"latency stage profile artifact invalid JSON: {exc}")
+        else:
+            if not isinstance(parsed, dict):
+                errors.append("latency stage profile artifact must be a JSON object")
+            else:
+                profile = parsed
+                errors.extend(
+                    _phase42h_latency_profile_validation_errors(
+                        profile,
+                        root=root_path,
+                        expected_samples_path=expected_samples_path,
+                        require_stage_profile_schema=True,
+                    )
+                )
+    report_profile = _dict(_dict(report or {}).get("hot_path_latency_summary"))
+    if report_profile and profile:
+        if int(_num(profile.get("sample_count"))) != int(_num(report_profile.get("sample_count"))):
+            errors.append("latency stage profile sample_count does not match final report")
+    return {
+        "checked": True,
+        "valid": not errors,
+        "errors": errors,
+        "root": _display_path(root_path),
+        "path": _display_path(PHASE42H_LATENCY_STAGE_PROFILE),
+        "absolute_path": _display_path(profile_path),
+        "exists": exists,
+        "size_bytes": size_bytes,
+        "path_under_active_root": _is_within(profile_path.resolve(), root_path),
+        "expected_latency_profile_samples_path": _display_path(LATENCY_PROFILE_SAMPLES),
+    }
+
+
+def _phase42h_latency_profile_validation_errors(
+    profile: dict[str, Any],
+    *,
+    root: Path | None = None,
+    expected_samples_path: str | Path | None = None,
+    require_stage_profile_schema: bool = False,
+) -> list[str]:
+    payload = _dict(profile)
+    errors: list[str] = []
+    if not payload:
+        return ["latency stage profile must be a non-empty object"]
+    schema_version = payload.get("schema_version")
+    if schema_version is None:
+        if require_stage_profile_schema:
+            errors.append("latency stage profile schema_version missing")
+    elif schema_version != PHASE42H_LATENCY_STAGE_PROFILE_SCHEMA_VERSION:
+        errors.append("latency stage profile schema_version is not phase_4_2h_latency_stage_profile_v1")
+    if payload.get("performed") is not True:
+        errors.append("latency stage profile performed must be true")
+    if int(_num(payload.get("sample_count"))) <= 0:
+        errors.append("latency stage profile sample_count must be > 0")
+    metrics = _dict(payload.get("metrics"))
+    if not metrics:
+        errors.append("latency stage profile metrics missing")
+    else:
+        missing_metrics = [metric for metric in LATENCY_METRIC_NAMES if metric not in metrics]
+        if missing_metrics:
+            errors.append(f"latency stage profile missing metrics: {', '.join(missing_metrics)}")
+        explicit_missing = [str(metric) for metric in payload.get("missing_metrics", []) if metric]
+        if explicit_missing:
+            errors.append(f"latency stage profile metrics have no samples: {', '.join(explicit_missing)}")
+        for metric in LATENCY_METRIC_NAMES:
+            summary = _dict(metrics.get(metric))
+            if int(_num(summary.get("count"))) <= 0:
+                errors.append(f"latency stage profile metric {metric} count must be > 0")
+    stage_availability = _dict(payload.get("stage_availability"))
+    if not stage_availability:
+        errors.append("latency stage profile stage_availability missing")
+    else:
+        for stage in REQUIRED_STAGE_NAMES:
+            if stage not in stage_availability:
+                errors.append(f"latency stage profile missing stage availability for {stage}")
+                continue
+            stats = _dict(stage_availability.get(stage))
+            if stage != "socket_recv_monotonic_ns" and int(_num(stats.get("available_count"))) <= 0:
+                errors.append(f"latency stage profile stage {stage} has no available samples")
+    earliest = str(payload.get("earliest_available_receive_stage") or "")
+    if earliest in {"", "stage_not_available"}:
+        errors.append("latency stage profile earliest_available_receive_stage missing")
+    elif earliest not in {
+        "socket_recv_monotonic_ns",
+        "raw_ws_callback_monotonic_ns",
+        "ws_message_received_monotonic_ns",
+        "message_dispatch_start_monotonic_ns",
+    }:
+        errors.append("latency stage profile earliest_available_receive_stage is invalid")
+    if payload.get("disk_write_on_hot_path") is not False:
+        errors.append("latency stage profile disk_write_on_hot_path must be false")
+    if payload.get("debug_logging_on_hot_path") is not False:
+        errors.append("latency stage profile debug_logging_on_hot_path must be false")
+    if payload.get("batch_writer_enabled") is not True:
+        errors.append("latency stage profile batch_writer_enabled must be true")
+    if expected_samples_path is not None:
+        path_error = _phase42h_latency_profile_samples_path_error(
+            payload.get("stage_profile_path"),
+            root=root,
+            expected_samples_path=expected_samples_path,
+        )
+        if path_error:
+            errors.append(path_error)
+    return errors
+
+
+def _phase42h_latency_profile_samples_path_error(
+    value: Any,
+    *,
+    root: Path | None,
+    expected_samples_path: str | Path,
+) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return "latency stage profile stage_profile_path missing"
+    expected = Path(expected_samples_path)
+    if root is not None and not expected.is_absolute():
+        expected = root / expected
+    expected_resolved = expected.resolve()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        if candidate.resolve() != expected_resolved:
+            return "latency stage profile stage_profile_path is not the Phase 4.2H samples path under active root"
+        if root is not None and not _is_within(candidate.resolve(), root):
+            return "latency stage profile stage_profile_path is outside active root"
+        return None
+    if root is not None and (root / candidate).resolve() == expected_resolved:
+        return None
+    if _display_path(candidate) == _display_path(LATENCY_PROFILE_SAMPLES):
+        return None
+    return "latency stage profile stage_profile_path is not the Phase 4.2H samples path under active root"
 
 
 def build_writer_batch_report(
@@ -883,6 +1072,14 @@ def resolve_phase41_runtime_report(
     capture_diagnostics = _dict(capture.get("capture_diagnostics"))
     current_capture_report = _dict(capture.get("phase41_runtime_report")) or _dict(capture_diagnostics.get("phase41_runtime_report"))
     if current_capture_report:
+        if capture.get("evaluation_mode") == "existing_artifacts":
+            return current_capture_report, {
+                "source": "existing_artifact_capture_diagnostics",
+                "path": "data/debug/phase_4_2h_multifeed_capture_diagnostics.json",
+                "fresh": False,
+                "artifact_loaded": True,
+                "stale_artifact_allowed": True,
+            }
         return current_capture_report, {
             "source": "current_capture_summary",
             "path": "capture.phase41_runtime_report",
@@ -1030,7 +1227,8 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
     def add(reason: str, classification: str, *, implementation: bool = False) -> None:
         nonlocal implementation_status, fresh_capture_status, clock_sync_status, readiness_semantics_status
         nonlocal latency_profile_status, hot_path_decoupling_status, writer_status, protocol_decision_status, primary
-        hard.append(reason)
+        if reason not in hard:
+            hard.append(reason)
         if classification not in classifications:
             classifications.append(classification)
         primary = primary or classification
@@ -1147,7 +1345,18 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
         warnings.append("server_time_rtt_p95_elevated")
 
     latency = _dict(evaluated.get("hot_path_latency_summary"))
-    if latency.get("performed") is not True:
+    latency_validation = validate_phase42h_latency_profile_summary(latency)
+    evaluated["latency_profile_validation"] = latency_validation
+    artifact_validation = _dict(evaluated.get("latency_stage_profile_artifact"))
+    if artifact_validation:
+        if artifact_validation.get("valid") is not True:
+            latency_validation = {
+                **latency_validation,
+                "valid": False,
+                "artifact_errors": artifact_validation.get("errors", []),
+            }
+            evaluated["latency_profile_validation"] = latency_validation
+    if latency_validation.get("valid") is not True:
         add("latency stage profile missing", "LATENCY_PROFILE_MISSING", implementation=True)
     queue = _dict(evaluated.get("queue_backpressure_summary"))
     if queue.get("performed") is not True:
@@ -1279,7 +1488,10 @@ def write_phase42h_artifacts(
     bundle_created: bool = False,
     bundle_path: str | Path | None = None,
 ) -> None:
-    root_path = Path(root)
+    root_path = Path(root).resolve()
+    report = evaluate_phase42h_report(report)
+    _write_json(root_path / PHASE42H_LATENCY_STAGE_PROFILE, report.get("hot_path_latency_summary", {}))
+    report["latency_stage_profile_artifact"] = validate_phase42h_latency_stage_profile_artifact(root_path, report=report)
     report = evaluate_phase42h_report(report)
     _write_json(root_path / PHASE42H_REPORT_JSON, report)
     _write_text(root_path / PHASE42H_REPORT_MD, render_phase42h_markdown(report))
@@ -1287,7 +1499,6 @@ def write_phase42h_artifacts(
     _write_json(root_path / PHASE42H_CLOCK_OFFSET_SAMPLES, {"samples": report.get("clock_offset_samples", []), "summary": report.get("clock_offset_summary", {})})
     _write_json(root_path / PHASE42H_RECEIVE_LAG_RAW_VS_CORRECTED, report.get("receive_lag_summary", {}))
     _write_json(root_path / PHASE42H_CORRECTED_HYBRID_SUMMARY, report.get("corrected_hybrid_summary", {}))
-    _write_json(root_path / PHASE42H_LATENCY_STAGE_PROFILE, report.get("hot_path_latency_summary", {}))
     _write_json(root_path / PHASE42H_QUEUE_BACKPRESSURE_REPORT, report.get("queue_backpressure_summary", {}))
     _write_json(root_path / PHASE42H_WRITER_BATCH_REPORT, report.get("writer_batch_report", {}))
     _write_json(root_path / PHASE42H_CLOCK_SANITY_REPORT, report.get("clock_sanity_report", {}))
