@@ -735,6 +735,82 @@ def test_phase42h_cli_evaluate_existing_artifacts_passes_valid_root(tmp_path: Pa
     assert report["rebuild_derived_artifacts"] is False
 
 
+def test_phase42h_cli_evaluate_existing_socket_recv_unavailable_is_warning_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_existing_phase42h_artifacts(tmp_path, line_count=24)
+    profile_path = tmp_path / hotpath.PHASE42H_LATENCY_STAGE_PROFILE
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile["socket_recv_monotonic_ns"] = "stage_not_available"
+    profile["unavailable_stages"] = {"socket_recv_monotonic_ns": "stage_not_available"}
+    profile["stage_availability"]["socket_recv_monotonic_ns"] = {
+        "available_count": 0,
+        "stage_not_available_count": profile["sample_count"],
+    }
+    profile["earliest_available_receive_stage"] = "raw_ws_callback_monotonic_ns"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    queue_path = tmp_path / hotpath.PHASE42H_QUEUE_BACKPRESSURE_REPORT
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    for key in ("disk_write_on_hot_path", "debug_logging_on_hot_path", "batch_writer_enabled"):
+        queue.pop(key, None)
+    queue["queue_backpressure_detected"] = False
+    queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+    exit_code, report = _run_phase42h_existing_eval(tmp_path, monkeypatch)
+
+    assert exit_code == 0
+    assert report["status"] == "pass"
+    assert report["hot_path_decoupling_status"] == "pass"
+    assert report["implementation_status"] == "pass"
+    assert report["strict_100ms_observability_ready"] is True
+    assert report["low_latency_ready"] is True
+    assert "socket_recv_monotonic_ns_unavailable" in report["warning_reasons"]
+    assert report["hot_path_latency_summary"]["earliest_available_receive_stage"] == "raw_ws_callback_monotonic_ns"
+    assert report["hot_path_latency_summary"]["unavailable_stages"] == {"socket_recv_monotonic_ns": "stage_not_available"}
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_classification"),
+    [
+        ("missing_metrics", "LATENCY_PROFILE_MISSING"),
+        ("disk_write_on_hot_path", "HOT_PATH_DECOUPLING_INCOMPLETE"),
+        ("debug_logging_on_hot_path", "HOT_PATH_DECOUPLING_INCOMPLETE"),
+        ("batch_writer_disabled", "HOT_PATH_DECOUPLING_INCOMPLETE"),
+        ("queue_backpressure_detected", "HOT_PATH_DECOUPLING_INCOMPLETE"),
+    ],
+)
+def test_phase42h_cli_evaluate_existing_still_fails_actual_hotpath_issues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    case: str,
+    expected_classification: str,
+) -> None:
+    _seed_existing_phase42h_artifacts(tmp_path, line_count=24)
+    if case == "queue_backpressure_detected":
+        queue_path = tmp_path / hotpath.PHASE42H_QUEUE_BACKPRESSURE_REPORT
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        queue["queue_backpressure_detected"] = True
+        queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    else:
+        profile_path = tmp_path / hotpath.PHASE42H_LATENCY_STAGE_PROFILE
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        if case == "missing_metrics":
+            profile["missing_metrics"] = ["parse_duration_ms"]
+        elif case == "disk_write_on_hot_path":
+            profile["disk_write_on_hot_path"] = True
+        elif case == "debug_logging_on_hot_path":
+            profile["debug_logging_on_hot_path"] = True
+        elif case == "batch_writer_disabled":
+            profile["batch_writer_enabled"] = False
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    exit_code, report = _run_phase42h_existing_eval(tmp_path, monkeypatch)
+
+    assert exit_code == 1
+    assert expected_classification in report["failure_classifications"]
+    if expected_classification == "HOT_PATH_DECOUPLING_INCOMPLETE":
+        assert report["hot_path_decoupling_status"] == "fail"
+
+
 def test_phase42h_cli_evaluate_existing_does_not_rewrite_derived_artifacts_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_existing_phase42h_artifacts(tmp_path, line_count=48)
     derived_paths = [
@@ -752,9 +828,13 @@ def test_phase42h_cli_evaluate_existing_does_not_rewrite_derived_artifacts_by_de
     def fail_full_count(_path: str | Path) -> int:
         raise AssertionError("evaluate-existing default should not full-scan JSONL artifacts")
 
+    def fail_streaming_finalization(**_kwargs: Any) -> Any:
+        raise AssertionError("evaluate-existing reuse mode should not call streaming finalization")
+
     monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
     monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
     monkeypatch.setattr(phase42h_cli, "run_phase42h_analysis", fail_analysis)
+    monkeypatch.setattr(hotpath, "run_phase42h_streaming_finalization", fail_streaming_finalization)
     monkeypatch.setattr(phase42h_cli, "_count_jsonl", fail_full_count)
     monkeypatch.setattr(
         phase42h_cli,
@@ -1984,6 +2064,40 @@ def test_memory_telemetry_included_in_failure_metadata() -> None:
     report = _report(writer_drops=1)
     evaluated = evaluate_phase42h_report(report)
     assert "memory_telemetry" in evaluated
+
+
+def _run_phase42h_existing_eval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[int, dict[str, Any]]:
+    def fail_analysis(**_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("evaluate-existing reuse mode should not rebuild derived artifacts")
+
+    def fail_streaming_finalization(**_kwargs: Any) -> Any:
+        raise AssertionError("evaluate-existing reuse mode should not call streaming finalization")
+
+    monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
+    monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
+    monkeypatch.setattr(phase42h_cli, "run_phase42h_analysis", fail_analysis)
+    monkeypatch.setattr(hotpath, "run_phase42h_streaming_finalization", fail_streaming_finalization)
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "7200",
+            "--environment-name",
+            "phase52_vps_repaired_eval",
+            "--environment-region",
+            "unknown",
+            "--run-mode",
+            "repaired_eval",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--skip-capture",
+            "--evaluate-existing-artifacts",
+            "--no-bundle",
+        ]
+    )
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    return exit_code, report
 
 
 def _patch_phase42h_cli_fixture(monkeypatch: pytest.MonkeyPatch, *, source_root: Path) -> None:

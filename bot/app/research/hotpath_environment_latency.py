@@ -706,6 +706,7 @@ def run_phase42h_existing_artifact_analysis(
         latency_profile=latency_profile,
         writer_report=writer_report,
     )
+    queue_report = _queue_report_with_latency_hotpath_defaults(queue_report, latency_profile)
     report = build_phase42h_report(
         symbol=symbol,
         clean_samples=[],
@@ -837,11 +838,7 @@ def build_phase42h_report(
         "clock_sync_status": "pass" if clock_sanity.get("clock_sanity_valid") is True else "fail",
         "readiness_semantics_status": "pass",
         "latency_profile_status": "pass" if latency_profile_validation["valid"] is True else "fail",
-        "hot_path_decoupling_status": "pass"
-        if latency_profile.get("disk_write_on_hot_path") is False
-        and latency_profile.get("debug_logging_on_hot_path") is False
-        and latency_profile.get("batch_writer_enabled") is True
-        else "fail",
+        "hot_path_decoupling_status": "pass" if _hot_path_decoupling_complete(latency_profile=latency_profile, queue_report=queue_report) else "fail",
         "writer_status": "pass"
         if writer_report.get("writer_shutdown_flush_completed") is True
         and _num(writer_report.get("writer_dropped_records")) == 0
@@ -1382,6 +1379,33 @@ def build_queue_backpressure_report(
     }
 
 
+def _queue_report_with_latency_hotpath_defaults(queue_report: dict[str, Any], latency_profile: dict[str, Any]) -> dict[str, Any]:
+    queue = dict(queue_report)
+    queue.setdefault("disk_write_on_hot_path", latency_profile.get("disk_write_on_hot_path") is True)
+    queue.setdefault("debug_logging_on_hot_path", latency_profile.get("debug_logging_on_hot_path") is True)
+    queue.setdefault("batch_writer_enabled", latency_profile.get("batch_writer_enabled") is True)
+    queue.setdefault("queue_backpressure_detected", latency_profile.get("queue_backpressure_detected") is True)
+    return queue
+
+
+def _hot_path_decoupling_complete(*, latency_profile: dict[str, Any], queue_report: dict[str, Any]) -> bool:
+    return not _hot_path_decoupling_failure_reasons(latency_profile=latency_profile, queue_report=queue_report)
+
+
+def _hot_path_decoupling_failure_reasons(*, latency_profile: dict[str, Any], queue_report: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if latency_profile.get("disk_write_on_hot_path") is True or queue_report.get("disk_write_on_hot_path") is True:
+        reasons.append("disk_write_on_hot_path")
+    if latency_profile.get("debug_logging_on_hot_path") is True or queue_report.get("debug_logging_on_hot_path") is True:
+        reasons.append("debug_logging_on_hot_path")
+    queue_batch_value = queue_report.get("batch_writer_enabled")
+    if latency_profile.get("batch_writer_enabled") is not True or queue_batch_value is False:
+        reasons.append("batch_writer_enabled")
+    if latency_profile.get("queue_backpressure_detected") is True or queue_report.get("queue_backpressure_detected") is True:
+        reasons.append("queue_backpressure_detected")
+    return reasons
+
+
 def resolve_phase41_runtime_report(
     root: str | Path,
     *,
@@ -1691,7 +1715,9 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
     queue = _dict(evaluated.get("queue_backpressure_summary"))
     if queue.get("performed") is not True:
         add("queue backpressure report missing", "QUEUE_BACKPRESSURE_REPORT_MISSING", implementation=True)
-    if queue.get("disk_write_on_hot_path") is True or queue.get("debug_logging_on_hot_path") is True or queue.get("batch_writer_enabled") is not True:
+    queue = _queue_report_with_latency_hotpath_defaults(queue, latency)
+    evaluated["queue_backpressure_summary"] = queue
+    if not _hot_path_decoupling_complete(latency_profile=latency, queue_report=queue):
         add("hot-path decoupling incomplete", "HOT_PATH_DECOUPLING_INCOMPLETE", implementation=True)
     if _num(queue.get("queue_dropped_messages")) > 0:
         add("queue_dropped_messages > 0", "QUEUE_DROPPED_MESSAGES_FAILURE")
@@ -2539,7 +2565,7 @@ def _readiness_warnings(
         warnings.append("corrected_hybrid_250ms_passes_but_100ms_fails")
     if _num(clock_offset_summary.get("server_time_rtt_p95_ms")) > SERVER_TIME_RTT_WARNING_MS:
         warnings.append("server_time_rtt_p95_elevated")
-    if latency_profile.get("socket_recv_monotonic_ns") == "stage_not_available":
+    if _socket_recv_monotonic_unavailable(latency_profile):
         warnings.append("socket_recv_monotonic_ns_unavailable")
     warnings.extend(str(item) for item in queue_report.get("warnings", []) if item)
     if _num(writer_report.get("writer_flush_p95_ms")) > WRITER_FLUSH_WARNING_MS:
@@ -2563,6 +2589,16 @@ def _any_corrected_hybrid_passes(sources: dict[str, dict[str, Any]]) -> bool:
         for report in sources.values()
         for metrics in _dict(report.get("corrected_hybrid")).values()
     )
+
+
+def _socket_recv_monotonic_unavailable(latency_profile: dict[str, Any]) -> bool:
+    if latency_profile.get("socket_recv_monotonic_ns") == "stage_not_available":
+        return True
+    unavailable = _dict(latency_profile.get("unavailable_stages"))
+    if unavailable.get("socket_recv_monotonic_ns") == "stage_not_available":
+        return True
+    stage = _dict(_dict(latency_profile.get("stage_availability")).get("socket_recv_monotonic_ns"))
+    return bool(stage) and int(_num(stage.get("available_count"))) <= 0
 
 
 def _series_summary(values: list[float]) -> dict[str, Any]:
