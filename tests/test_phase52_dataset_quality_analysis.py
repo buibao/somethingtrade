@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -208,9 +208,9 @@ def _write_session(
     sequence_gaps: int = 0,
     warning_reasons: list[str] | None = None,
 ) -> None:
-    capture_value = requested_duration_sec if capture_duration_sec is DEFAULT else capture_duration_sec
+    capture_value = requested_duration_sec if capture_duration_sec is DEFAULT else cast(float | None, capture_duration_sec)
     actual_value = requested_duration_sec if actual_duration_sec is None else actual_duration_sec
-    total_child = None if capture_value is None else float(capture_value) + finalization_duration_sec + bundle_duration_sec
+    total_child = None if capture_value is None else capture_value + finalization_duration_sec + bundle_duration_sec
     session_dir = sessions_root / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     memory = {

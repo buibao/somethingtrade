@@ -61,6 +61,7 @@ from app.research.hotpath_environment_latency import (  # noqa: E402
     refresh_generated_file_sizes,
     run_phase42h_vps_preflight,
     run_phase42h_analysis,
+    run_phase42h_existing_artifact_analysis,
     validate_gitignore_rules,
     write_phase42h_artifacts,
 )
@@ -86,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-capture", action="store_true")
     parser.add_argument("--allow-fixture-mode", action="store_true")
     parser.add_argument("--evaluate-existing-artifacts", action="store_true")
+    parser.add_argument("--rebuild-derived-artifacts", action="store_true")
     parser.add_argument("--skip-pytest", action="store_true")
     parser.add_argument("--root", default=str(SOURCE_ROOT))
     parser.add_argument("--input-clean-samples", default="data/dataset/orderbook_clean_samples.jsonl")
@@ -101,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
+    if args.rebuild_derived_artifacts and not args.evaluate_existing_artifacts:
+        parser.error("--rebuild-derived-artifacts is only valid with --evaluate-existing-artifacts")
     if args.evaluate_existing_artifacts:
         if not args.skip_capture:
             parser.error("--evaluate-existing-artifacts requires --skip-capture")
@@ -334,18 +338,15 @@ def main(argv: list[str] | None = None) -> int:
     record_memory_stage(memory_telemetry, "capture_end")
     _mark_stage_start(stage_timing, "finalization")
     record_memory_stage(memory_telemetry, "finalization_start")
-    report = run_phase42h_analysis(
-        root=root,
-        symbol=args.symbol,
-        clock_offset_samples=clock_samples,
-        environment=environment,
-        clean_samples_path=args.input_clean_samples,
-        bookticker_path=args.input_bookticker,
-        trade_path=args.input_trade,
-        aggtrade_path=args.input_aggtrade,
-        latency_profile_samples_path=args.input_latency_profile,
-        corrected_labels_path=args.output_corrected_labels,
-        capture={
+    if args.evaluate_existing_artifacts and not args.rebuild_derived_artifacts:
+        analysis_capture = {
+            **capture,
+            "depth_clean_sample_count": int(_num(capture.get("depth_clean_sample_count"))),
+            "latency_profile_sample_count": int(_num(capture.get("latency_profile_sample_count"))),
+            "reference_event_counts": _dict(capture.get("reference_event_counts")),
+        }
+    else:
+        analysis_capture = {
             **capture,
             "depth_clean_sample_count": _count_jsonl(_resolve(root, args.input_clean_samples)),
             "latency_profile_sample_count": _count_jsonl(_resolve(root, args.input_latency_profile)),
@@ -354,18 +355,54 @@ def main(argv: list[str] | None = None) -> int:
                 "trade_price": _count_jsonl(_resolve(root, args.input_trade)),
                 "aggTrade_price": _count_jsonl(_resolve(root, args.input_aggtrade)),
             },
-        },
-        cleanup_report=cleanup_report,
-        gitignore_validation=gitignore_validation,
-        pytest_passed=pytest_passed,
-        typecheck_passed=typecheck_passed,
-        typecheck_summary=typecheck_summary,
-        fresh_capture_required=not args.skip_capture,
-        preflight_report=preflight_report,
-        memory_telemetry=memory_telemetry,
-    )
-    if args.evaluate_existing_artifacts:
+        }
+    if args.evaluate_existing_artifacts and not args.rebuild_derived_artifacts:
+        report = run_phase42h_existing_artifact_analysis(
+            root=root,
+            symbol=args.symbol,
+            clock_offset_samples=clock_samples,
+            environment=environment,
+            clean_samples_path=args.input_clean_samples,
+            bookticker_path=args.input_bookticker,
+            trade_path=args.input_trade,
+            aggtrade_path=args.input_aggtrade,
+            latency_profile_samples_path=args.input_latency_profile,
+            corrected_labels_path=args.output_corrected_labels,
+            capture=analysis_capture,
+            cleanup_report=cleanup_report,
+            gitignore_validation=gitignore_validation,
+            pytest_passed=pytest_passed,
+            typecheck_passed=typecheck_passed,
+            typecheck_summary=typecheck_summary,
+            preflight_report=preflight_report,
+            memory_telemetry=memory_telemetry,
+        )
+    else:
+        report = run_phase42h_analysis(
+            root=root,
+            symbol=args.symbol,
+            clock_offset_samples=clock_samples,
+            environment=environment,
+            clean_samples_path=args.input_clean_samples,
+            bookticker_path=args.input_bookticker,
+            trade_path=args.input_trade,
+            aggtrade_path=args.input_aggtrade,
+            latency_profile_samples_path=args.input_latency_profile,
+            corrected_labels_path=args.output_corrected_labels,
+            capture=analysis_capture,
+            cleanup_report=cleanup_report,
+            gitignore_validation=gitignore_validation,
+            pytest_passed=pytest_passed,
+            typecheck_passed=typecheck_passed,
+            typecheck_summary=typecheck_summary,
+            fresh_capture_required=not args.skip_capture,
+            preflight_report=preflight_report,
+            memory_telemetry=memory_telemetry,
+        )
+    if args.evaluate_existing_artifacts and args.rebuild_derived_artifacts:
         report["evaluation_mode"] = "existing_artifacts"
+        report["derived_artifact_mode"] = "rebuilt"
+        report["rebuild_derived_artifacts"] = True
         report["fresh_capture_required"] = False
         report["fresh_capture_performed"] = False
         report["skip_capture"] = True
@@ -388,7 +425,11 @@ def main(argv: list[str] | None = None) -> int:
         report["hard_fail_reasons"].append(f"multi-feed capture exited {capture_code}")
         report["primary_failure"] = report.get("primary_failure") or "FRESH_CAPTURE_NOT_PERFORMED"
         report = evaluate_phase42h_report(report)
-    create_dataset_zip = bool(report.get("labeled_sample_count", 0) or report.get("hot_path_latency_summary", {}).get("sample_count", 0))
+    create_dataset_zip = (
+        False
+        if args.evaluate_existing_artifacts and not args.rebuild_derived_artifacts
+        else bool(report.get("labeled_sample_count", 0) or report.get("hot_path_latency_summary", {}).get("sample_count", 0))
+    )
     report = _write_and_bundle(
         report,
         root=root,
@@ -1183,12 +1224,36 @@ def _existing_artifact_capture(args: argparse.Namespace, *, root: Path) -> dict[
     diagnostic_errors = validate_capture_diagnostics(diagnostics, symbol=args.symbol) if diagnostics else ["capture diagnostics missing"]
     requested_streams = diagnostics.get("requested_streams") if isinstance(diagnostics.get("requested_streams"), list) else required_streams(args.symbol)
     parsed_counts = _dict(diagnostics.get("parsed_count_by_source"))
+    previous_capture = _dict(previous_report.get("capture"))
+    previous_reference_counts = _dict(previous_capture.get("reference_event_counts"))
     parsed_counts = {
-        "depth_mid": parsed_counts.get("depth_mid", _count_jsonl(_resolve(root, args.input_clean_samples))),
-        "bookTicker_mid": parsed_counts.get("bookTicker_mid", _count_jsonl(_resolve(root, args.input_bookticker))),
-        "trade_price": parsed_counts.get("trade_price", _count_jsonl(_resolve(root, args.input_trade))),
-        "aggTrade_price": parsed_counts.get("aggTrade_price", _count_jsonl(_resolve(root, args.input_aggtrade))),
+        "depth_mid": _existing_jsonl_count_hint(
+            _resolve(root, args.input_clean_samples),
+            parsed_counts.get("depth_mid"),
+            previous_capture.get("depth_clean_sample_count"),
+            previous_report.get("clean_sample_count"),
+        ),
+        "bookTicker_mid": _existing_jsonl_count_hint(
+            _resolve(root, args.input_bookticker),
+            parsed_counts.get("bookTicker_mid"),
+            previous_reference_counts.get("bookTicker_mid"),
+        ),
+        "trade_price": _existing_jsonl_count_hint(
+            _resolve(root, args.input_trade),
+            parsed_counts.get("trade_price"),
+            previous_reference_counts.get("trade_price"),
+        ),
+        "aggTrade_price": _existing_jsonl_count_hint(
+            _resolve(root, args.input_aggtrade),
+            parsed_counts.get("aggTrade_price"),
+            previous_reference_counts.get("aggTrade_price"),
+        ),
     }
+    latency_profile_count = _existing_jsonl_count_hint(
+        _resolve(root, args.input_latency_profile),
+        previous_capture.get("latency_profile_sample_count"),
+        _dict(previous_report.get("hot_path_latency_summary")).get("sample_count"),
+    )
     diagnostics = {
         **diagnostics,
         "fresh_capture_performed": False,
@@ -1210,14 +1275,35 @@ def _existing_artifact_capture(args: argparse.Namespace, *, root: Path) -> dict[
         "capture_diagnostics": diagnostics,
         "capture_diagnostic_errors": diagnostic_errors,
         "duration_sec": float(previous_report.get("duration_sec", args.duration_sec) or args.duration_sec),
-        "depth_clean_sample_count": _count_jsonl(_resolve(root, args.input_clean_samples)),
-        "latency_profile_sample_count": _count_jsonl(_resolve(root, args.input_latency_profile)),
+        "depth_clean_sample_count": parsed_counts["depth_mid"],
+        "latency_profile_sample_count": latency_profile_count,
         "reference_event_counts": {
-            "bookTicker_mid": _count_jsonl(_resolve(root, args.input_bookticker)),
-            "trade_price": _count_jsonl(_resolve(root, args.input_trade)),
-            "aggTrade_price": _count_jsonl(_resolve(root, args.input_aggtrade)),
+            "bookTicker_mid": parsed_counts["bookTicker_mid"],
+            "trade_price": parsed_counts["trade_price"],
+            "aggTrade_price": parsed_counts["aggTrade_price"],
         },
     }
+
+
+def _existing_jsonl_count_hint(path: Path, *hints: Any) -> int:
+    for hint in hints:
+        count = int(_num(hint))
+        if count > 0:
+            return count
+    return 1 if _jsonl_has_nonempty_record(path) else 0
+
+
+def _jsonl_has_nonempty_record(path: Path) -> bool:
+    if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def _fixture_capture(args: argparse.Namespace, *, root: Path) -> dict[str, Any]:

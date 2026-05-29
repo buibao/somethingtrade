@@ -204,10 +204,13 @@ def _eligibility_failure_reasons(
 
 
 def _session_failed(quality: dict[str, Any], metadata: dict[str, Any], hotpath: dict[str, Any]) -> bool:
+    quality_failed = bool(quality) and quality.get("status") != "pass"
+    metadata_failed = bool(metadata) and metadata.get("runtime_status") != "pass"
+    hotpath_failed = bool(hotpath) and hotpath.get("status") != "pass"
     return (
-        (quality and quality.get("status") != "pass")
-        or (metadata and metadata.get("runtime_status") != "pass")
-        or (hotpath and hotpath.get("status") != "pass")
+        quality_failed
+        or metadata_failed
+        or hotpath_failed
         or bool(metadata.get("primary_failure"))
         or bool(hotpath.get("primary_failure"))
     )

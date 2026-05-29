@@ -83,6 +83,7 @@ LATENCY_PROFILE_SAMPLES = Path("data/dataset/phase_4_2h_latency_profile_samples.
 CORRECTED_TIME_PROTOCOL_LABELS = Path("data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl")
 LATENCY_PROFILE_DATASETS_ZIP = Path("data/dataset/phase_4_2h_latency_profile_datasets.zip")
 PHASE42H_LATENCY_STAGE_PROFILE_SCHEMA_VERSION = "phase_4_2h_latency_stage_profile_v1"
+DERIVED_ARTIFACT_MISSING_CLASSIFICATION = "DERIVED_ARTIFACT_MISSING"
 
 PHASE42H_REPORT_JSON = Path("data/reports/phase_4_2h_hotpath_environment_latency_report.json")
 PHASE42H_REPORT_MD = Path("data/reports/phase_4_2h_hotpath_environment_latency_report.md")
@@ -632,6 +633,140 @@ def run_phase42h_analysis(
     return report
 
 
+def run_phase42h_existing_artifact_analysis(
+    *,
+    root: str | Path,
+    symbol: str,
+    clock_offset_samples: list[dict[str, Any]],
+    environment: dict[str, Any],
+    clean_samples_path: str | Path = "data/dataset/orderbook_clean_samples.jsonl",
+    bookticker_path: str | Path = BOOKTICKER_REFERENCE_QUOTES,
+    trade_path: str | Path = TRADE_REFERENCE_EVENTS,
+    aggtrade_path: str | Path = AGGTRADE_REFERENCE_EVENTS,
+    latency_profile_samples_path: str | Path = LATENCY_PROFILE_SAMPLES,
+    receive_labels_path: str | Path = BENCHMARK_LABELS,
+    time_protocol_labels_path: str | Path = TIME_PROTOCOL_LABELS,
+    corrected_labels_path: str | Path = CORRECTED_TIME_PROTOCOL_LABELS,
+    capture: dict[str, Any],
+    cleanup_report: dict[str, Any] | None,
+    gitignore_validation: dict[str, Any],
+    pytest_passed: bool = True,
+    typecheck_passed: bool = True,
+    typecheck_summary: str = "",
+    preflight_report: dict[str, Any] | None = None,
+    memory_telemetry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    root_path = Path(root)
+    previous_report = _read_json(root_path / PHASE42H_REPORT_JSON)
+    latency_profile = _read_json(root_path / PHASE42H_LATENCY_STAGE_PROFILE)
+    latency_stage_artifact = validate_phase42h_latency_stage_profile_artifact(
+        root_path,
+        report={"hot_path_latency_summary": latency_profile},
+    )
+    required_artifacts = validate_phase42h_existing_artifacts(
+        root_path,
+        clean_samples_path=clean_samples_path,
+        bookticker_path=bookticker_path,
+        trade_path=trade_path,
+        aggtrade_path=aggtrade_path,
+        latency_profile_samples_path=latency_profile_samples_path,
+        receive_labels_path=receive_labels_path,
+        time_protocol_labels_path=time_protocol_labels_path,
+        corrected_labels_path=corrected_labels_path,
+    )
+    clock_offset_summary = _dict(previous_report.get("clock_offset_summary"))
+    if not clock_offset_summary:
+        clock_offset_summary = compute_clock_offset_summary(clock_offset_samples)
+    clock_sanity = _dict(previous_report.get("clock_sanity_report"))
+    if not clock_sanity:
+        clock_sanity = build_clock_sanity_report(
+            clock_offset_summary=clock_offset_summary,
+            sources=_dict(previous_report.get("sources")),
+        )
+    phase41_report, phase41_source = resolve_phase41_runtime_report(root_path, capture=capture)
+    previous_writer = _dict(previous_report.get("writer_batch_report"))
+    writer_report = build_writer_batch_report(
+        phase41_report=phase41_report,
+        capture_diagnostics=_dict(capture.get("capture_diagnostics")),
+    )
+    if (
+        previous_writer
+        and writer_report.get("writer_shutdown_flush_completed") is not True
+        and previous_writer.get("writer_shutdown_flush_completed") is True
+    ):
+        writer_report = previous_writer
+    queue_report = build_queue_backpressure_report(
+        phase41_report=phase41_report,
+        latency_profile=latency_profile,
+        writer_report=writer_report,
+    )
+    report = build_phase42h_report(
+        symbol=symbol,
+        clean_samples=[],
+        sources=_dict(previous_report.get("sources")),
+        timestamp_schema=_dict(previous_report.get("timestamp_schema")),
+        leakage_result=_dict(previous_report.get("leakage_check")),
+        clock_offset_samples=clock_offset_samples or [sample for sample in previous_report.get("clock_offset_samples", []) if isinstance(sample, dict)],
+        clock_offset_summary=clock_offset_summary,
+        clock_sanity=clock_sanity,
+        latency_profile=latency_profile,
+        queue_report=queue_report,
+        writer_report=writer_report,
+        phase41_report=phase41_report,
+        capture={
+            **capture,
+            "evaluation_mode": "existing_artifacts",
+            "fresh_capture_required": False,
+            "fresh_capture_performed": False,
+            "skip_capture": True,
+            "fixture_mode": False,
+        },
+        cleanup_report=cleanup_report,
+        gitignore_validation=gitignore_validation,
+        environment=environment,
+        pytest_passed=pytest_passed,
+        typecheck_passed=typecheck_passed,
+        typecheck_summary=typecheck_summary,
+        fresh_capture_required=False,
+        preflight_report=preflight_report,
+        phase41_runtime_report_source=phase41_source,
+        labeled_sample_count=int(_num(previous_report.get("labeled_sample_count"))),
+        clean_sample_count=int(_num(previous_report.get("clean_sample_count")) or _num(capture.get("depth_clean_sample_count"))),
+        memory_telemetry=memory_telemetry,
+    )
+    report["evaluation_mode"] = "existing_artifacts"
+    report["derived_artifact_mode"] = "reuse_existing"
+    report["rebuild_derived_artifacts"] = False
+    report["latency_stage_profile_artifact"] = latency_stage_artifact
+    report["existing_artifact_validation"] = required_artifacts
+    report["streaming_finalization"] = {
+        "skipped": True,
+        "reason": "evaluate_existing_artifacts_reused_existing_derived_files",
+        "rebuild_required_flag": "--rebuild-derived-artifacts",
+    }
+    if not previous_report:
+        report["hard_fail_reasons"].append("existing Phase 4.2H report missing")
+        report["failure_classifications"].append("REPORT_MISSING")
+        report["primary_failure"] = report.get("primary_failure") or "REPORT_MISSING"
+    if latency_stage_artifact.get("valid") is not True:
+        report["hard_fail_reasons"].append("latency stage profile missing")
+        report["failure_classifications"].append("LATENCY_PROFILE_MISSING")
+        report["primary_failure"] = report.get("primary_failure") or "LATENCY_PROFILE_MISSING"
+    for item in required_artifacts.get("files", []):
+        if not isinstance(item, dict) or item.get("valid") is True:
+            continue
+        role = str(item.get("role") or item.get("path") or "artifact")
+        reason = f"existing artifact invalid: {role}"
+        report["hard_fail_reasons"].append(reason)
+        if role == "latency_profile_samples":
+            report["failure_classifications"].append("LATENCY_PROFILE_MISSING")
+            report["primary_failure"] = report.get("primary_failure") or "LATENCY_PROFILE_MISSING"
+        else:
+            report["failure_classifications"].append(DERIVED_ARTIFACT_MISSING_CLASSIFICATION)
+            report["primary_failure"] = report.get("primary_failure") or DERIVED_ARTIFACT_MISSING_CLASSIFICATION
+    return evaluate_phase42h_report(report)
+
+
 def build_phase42h_report(
     *,
     symbol: str,
@@ -864,6 +999,101 @@ def validate_phase42h_latency_stage_profile_artifact(
         "size_bytes": size_bytes,
         "path_under_active_root": _is_within(profile_path.resolve(), root_path),
         "expected_latency_profile_samples_path": _display_path(LATENCY_PROFILE_SAMPLES),
+    }
+
+
+def validate_phase42h_existing_artifacts(
+    root: str | Path,
+    *,
+    clean_samples_path: str | Path = "data/dataset/orderbook_clean_samples.jsonl",
+    bookticker_path: str | Path = BOOKTICKER_REFERENCE_QUOTES,
+    trade_path: str | Path = TRADE_REFERENCE_EVENTS,
+    aggtrade_path: str | Path = AGGTRADE_REFERENCE_EVENTS,
+    latency_profile_samples_path: str | Path = LATENCY_PROFILE_SAMPLES,
+    receive_labels_path: str | Path = BENCHMARK_LABELS,
+    time_protocol_labels_path: str | Path = TIME_PROTOCOL_LABELS,
+    corrected_labels_path: str | Path = CORRECTED_TIME_PROTOCOL_LABELS,
+) -> dict[str, Any]:
+    root_path = Path(root).resolve()
+    files = [
+        _validate_existing_jsonl_artifact(root_path, clean_samples_path, role="clean_samples"),
+        _validate_existing_jsonl_artifact(root_path, bookticker_path, role="bookticker_reference_quotes"),
+        _validate_existing_jsonl_artifact(root_path, trade_path, role="trade_reference_events"),
+        _validate_existing_jsonl_artifact(root_path, aggtrade_path, role="aggtrade_reference_events"),
+        _validate_existing_jsonl_artifact(root_path, latency_profile_samples_path, role="latency_profile_samples"),
+        _validate_existing_jsonl_artifact(root_path, receive_labels_path, role="receive_time_reference_labels"),
+        _validate_existing_jsonl_artifact(root_path, time_protocol_labels_path, role="time_protocol_labels"),
+        _validate_existing_jsonl_artifact(root_path, corrected_labels_path, role="corrected_time_protocol_labels"),
+    ]
+    return {
+        "checked": True,
+        "mode": "reuse_existing",
+        "valid": all(item.get("valid") is True for item in files),
+        "root": _display_path(root_path),
+        "files": files,
+        "full_scan_performed": False,
+    }
+
+
+def _validate_existing_jsonl_artifact(root: Path, path: str | Path, *, role: str) -> dict[str, Any]:
+    root_path = root.resolve()
+    target = _resolve(root_path, path).resolve()
+    path_under_active_root = _is_within(target, root_path)
+    errors: list[str] = []
+    exists = target.exists()
+    is_file = target.is_file() if exists else False
+    size_bytes = target.stat().st_size if exists and is_file else 0
+    first_record_checked = False
+    first_record_line_number: int | None = None
+    first_record_keys: list[str] = []
+
+    if not path_under_active_root:
+        errors.append("artifact path is outside active root")
+    if not exists:
+        errors.append("artifact missing")
+    elif not is_file:
+        errors.append("artifact is not a file")
+    elif size_bytes <= 0:
+        errors.append("artifact is empty")
+    else:
+        try:
+            with target.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    first_record_line_number = line_number
+                    try:
+                        payload = json.loads(stripped)
+                    except json.JSONDecodeError as exc:
+                        errors.append(f"first JSONL record is invalid JSON: {exc}")
+                    else:
+                        if not isinstance(payload, dict):
+                            errors.append("first JSONL record must be a JSON object")
+                        else:
+                            first_record_checked = True
+                            first_record_keys = sorted(str(key) for key in payload.keys())
+                    break
+            if first_record_line_number is None:
+                errors.append("artifact has no non-empty JSONL records")
+        except OSError as exc:
+            errors.append(f"artifact could not be read: {exc}")
+
+    return {
+        "role": role,
+        "valid": not errors,
+        "errors": errors,
+        "path": _display_path(path),
+        "absolute_path": _display_path(target),
+        "relative_path": _relative_display(root_path, target) if path_under_active_root else _display_path(target),
+        "exists": exists,
+        "is_file": is_file,
+        "size_bytes": size_bytes,
+        "path_under_active_root": path_under_active_root,
+        "first_record_checked": first_record_checked,
+        "first_record_line_number": first_record_line_number,
+        "first_record_keys": first_record_keys,
+        "full_scan_performed": False,
     }
 
 
@@ -1356,6 +1586,15 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
                 "artifact_errors": artifact_validation.get("errors", []),
             }
             evaluated["latency_profile_validation"] = latency_validation
+    existing_artifacts = _dict(evaluated.get("existing_artifact_validation"))
+    for item in existing_artifacts.get("files", []):
+        if not isinstance(item, dict) or item.get("valid") is True:
+            continue
+        role = str(item.get("role") or item.get("path") or "artifact")
+        if role == "latency_profile_samples":
+            add("latency profile samples missing or invalid", "LATENCY_PROFILE_MISSING", implementation=True)
+        else:
+            add(f"existing derived artifact missing or invalid: {role}", DERIVED_ARTIFACT_MISSING_CLASSIFICATION, implementation=True)
     if latency_validation.get("valid") is not True:
         add("latency stage profile missing", "LATENCY_PROFILE_MISSING", implementation=True)
     queue = _dict(evaluated.get("queue_backpressure_summary"))
@@ -1764,6 +2003,8 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
         "WRITER_SHUTDOWN_FLUSH_FAILURE",
         "FEATURE_LEAKAGE_FAILURE",
         "LABEL_LEAKAGE_FAILURE",
+        DERIVED_ARTIFACT_MISSING_CLASSIFICATION,
+        "REPORT_MISSING",
         "REPORT_SCHEMA_FAILURE",
         "BUNDLE_FAILURE",
         "READINESS_SEMANTICS_FAILURE",

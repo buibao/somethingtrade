@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import zipfile
 from types import SimpleNamespace
 import time
@@ -85,7 +86,7 @@ def test_phase52_real_capture_does_not_use_capture_output_true(tmp_path: Path, m
     monkeypatch.setattr("app.research.phase52_auto_collection.subprocess.run", fake_run)
     phase52._run_real_phase42h_capture(root_path=tmp_path, session_dir=tmp_path / "data/phase_5_2/sessions/s1", requested_duration_sec=1)
     assert observed.get("capture_output") is not True
-    assert observed.get("stderr") is phase52.subprocess.STDOUT
+    assert observed.get("stderr") is subprocess.STDOUT
 
 
 def test_phase52_real_capture_streams_child_output_to_console_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
