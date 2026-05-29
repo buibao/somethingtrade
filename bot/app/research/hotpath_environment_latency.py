@@ -59,7 +59,7 @@ STRICT_LAG_P99_MS = 200.0
 QUEUE_DEPTH_NEAR_CAPACITY_RATIO = 0.80
 QUEUE_PUT_BLOCK_WARNING_MS = 5.0
 WRITER_FLUSH_WARNING_MS = 50.0
-CAPTURE_DURATION_GUARD_REQUESTED_MAX_SEC = 7200.0
+CAPTURE_DURATION_GUARD_REQUESTED_MAX_SEC = 14400.0
 CAPTURE_DURATION_GUARD_GRACE_SEC = 120.0
 FINALIZATION_SLOW_WARNING_SEC = 600.0
 BUNDLE_SLOW_WARNING_SEC = 300.0
@@ -509,7 +509,7 @@ def phase42h_capture_duration_guard_limit_sec(
     grace_sec: float = CAPTURE_DURATION_GUARD_GRACE_SEC,
 ) -> float | None:
     requested = _float_or_none(requested_duration_sec)
-    if requested is None or requested > CAPTURE_DURATION_GUARD_REQUESTED_MAX_SEC:
+    if requested is None or requested <= 0.0 or requested > CAPTURE_DURATION_GUARD_REQUESTED_MAX_SEC:
         return None
     return max(0.0, requested) + max(0.0, grace_sec)
 

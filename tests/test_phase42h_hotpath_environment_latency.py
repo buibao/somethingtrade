@@ -665,6 +665,45 @@ def test_phase42h_duration_guard_fails_large_capture_overrun() -> None:
     assert "CAPTURE_DURATION_EXCEEDED" in evaluated["failure_classifications"]
 
 
+def test_phase42h_capture_duration_guard_limit_for_10800_is_10920() -> None:
+    assert hotpath.phase42h_capture_duration_guard_limit_sec(10_800) == 10_920.0
+
+
+def test_phase42h_capture_duration_guard_limit_for_14400_is_14520() -> None:
+    assert hotpath.phase42h_capture_duration_guard_limit_sec(14_400) == 14_520.0
+
+
+def test_phase42h_capture_duration_guard_applies_to_3h_session() -> None:
+    _assert_duration_guard_applies_to_requested_duration(10_800)
+
+
+def test_phase42h_capture_duration_guard_applies_to_4h_session() -> None:
+    _assert_duration_guard_applies_to_requested_duration(14_400)
+
+
+def _assert_duration_guard_applies_to_requested_duration(requested_duration_sec: float) -> None:
+    guard_limit = hotpath.phase42h_capture_duration_guard_limit_sec(requested_duration_sec)
+    assert guard_limit is not None
+    capture_duration = guard_limit + 1.0
+    report = _fresh_phase42h_report()
+    report["duration_sec"] = float(requested_duration_sec)
+    report["capture_duration_sec"] = capture_duration
+    report["total_child_duration_sec"] = capture_duration
+    report["finalization_duration_sec"] = 0.0
+    report["bundle_duration_sec"] = 0.0
+    report["capture"] = {
+        **report["capture"],
+        "capture_duration_sec": capture_duration,
+        "capture_duration_guard_limit_sec": guard_limit,
+        "capture_duration_within_guard": False,
+    }
+
+    evaluated = evaluate_phase42h_report(report)
+
+    assert evaluated["status"] == "fail"
+    assert "CAPTURE_DURATION_EXCEEDED" in evaluated["failure_classifications"]
+
+
 def test_phase42h_report_includes_stage_timestamps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_required_gitignore(tmp_path)
     _patch_phase42h_cli_fixture(monkeypatch, source_root=tmp_path)
