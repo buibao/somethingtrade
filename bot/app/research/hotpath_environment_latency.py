@@ -706,7 +706,11 @@ def run_phase42h_existing_artifact_analysis(
         latency_profile=latency_profile,
         writer_report=writer_report,
     )
-    queue_report = _queue_report_with_latency_hotpath_defaults(queue_report, latency_profile)
+    queue_report, queue_normalization = _normalize_queue_hotpath_fields(
+        queue_report,
+        latency_profile,
+        prefer_latency_profile=True,
+    )
     report = build_phase42h_report(
         symbol=symbol,
         clean_samples=[],
@@ -746,6 +750,7 @@ def run_phase42h_existing_artifact_analysis(
     report["rebuild_derived_artifacts"] = False
     report["latency_stage_profile_artifact"] = latency_stage_artifact
     report["existing_artifact_validation"] = required_artifacts
+    report["queue_backpressure_artifact_normalization"] = queue_normalization
     report["streaming_finalization"] = {
         "skipped": True,
         "reason": "evaluate_existing_artifacts_reused_existing_derived_files",
@@ -1379,13 +1384,58 @@ def build_queue_backpressure_report(
     }
 
 
-def _queue_report_with_latency_hotpath_defaults(queue_report: dict[str, Any], latency_profile: dict[str, Any]) -> dict[str, Any]:
+HOTPATH_QUEUE_FIELD_NAMES = (
+    "disk_write_on_hot_path",
+    "debug_logging_on_hot_path",
+    "batch_writer_enabled",
+    "queue_backpressure_detected",
+)
+
+
+def _normalize_queue_hotpath_fields(
+    queue_report: dict[str, Any],
+    latency_profile: dict[str, Any],
+    *,
+    prefer_latency_profile: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     queue = dict(queue_report)
-    queue.setdefault("disk_write_on_hot_path", latency_profile.get("disk_write_on_hot_path") is True)
-    queue.setdefault("debug_logging_on_hot_path", latency_profile.get("debug_logging_on_hot_path") is True)
-    queue.setdefault("batch_writer_enabled", latency_profile.get("batch_writer_enabled") is True)
-    queue.setdefault("queue_backpressure_detected", latency_profile.get("queue_backpressure_detected") is True)
-    return queue
+    original = {field: queue.get(field) for field in HOTPATH_QUEUE_FIELD_NAMES}
+    latency_fields = _latency_profile_hotpath_fields(latency_profile, queue_report=queue)
+    normalized = {
+        field: latency_fields[field] if prefer_latency_profile else original.get(field)
+        for field in HOTPATH_QUEUE_FIELD_NAMES
+    }
+    for field, value in normalized.items():
+        if value is None:
+            queue.setdefault(field, latency_fields[field])
+        else:
+            queue[field] = value
+    ignored = [
+        field
+        for field in HOTPATH_QUEUE_FIELD_NAMES
+        if prefer_latency_profile and original.get(field) is not None and original.get(field) != normalized.get(field)
+    ]
+    return queue, {
+        "performed": prefer_latency_profile,
+        "source": "validated_latency_stage_profile" if prefer_latency_profile else "queue_backpressure_summary",
+        "stale_queue_hotpath_fields_ignored": ignored,
+        "original_queue_hotpath_fields": original,
+        "normalized_queue_hotpath_fields": {field: queue.get(field) for field in HOTPATH_QUEUE_FIELD_NAMES},
+    }
+
+
+def _latency_profile_hotpath_fields(latency_profile: dict[str, Any], *, queue_report: dict[str, Any]) -> dict[str, bool]:
+    queue_backpressure = (
+        latency_profile.get("queue_backpressure_detected") is True
+        if "queue_backpressure_detected" in latency_profile
+        else queue_report.get("queue_backpressure_detected") is True
+    )
+    return {
+        "disk_write_on_hot_path": latency_profile.get("disk_write_on_hot_path") is True,
+        "debug_logging_on_hot_path": latency_profile.get("debug_logging_on_hot_path") is True,
+        "batch_writer_enabled": latency_profile.get("batch_writer_enabled") is True,
+        "queue_backpressure_detected": queue_backpressure,
+    }
 
 
 def _hot_path_decoupling_complete(*, latency_profile: dict[str, Any], queue_report: dict[str, Any]) -> bool:
@@ -1715,8 +1765,23 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
     queue = _dict(evaluated.get("queue_backpressure_summary"))
     if queue.get("performed") is not True:
         add("queue backpressure report missing", "QUEUE_BACKPRESSURE_REPORT_MISSING", implementation=True)
-    queue = _queue_report_with_latency_hotpath_defaults(queue, latency)
+    prefer_latency_queue_fields = (
+        evaluated.get("evaluation_mode") == "existing_artifacts"
+        and evaluated.get("derived_artifact_mode") == "reuse_existing"
+    )
+    queue, queue_normalization = _normalize_queue_hotpath_fields(
+        queue,
+        latency,
+        prefer_latency_profile=prefer_latency_queue_fields,
+    )
+    previous_queue_normalization = _dict(evaluated.get("queue_backpressure_artifact_normalization"))
+    if prefer_latency_queue_fields and previous_queue_normalization.get("performed") is True:
+        for field in ("stale_queue_hotpath_fields_ignored", "original_queue_hotpath_fields"):
+            if previous_queue_normalization.get(field):
+                queue_normalization[field] = previous_queue_normalization[field]
     evaluated["queue_backpressure_summary"] = queue
+    if prefer_latency_queue_fields:
+        evaluated["queue_backpressure_artifact_normalization"] = queue_normalization
     if not _hot_path_decoupling_complete(latency_profile=latency, queue_report=queue):
         add("hot-path decoupling incomplete", "HOT_PATH_DECOUPLING_INCOMPLETE", implementation=True)
     if _num(queue.get("queue_dropped_messages")) > 0:

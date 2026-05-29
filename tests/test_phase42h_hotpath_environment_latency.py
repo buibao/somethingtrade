@@ -746,12 +746,22 @@ def test_phase42h_cli_evaluate_existing_socket_recv_unavailable_is_warning_only(
         "stage_not_available_count": profile["sample_count"],
     }
     profile["earliest_available_receive_stage"] = "raw_ws_callback_monotonic_ns"
+    profile["disk_write_on_hot_path"] = False
+    profile["debug_logging_on_hot_path"] = False
+    profile["batch_writer_enabled"] = True
+    profile["queue_backpressure_detected"] = False
+    profile["missing_metrics"] = []
     profile_path.write_text(json.dumps(profile), encoding="utf-8")
     queue_path = tmp_path / hotpath.PHASE42H_QUEUE_BACKPRESSURE_REPORT
     queue = json.loads(queue_path.read_text(encoding="utf-8"))
-    for key in ("disk_write_on_hot_path", "debug_logging_on_hot_path", "batch_writer_enabled"):
-        queue.pop(key, None)
-    queue["queue_backpressure_detected"] = False
+    queue["disk_write_on_hot_path"] = False
+    queue["debug_logging_on_hot_path"] = False
+    queue["batch_writer_enabled"] = False
+    queue["queue_backpressure_detected"] = True
+    queue["queue_backpressure_events"] = 6
+    queue["queue_dropped_messages"] = 0
+    queue["queue_depth_near_capacity"] = False
+    queue["warnings"] = []
     queue_path.write_text(json.dumps(queue), encoding="utf-8")
 
     exit_code, report = _run_phase42h_existing_eval(tmp_path, monkeypatch)
@@ -765,6 +775,17 @@ def test_phase42h_cli_evaluate_existing_socket_recv_unavailable_is_warning_only(
     assert "socket_recv_monotonic_ns_unavailable" in report["warning_reasons"]
     assert report["hot_path_latency_summary"]["earliest_available_receive_stage"] == "raw_ws_callback_monotonic_ns"
     assert report["hot_path_latency_summary"]["unavailable_stages"] == {"socket_recv_monotonic_ns": "stage_not_available"}
+    normalization = report["queue_backpressure_artifact_normalization"]
+    assert normalization["performed"] is True
+    assert normalization["source"] == "validated_latency_stage_profile"
+    assert set(normalization["stale_queue_hotpath_fields_ignored"]) == {
+        "batch_writer_enabled",
+        "queue_backpressure_detected",
+    }
+    assert normalization["original_queue_hotpath_fields"]["batch_writer_enabled"] is False
+    assert normalization["original_queue_hotpath_fields"]["queue_backpressure_detected"] is True
+    assert normalization["normalized_queue_hotpath_fields"]["batch_writer_enabled"] is True
+    assert normalization["normalized_queue_hotpath_fields"]["queue_backpressure_detected"] is False
 
 
 @pytest.mark.parametrize(
@@ -775,6 +796,7 @@ def test_phase42h_cli_evaluate_existing_socket_recv_unavailable_is_warning_only(
         ("debug_logging_on_hot_path", "HOT_PATH_DECOUPLING_INCOMPLETE"),
         ("batch_writer_disabled", "HOT_PATH_DECOUPLING_INCOMPLETE"),
         ("queue_backpressure_detected", "HOT_PATH_DECOUPLING_INCOMPLETE"),
+        ("queue_dropped_messages", "QUEUE_DROPPED_MESSAGES_FAILURE"),
     ],
 )
 def test_phase42h_cli_evaluate_existing_still_fails_actual_hotpath_issues(
@@ -785,10 +807,10 @@ def test_phase42h_cli_evaluate_existing_still_fails_actual_hotpath_issues(
     expected_classification: str,
 ) -> None:
     _seed_existing_phase42h_artifacts(tmp_path, line_count=24)
-    if case == "queue_backpressure_detected":
+    if case == "queue_dropped_messages":
         queue_path = tmp_path / hotpath.PHASE42H_QUEUE_BACKPRESSURE_REPORT
         queue = json.loads(queue_path.read_text(encoding="utf-8"))
-        queue["queue_backpressure_detected"] = True
+        queue["queue_dropped_messages"] = 1
         queue_path.write_text(json.dumps(queue), encoding="utf-8")
     else:
         profile_path = tmp_path / hotpath.PHASE42H_LATENCY_STAGE_PROFILE
@@ -801,6 +823,8 @@ def test_phase42h_cli_evaluate_existing_still_fails_actual_hotpath_issues(
             profile["debug_logging_on_hot_path"] = True
         elif case == "batch_writer_disabled":
             profile["batch_writer_enabled"] = False
+        elif case == "queue_backpressure_detected":
+            profile["queue_backpressure_detected"] = True
         profile_path.write_text(json.dumps(profile), encoding="utf-8")
 
     exit_code, report = _run_phase42h_existing_eval(tmp_path, monkeypatch)
