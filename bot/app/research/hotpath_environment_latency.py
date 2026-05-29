@@ -674,10 +674,14 @@ def run_phase42h_existing_artifact_analysis(
         time_protocol_labels_path=time_protocol_labels_path,
         corrected_labels_path=corrected_labels_path,
     )
+    queue_artifact = _read_json(root_path / PHASE42H_QUEUE_BACKPRESSURE_REPORT)
+    writer_artifact = _read_json(root_path / PHASE42H_WRITER_BATCH_REPORT)
+    clock_sanity_artifact = _read_json(root_path / PHASE42H_CLOCK_SANITY_REPORT)
+    leakage_artifact = _read_json(root_path / PHASE42H_LEAKAGE_CHECK)
     clock_offset_summary = _dict(previous_report.get("clock_offset_summary"))
     if not clock_offset_summary:
         clock_offset_summary = compute_clock_offset_summary(clock_offset_samples)
-    clock_sanity = _dict(previous_report.get("clock_sanity_report"))
+    clock_sanity = clock_sanity_artifact or _dict(previous_report.get("clock_sanity_report"))
     if not clock_sanity:
         clock_sanity = build_clock_sanity_report(
             clock_offset_summary=clock_offset_summary,
@@ -689,13 +693,15 @@ def run_phase42h_existing_artifact_analysis(
         phase41_report=phase41_report,
         capture_diagnostics=_dict(capture.get("capture_diagnostics")),
     )
+    if writer_artifact:
+        writer_report = writer_artifact
     if (
         previous_writer
         and writer_report.get("writer_shutdown_flush_completed") is not True
         and previous_writer.get("writer_shutdown_flush_completed") is True
     ):
         writer_report = previous_writer
-    queue_report = build_queue_backpressure_report(
+    queue_report = queue_artifact or build_queue_backpressure_report(
         phase41_report=phase41_report,
         latency_profile=latency_profile,
         writer_report=writer_report,
@@ -705,7 +711,7 @@ def run_phase42h_existing_artifact_analysis(
         clean_samples=[],
         sources=_dict(previous_report.get("sources")),
         timestamp_schema=_dict(previous_report.get("timestamp_schema")),
-        leakage_result=_dict(previous_report.get("leakage_check")),
+        leakage_result=leakage_artifact or _dict(previous_report.get("leakage_check")),
         clock_offset_samples=clock_offset_samples or [sample for sample in previous_report.get("clock_offset_samples", []) if isinstance(sample, dict)],
         clock_offset_summary=clock_offset_summary,
         clock_sanity=clock_sanity,
@@ -758,12 +764,9 @@ def run_phase42h_existing_artifact_analysis(
         role = str(item.get("role") or item.get("path") or "artifact")
         reason = f"existing artifact invalid: {role}"
         report["hard_fail_reasons"].append(reason)
-        if role == "latency_profile_samples":
-            report["failure_classifications"].append("LATENCY_PROFILE_MISSING")
-            report["primary_failure"] = report.get("primary_failure") or "LATENCY_PROFILE_MISSING"
-        else:
-            report["failure_classifications"].append(DERIVED_ARTIFACT_MISSING_CLASSIFICATION)
-            report["primary_failure"] = report.get("primary_failure") or DERIVED_ARTIFACT_MISSING_CLASSIFICATION
+        classification = _existing_artifact_failure_classification(role)
+        report["failure_classifications"].append(classification)
+        report["primary_failure"] = report.get("primary_failure") or classification
     return evaluate_phase42h_report(report)
 
 
@@ -1016,6 +1019,7 @@ def validate_phase42h_existing_artifacts(
 ) -> dict[str, Any]:
     root_path = Path(root).resolve()
     files = [
+        _validate_existing_json_artifact(root_path, PHASE42H_REPORT_JSON, role="phase42h_report"),
         _validate_existing_jsonl_artifact(root_path, clean_samples_path, role="clean_samples"),
         _validate_existing_jsonl_artifact(root_path, bookticker_path, role="bookticker_reference_quotes"),
         _validate_existing_jsonl_artifact(root_path, trade_path, role="trade_reference_events"),
@@ -1024,6 +1028,10 @@ def validate_phase42h_existing_artifacts(
         _validate_existing_jsonl_artifact(root_path, receive_labels_path, role="receive_time_reference_labels"),
         _validate_existing_jsonl_artifact(root_path, time_protocol_labels_path, role="time_protocol_labels"),
         _validate_existing_jsonl_artifact(root_path, corrected_labels_path, role="corrected_time_protocol_labels"),
+        _validate_existing_json_artifact(root_path, PHASE42H_QUEUE_BACKPRESSURE_REPORT, role="queue_backpressure_report"),
+        _validate_existing_json_artifact(root_path, PHASE42H_WRITER_BATCH_REPORT, role="writer_batch_report"),
+        _validate_existing_json_artifact(root_path, PHASE42H_CLOCK_SANITY_REPORT, role="clock_sanity_report"),
+        _validate_existing_json_artifact(root_path, PHASE42H_LEAKAGE_CHECK, role="leakage_check"),
     ]
     return {
         "checked": True,
@@ -1033,6 +1041,88 @@ def validate_phase42h_existing_artifacts(
         "files": files,
         "full_scan_performed": False,
     }
+
+
+def _validate_existing_json_artifact(root: Path, path: str | Path, *, role: str) -> dict[str, Any]:
+    root_path = root.resolve()
+    target = _resolve(root_path, path).resolve()
+    path_under_active_root = _is_within(target, root_path)
+    errors: list[str] = []
+    exists = target.exists()
+    is_file = target.is_file() if exists else False
+    size_bytes = target.stat().st_size if exists and is_file else 0
+    payload: dict[str, Any] = {}
+
+    if not path_under_active_root:
+        errors.append("artifact path is outside active root")
+    if not exists:
+        errors.append("artifact missing")
+    elif not is_file:
+        errors.append("artifact is not a file")
+    elif size_bytes <= 0:
+        errors.append("artifact is empty")
+    else:
+        try:
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            errors.append(f"artifact invalid JSON: {exc}")
+        except OSError as exc:
+            errors.append(f"artifact could not be read: {exc}")
+        else:
+            if not isinstance(parsed, dict):
+                errors.append("artifact must be a JSON object")
+            elif not parsed:
+                errors.append("artifact must be a non-empty JSON object")
+            else:
+                payload = parsed
+
+    errors.extend(_existing_json_artifact_content_errors(role, payload))
+    return {
+        "role": role,
+        "valid": not errors,
+        "errors": errors,
+        "path": _display_path(path),
+        "absolute_path": _display_path(target),
+        "relative_path": _relative_display(root_path, target) if path_under_active_root else _display_path(target),
+        "exists": exists,
+        "is_file": is_file,
+        "size_bytes": size_bytes,
+        "path_under_active_root": path_under_active_root,
+        "json_object_checked": bool(payload),
+        "full_scan_performed": False,
+    }
+
+
+def _existing_json_artifact_content_errors(role: str, payload: dict[str, Any]) -> list[str]:
+    if not payload:
+        return []
+    if role == "phase42h_report" and payload.get("phase") != PHASE:
+        return ["Phase 4.2H report phase is invalid"]
+    if role == "queue_backpressure_report" and payload.get("performed") is not True:
+        return ["queue backpressure report performed must be true"]
+    if role == "writer_batch_report" and payload.get("writer_shutdown_flush_completed") is not True:
+        return ["writer report shutdown flush must be complete"]
+    if role == "clock_sanity_report" and payload.get("clock_sanity_valid") is not True:
+        return ["clock sanity report must be valid"]
+    if role == "leakage_check" and payload.get("performed") is not True:
+        return ["leakage check performed must be true"]
+    return []
+
+
+def _existing_artifact_failure_classification(role: str) -> str:
+    if role == "latency_profile_samples":
+        return "LATENCY_PROFILE_MISSING"
+    if role == "queue_backpressure_report":
+        return "QUEUE_BACKPRESSURE_REPORT_MISSING"
+    if role == "clock_sanity_report":
+        return "CLOCK_SYNC_FAILURE"
+    if role == "writer_batch_report":
+        return "WRITER_SHUTDOWN_FLUSH_FAILURE"
+    if role == "leakage_check":
+        return "LEAKAGE_FAILURE"
+    if role == "phase42h_report":
+        return "REPORT_MISSING"
+    return DERIVED_ARTIFACT_MISSING_CLASSIFICATION
 
 
 def _validate_existing_jsonl_artifact(root: Path, path: str | Path, *, role: str) -> dict[str, Any]:
@@ -1591,10 +1681,11 @@ def evaluate_phase42h_report(report: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict) or item.get("valid") is True:
             continue
         role = str(item.get("role") or item.get("path") or "artifact")
-        if role == "latency_profile_samples":
-            add("latency profile samples missing or invalid", "LATENCY_PROFILE_MISSING", implementation=True)
+        classification = _existing_artifact_failure_classification(role)
+        if classification == "LATENCY_PROFILE_MISSING":
+            add("latency profile samples missing or invalid", classification, implementation=True)
         else:
-            add(f"existing derived artifact missing or invalid: {role}", DERIVED_ARTIFACT_MISSING_CLASSIFICATION, implementation=True)
+            add(f"existing artifact missing or invalid: {role}", classification, implementation=True)
     if latency_validation.get("valid") is not True:
         add("latency stage profile missing", "LATENCY_PROFILE_MISSING", implementation=True)
     queue = _dict(evaluated.get("queue_backpressure_summary"))
@@ -2001,6 +2092,7 @@ def classify_phase42h_failure(report: dict[str, Any]) -> str:
         "WRITER_DROPPED_RECORDS_FAILURE",
         "WRITER_ERROR_FAILURE",
         "WRITER_SHUTDOWN_FLUSH_FAILURE",
+        "LEAKAGE_FAILURE",
         "FEATURE_LEAKAGE_FAILURE",
         "LABEL_LEAKAGE_FAILURE",
         DERIVED_ARTIFACT_MISSING_CLASSIFICATION,

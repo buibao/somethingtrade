@@ -742,6 +742,8 @@ def test_phase42h_cli_evaluate_existing_does_not_rewrite_derived_artifacts_by_de
         tmp_path / "data/dataset/orderbook_time_protocol_benchmark_labels.jsonl",
         tmp_path / "data/dataset/orderbook_reference_benchmark_labels.jsonl",
     ]
+    cache_root = tmp_path / "data/cache"
+    assert list(cache_root.glob("tmp*/phase42h_*.sqlite")) == []
     before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in derived_paths}
 
     def fail_analysis(**_kwargs: Any) -> dict[str, Any]:
@@ -783,15 +785,36 @@ def test_phase42h_cli_evaluate_existing_does_not_rewrite_derived_artifacts_by_de
     assert exit_code == 0
     after = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in derived_paths}
     assert after == before
+    assert list(cache_root.glob("tmp*/phase42h_*.sqlite")) == []
     report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
     assert report["streaming_finalization"]["skipped"] is True
     assert report["existing_artifact_validation"]["valid"] is True
     assert report["derived_artifact_mode"] == "reuse_existing"
 
 
-def test_phase42h_cli_evaluate_existing_fails_empty_derived_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _seed_existing_phase42h_artifacts(tmp_path, line_count=24)
-    (tmp_path / "data/dataset/orderbook_time_protocol_benchmark_labels.jsonl").write_text("", encoding="utf-8")
+@pytest.mark.parametrize(
+    ("relative_path", "role"),
+    [
+        ("data/dataset/phase_4_2h_corrected_time_protocol_labels.jsonl", "corrected_time_protocol_labels"),
+        ("data/dataset/orderbook_time_protocol_benchmark_labels.jsonl", "time_protocol_labels"),
+        ("data/dataset/orderbook_reference_benchmark_labels.jsonl", "receive_time_reference_labels"),
+    ],
+)
+@pytest.mark.parametrize("missing", [False, True])
+def test_phase42h_cli_evaluate_existing_fails_missing_or_empty_derived_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    relative_path: str,
+    role: str,
+    missing: bool,
+) -> None:
+    _seed_existing_phase42h_artifacts(tmp_path, line_count=8)
+    path = tmp_path / relative_path
+    if missing:
+        path.unlink()
+    else:
+        path.write_text("", encoding="utf-8")
     monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
     monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
 
@@ -819,7 +842,40 @@ def test_phase42h_cli_evaluate_existing_fails_empty_derived_artifact(tmp_path: P
     assert exit_code == 1
     assert report["primary_failure"] == hotpath.DERIVED_ARTIFACT_MISSING_CLASSIFICATION
     assert hotpath.DERIVED_ARTIFACT_MISSING_CLASSIFICATION in report["failure_classifications"]
-    invalid = [item for item in report["existing_artifact_validation"]["files"] if item["role"] == "time_protocol_labels"]
+    invalid = [item for item in report["existing_artifact_validation"]["files"] if item["role"] == role]
+    assert invalid and invalid[0]["valid"] is False
+
+
+def test_phase42h_cli_evaluate_existing_fails_missing_required_debug_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_existing_phase42h_artifacts(tmp_path, line_count=8)
+    (tmp_path / hotpath.PHASE42H_QUEUE_BACKPRESSURE_REPORT).unlink()
+    monkeypatch.setattr(phase42h_cli, "SOURCE_ROOT", tmp_path)
+    monkeypatch.setattr(phase42h_cli, "_run_typecheck", lambda output_path: (0, "typecheck/compileall passed with test fixture"))
+
+    exit_code = phase42h_cli.main(
+        [
+            "--root",
+            str(tmp_path),
+            "--duration-sec",
+            "7200",
+            "--environment-name",
+            "phase52_vps_repaired_eval",
+            "--environment-region",
+            "unknown",
+            "--run-mode",
+            "repaired_eval",
+            "--skip-preflight",
+            "--skip-pytest",
+            "--skip-capture",
+            "--evaluate-existing-artifacts",
+            "--no-bundle",
+        ]
+    )
+
+    report = json.loads((tmp_path / "data/reports/phase_4_2h_hotpath_environment_latency_report.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert "QUEUE_BACKPRESSURE_REPORT_MISSING" in report["failure_classifications"]
+    invalid = [item for item in report["existing_artifact_validation"]["files"] if item["role"] == "queue_backpressure_report"]
     assert invalid and invalid[0]["valid"] is False
 
 
@@ -2047,6 +2103,22 @@ def _seed_existing_phase42h_artifacts(root: Path, *, line_count: int) -> None:
     diagnostics_path.write_text(json.dumps(diagnostics), encoding="utf-8")
     writer = _writer_report()
     phase41 = _phase41(writer=writer)
+    queue = build_queue_backpressure_report(
+        phase41_report=phase41,
+        latency_profile=latency_profile,
+        writer_report=writer,
+    )
+    clock_sanity = _clock_sanity()
+    debug_artifacts = {
+        hotpath.PHASE42H_QUEUE_BACKPRESSURE_REPORT: queue,
+        hotpath.PHASE42H_WRITER_BATCH_REPORT: writer,
+        hotpath.PHASE42H_CLOCK_SANITY_REPORT: clock_sanity,
+        hotpath.PHASE42H_LEAKAGE_CHECK: streaming.leakage_result,
+    }
+    for relative, payload in debug_artifacts.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
     report = build_phase42h_report(
         symbol="BTCUSDT",
         clean_samples=[],
@@ -2055,13 +2127,9 @@ def _seed_existing_phase42h_artifacts(root: Path, *, line_count: int) -> None:
         leakage_result=streaming.leakage_result,
         clock_offset_samples=clock_samples,
         clock_offset_summary=clock_summary,
-        clock_sanity=_clock_sanity(),
+        clock_sanity=clock_sanity,
         latency_profile=latency_profile,
-        queue_report=build_queue_backpressure_report(
-            phase41_report=phase41,
-            latency_profile=latency_profile,
-            writer_report=writer,
-        ),
+        queue_report=queue,
         writer_report=writer,
         phase41_report=phase41,
         capture={
