@@ -1,0 +1,50 @@
+{
+  "accepted_clock_sample_count": 0,
+  "actual_duration_sec": 0.9103570659999605,
+  "clock_sync_status": "fail",
+  "discarded_clock_sample_count": 0,
+  "end_to_end_hot_path_p99_ms": null,
+  "ended_at_utc": "2026-05-27T16:44:39Z",
+  "failure_reasons": [
+    "status_pass",
+    "primary_failure_none",
+    "phase41_status_pass",
+    "clock_sync_status_pass",
+    "clock_offset_drift_valid",
+    "clock_offset_sample_quality_valid",
+    "strict_100ms_observability_ready",
+    "low_latency_ready"
+  ],
+  "host_info": {
+    "hostname": "ubuntu-s-2vcpu-4gb-120gb-intel-sgp1",
+    "machine": "x86_64",
+    "processor": "x86_64"
+  },
+  "low_latency_ready": false,
+  "metadata_missing_required_fields": [],
+  "no_execution": true,
+  "no_live_trading": true,
+  "no_order_placement": true,
+  "no_wallet_logic": true,
+  "notes": "preflight check v4 with session-local gitignore",
+  "os_info": {
+    "platform": "Linux-6.8.0-71-generic-x86_64-with-glibc2.39",
+    "release": "6.8.0-71-generic",
+    "system": "Linux"
+  },
+  "phase": "5.2",
+  "plan_name": "phase52_preflight_check",
+  "primary_failure": "FRESH_CAPTURE_DURATION_FAILURE",
+  "python_version": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+  "repo_commit": "e9db1b2bd7d921b3a1faf280c767c6c690670aec",
+  "requested_duration_sec": 60.0,
+  "research_eligible": false,
+  "runtime_status": "fail",
+  "session_id": "preflight_check_60s_v4",
+  "snapshot_copy_p99_us": null,
+  "source_repo_dirty": true,
+  "started_at_utc": "2026-05-27T16:44:38Z",
+  "strict_100ms_observability_ready": false,
+  "vps_provider": "",
+  "vps_region": ""
+}

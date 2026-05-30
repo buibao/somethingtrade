@@ -1,0 +1,4 @@
+filename: phase_5_2_preflight_check_60s_capture_bundle.zip
+sha256: 8442afffe3d3c21a263dbc146e8530f71fa53f4d0e3af2c7f8d1d8d83e3ac3d4
+file_size_bytes: 9108
+utc_timestamp: 2026-05-27T16:34:43Z

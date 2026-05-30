@@ -1,0 +1,43 @@
+timestamp_utc=20260530T131704Z
+repo_dir=/root/somethingtrade
+
+HEAD:
+17ca6b7736e332d2003e200f53f1477b1267edcf
+
+BRANCH:
+main
+
+STATUS:
+?? make_destroy_safety_backup.sh
+
+LAST_COMMITS:
+17ca6b7 (HEAD -> main, origin/main, origin/HEAD, backup-before-rebase-phase52f-20260530-124235) fix: normalize phase42h repaired eval queue hotpath metadata
+7f815de feat: Add tests for Phase 5.2F final audit manifest generation and validation
+c20dc85 feat: Normalize queue hotpath fields and enhance evaluation reporting for existing artifacts
+7bd8a80 feat: Enhance hot-path decoupling checks and add corresponding tests for socket receive availability
+9f2fe8d feat: Enhance existing artifact validation with additional checks and error classifications
+fe5b424 feat: Add existing artifact analysis and evaluation mode for Phase 4.2H
+f614d28 feat: Enhance latency profile evaluation and artifact handling
+ba7fd27 Add Phase 5.2 dataset quality analysis scripts and tests
+8fd9218 Update capture duration guard limits and add corresponding tests for 3h and 4h sessions
+7187400 Enhance Phase 5.2 Auto Collection with Duration Quality Checks and Stage Timing
+6b14e61 Refactor orderbook_phase41 and phase52 scripts to improve path handling and add session audit functionality
+5a9f41a Refactor phase51 and phase52 tests to integrate phase42h bundle handling
+32d43d2 Add OOM handling tests and memory risk warnings in phase52 scripts
+091aaea Refactor Phase 5.2 scripts to improve gitignore handling and archive management
+f588bf8 Update .gitignore and tests for Phase 5.2 artifact management
+c22f209 Enhance Phase 5.2 Scripts with Cleanup and Resume Functionality
+e9db1b2 Add Phase 5.2 auto collection scripts and metadata files
+7967d6a Add Phase 5.1 Edge Robustness Research Scripts and Tests
+bee6ab4 phase 5.0 empirical signal research
+2d4382c feat: Enhance Phase 5.0 Microstructure Signal Research and Testing
+b0ea999 (tag: phase-4.2h-vps-final-pass) feat: Implement low RTT sample quality checks and robust clock offset estimation
+a146471 feat: Enhance snapshot copy performance and reporting metrics in OrderbookPhase41
+4855241 feat: Integrate Phase 4.1 runtime readiness checks into Phase 4.2H reporting
+4092218 Refactor latency metrics and phase 41 runtime report handling
+45927b0 feat: Add DigitalOcean VPS support for Phase 4.2H benchmarking
+22f09e0 Add comprehensive tests for phase 42h hotpath environment latency
+0922e08 Add Phase 4.2F+G Latency Readiness Profile Script and Tests
+395055c Add Phase 4.2E Clock Sync Receive Lag Calibration Script and Tests
+11a9e8d Add Phase 4.2D Time Protocol Benchmark Script and Tests
+c7e0e5e Remove outdated dataset quality and coverage reports for Phase 4.2, 4.2A, 4.2B, and 4.2C due to failure in meeting quality thresholds. This includes the deletion of markdown and JSON files related to dataset quality, coverage, and benchmark reports, as well as the removal of the runtime pass bundle zip file.

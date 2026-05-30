@@ -1,0 +1,13 @@
+# Generated runtime artifacts
+*.jsonl
+data/dataset/
+data/debug/
+data/cache/
+data/logs/
+data/reports/
+logs/
+reports/
+debug/
+cache/
+*.zip
+*.log

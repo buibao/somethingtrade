@@ -1,0 +1,28 @@
+{
+  "bundle_sha256_valid": true,
+  "checks": {
+    "bundle_sha256_valid": true,
+    "clock_offset_drift_valid": false,
+    "clock_offset_sample_quality_valid": false,
+    "clock_sync_status_pass": false,
+    "low_latency_ready": false,
+    "phase41_status_pass": false,
+    "primary_failure_none": false,
+    "status_pass": false,
+    "strict_100ms_observability_ready": false
+  },
+  "failure_reasons": [
+    "status_pass",
+    "primary_failure_none",
+    "phase41_status_pass",
+    "clock_sync_status_pass",
+    "clock_offset_drift_valid",
+    "clock_offset_sample_quality_valid",
+    "strict_100ms_observability_ready",
+    "low_latency_ready"
+  ],
+  "phase": "5.2",
+  "research_eligible": false,
+  "status": "fail",
+  "strict_100ms_hard_requirement": true
+}
