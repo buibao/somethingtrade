@@ -1,0 +1,180 @@
+{
+  "allowed_phase54_sessions": [
+    "session_001_sanity_30m",
+    "session_002_short_1h"
+  ],
+  "artifact_integrity_summary": {
+    "integrity_status": "partial",
+    "internal_sha256s_failed": 0,
+    "per_session_sha256_files_checked": 6,
+    "zip_files_tested": 20
+  },
+  "coverage_100ms_summary": {
+    "coverage_ratio": 0.9972676881242483,
+    "coverage_status": "fail",
+    "coverage_threshold": 0.95,
+    "coverage_threshold_source": "app.research.reference_feed_benchmark.REQUIRED_100MS_VALID_RATE",
+    "future_leak_count": 24
+  },
+  "created_at_utc": "2026-05-30T09:38:27Z",
+  "dataset_schema_summary": {
+    "dataset_schema_status": "fail",
+    "file_count": 50,
+    "hard_fail_reasons": [
+      "dataset_schema_failures_detected"
+    ]
+  },
+  "evidence_paths": {
+    "final_evidence_bundle": "data/phase_5_3/evidence/phase_5_3_final_evidence_bundle.zip",
+    "final_evidence_bundle_sha256": "730c9c0249ba9ed92d61d995416f4b2495a26abee7e26cbf6474f908060d3e68",
+    "final_evidence_bundle_sha256_file": "data/phase_5_3/evidence/phase_5_3_final_evidence_bundle.zip.sha256"
+  },
+  "excluded_sessions": [
+    {
+      "reasons": [
+        "future_timestamp_leak_detected",
+        "future_leak_detected"
+      ],
+      "session_id": "session_003_short_1h"
+    },
+    {
+      "reasons": [
+        "future_timestamp_leak_detected",
+        "future_leak_detected",
+        "queue_backpressure_or_drops_detected"
+      ],
+      "session_id": "session_004_medium_2h"
+    },
+    {
+      "reasons": [
+        "hotpath_status_not_pass",
+        "dataset_schema_fail",
+        "future_timestamp_leak_detected",
+        "future_leak_detected",
+        "queue_backpressure_or_drops_detected",
+        "session_primary_failure_present",
+        "phase52_quality_status_not_pass",
+        "phase52_research_eligible_not_true"
+      ],
+      "session_id": "session_005_medium_2h"
+    },
+    {
+      "reasons": [
+        "future_timestamp_leak_detected",
+        "future_leak_detected"
+      ],
+      "session_id": "session_005_medium_2h_repaired_eval"
+    },
+    {
+      "reasons": [
+        "failed_run_lineage_only"
+      ],
+      "session_id": "session_001_sanity_30m"
+    },
+    {
+      "reasons": [
+        "failed_run_lineage_only"
+      ],
+      "session_id": "session_002_short_1h"
+    },
+    {
+      "reasons": [
+        "preflight_only"
+      ],
+      "session_id": "preflight_check_60s"
+    },
+    {
+      "reasons": [
+        "preflight_only"
+      ],
+      "session_id": "preflight_check_60s_v2"
+    },
+    {
+      "reasons": [
+        "preflight_only"
+      ],
+      "session_id": "preflight_check_60s_v3"
+    },
+    {
+      "reasons": [
+        "preflight_only"
+      ],
+      "session_id": "preflight_check_60s_v4"
+    }
+  ],
+  "final_status": "phase_5_3_partial",
+  "hard_fail_reasons": [
+    "dataset_schema_failures_detected",
+    "future_leak_detected",
+    "queue_backpressure_or_drops_detected",
+    "session_primary_failure_present"
+  ],
+  "input_roots": {
+    "backup_meta": "backup_meta/destroy_safety_backup_20260530T131704Z",
+    "failed_runs": "data/cache/phase_5_2_failed_runs",
+    "phase52_sessions": "data/phase_5_2/sessions",
+    "phase52f_artifacts": "artifacts/phase_5_2f",
+    "preflight_sessions": "data/sessions"
+  },
+  "name": "Dataset Integrity & Research Readiness",
+  "orderbook_reference_summary": {
+    "bid_ask_crossed_count": 0,
+    "mismatch_counter": {
+      "invalid_delta_cases": 0,
+      "orderbook_mismatch_cases": 0,
+      "sequence_gap_cases": 0
+    },
+    "reference_consistency_status": "pass",
+    "spread_negative_count": 0
+  },
+  "phase": "5.3",
+  "repo_root": "D:/somethingtrade",
+  "report_paths": {
+    "phase_5_3_100ms_label_coverage_report.json": "data/phase_5_3/reports/phase_5_3_100ms_label_coverage_report.json",
+    "phase_5_3_100ms_label_coverage_report.md": "data/phase_5_3/reports/phase_5_3_100ms_label_coverage_report.md",
+    "phase_5_3_artifact_integrity_report.json": "data/phase_5_3/reports/phase_5_3_artifact_integrity_report.json",
+    "phase_5_3_artifact_integrity_report.md": "data/phase_5_3/reports/phase_5_3_artifact_integrity_report.md",
+    "phase_5_3_backup_restore_inventory_report.json": "data/phase_5_3/reports/phase_5_3_backup_restore_inventory_report.json",
+    "phase_5_3_backup_restore_inventory_report.md": "data/phase_5_3/reports/phase_5_3_backup_restore_inventory_report.md",
+    "phase_5_3_dataset_schema_report.json": "data/phase_5_3/reports/phase_5_3_dataset_schema_report.json",
+    "phase_5_3_dataset_schema_report.md": "data/phase_5_3/reports/phase_5_3_dataset_schema_report.md",
+    "phase_5_3_orderbook_reference_consistency_report.json": "data/phase_5_3/reports/phase_5_3_orderbook_reference_consistency_report.json",
+    "phase_5_3_orderbook_reference_consistency_report.md": "data/phase_5_3/reports/phase_5_3_orderbook_reference_consistency_report.md",
+    "phase_5_3_research_eligibility_report.json": "data/phase_5_3/reports/phase_5_3_research_eligibility_report.json",
+    "phase_5_3_research_eligibility_report.md": "data/phase_5_3/reports/phase_5_3_research_eligibility_report.md",
+    "phase_5_3_research_readiness_manifest.json": "data/phase_5_3/manifests/phase_5_3_research_readiness_manifest.json",
+    "phase_5_3_research_readiness_manifest.md": "data/phase_5_3/reports/phase_5_3_research_readiness_manifest.md",
+    "phase_5_3_runtime_data_health_report.json": "data/phase_5_3/reports/phase_5_3_runtime_data_health_report.json",
+    "phase_5_3_runtime_data_health_report.md": "data/phase_5_3/reports/phase_5_3_runtime_data_health_report.md",
+    "phase_5_3_session_lineage_report.json": "data/phase_5_3/reports/phase_5_3_session_lineage_report.json",
+    "phase_5_3_session_lineage_report.md": "data/phase_5_3/reports/phase_5_3_session_lineage_report.md",
+    "phase_5_3_timestamp_integrity_report.json": "data/phase_5_3/reports/phase_5_3_timestamp_integrity_report.json",
+    "phase_5_3_timestamp_integrity_report.md": "data/phase_5_3/reports/phase_5_3_timestamp_integrity_report.md"
+  },
+  "research_ready": "partial",
+  "runtime_data_health_summary": {
+    "queue_backpressure_status": "fail",
+    "runtime_health_status": "fail",
+    "writer_batch_status": "pass",
+    "ws_lifecycle_status": "pass"
+  },
+  "session_lineage_summary": {
+    "complete_count": 6,
+    "session_count": 12
+  },
+  "source_backup_lineage": {
+    "backup_meta": "backup_meta/destroy_safety_backup_20260530T131704Z",
+    "backup_meta_sha256s_present": true,
+    "internal_sha256s_checked": 8
+  },
+  "timestamp_integrity_summary": {
+    "future_timestamp_leak_count": 96,
+    "horizon_100ms_timestamp_verifiable": true,
+    "negative_latency_count": 0,
+    "timestamp_status": "fail"
+  },
+  "warnings": [
+    "some_session_sha256_targets_missing_or_unverifiable",
+    "session_005_medium_2h_repaired_eval:phase52_quality_report_not_eligible_but_repaired_eval_hotpath_pass_used"
+  ]
+}
